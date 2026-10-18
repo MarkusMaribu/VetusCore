@@ -107,6 +107,16 @@ fn main() {
 
         // Don't fail builds on harmless warnings in upstream sources.
         build.define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
+        if os.eq_ignore_ascii_case("android") {
+            if let Some(ndk) = env::var_os("ANDROID_NDK_HOME").or_else(|| env::var_os("ANDROID_NDK_ROOT")) {
+                let toolchain = PathBuf::from(ndk).join("build/cmake/android.toolchain.cmake");
+                if toolchain.is_file() {
+                    build.define("CMAKE_TOOLCHAIN_FILE", toolchain);
+                    build.define("ANDROID_ABI", "arm64-v8a");
+                    build.define("ANDROID_PLATFORM", "android-21");
+                }
+            }
+        }
 
         let install_dir = build.build();
 

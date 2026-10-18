@@ -1,0 +1,41 @@
+name: Vetus embedded
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - "platform/android/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/vetus_embedded.yml"
+
+jobs:
+  arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+      - name: Boost headers
+        run: |
+          curl -L --retry 3 -o /tmp/boost.tar.gz https://archives.boost.io/release/1.85.0/source/boost_1_85_0.tar.gz
+          mkdir -p vendor
+          tar -xzf /tmp/boost.tar.gz -C vendor
+          mv vendor/boost_1_85_0 vendor/boost
+      - name: Build libvetus_core.so
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+        run: cargo build -p vetus_embed --release --target aarch64-linux-android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libvetus_core-arm64
+          path: target/aarch64-linux-android/release/libvetus_core.so

@@ -20,7 +20,7 @@
 //! SDLThread stack: guest code later calls this bridge from a coroutine
 //! stack, where JNI *lookups* are not reliable (see that function).
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", not(feature = "embedded")))]
 mod imp {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int, c_void};
@@ -522,7 +522,7 @@ mod imp {
         out
     }
 }
-#[cfg(not(target_os = "android"))]
+#[cfg(any(not(target_os = "android"), feature = "embedded"))]
 mod imp {
     /// No host bridge on this platform, so nothing to resolve.
     pub fn populate_jni_cache() {}
@@ -532,6 +532,21 @@ mod imp {
     }
     pub fn take_photo(_front: bool) -> Option<Vec<u8>> {
         None
+    }
+
+    #[cfg(all(target_os = "android", feature = "embedded"))]
+    pub fn has_microphone() -> bool {
+        false
+    }
+    #[cfg(all(target_os = "android", feature = "embedded"))]
+    pub fn start_mic() -> bool {
+        false
+    }
+    #[cfg(all(target_os = "android", feature = "embedded"))]
+    pub fn stop_mic() {}
+    #[cfg(all(target_os = "android", feature = "embedded"))]
+    pub fn read_mic_chunk() -> Vec<i16> {
+        Vec::new()
     }
 }
 

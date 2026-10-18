@@ -63,6 +63,19 @@ fn linux_has_lib(lib: &str) -> bool {
     })
 }
 
+fn define_android_toolchain(build: &mut cmake::Config) {
+    let ndk = env::var_os("ANDROID_NDK_HOME").or_else(|| env::var_os("ANDROID_NDK_ROOT"));
+    let Some(ndk) = ndk else {
+        return;
+    };
+    let toolchain = Path::new(&ndk).join("build/cmake/android.toolchain.cmake");
+    if toolchain.is_file() {
+        build.define("CMAKE_TOOLCHAIN_FILE", toolchain);
+        build.define("ANDROID_ABI", "arm64-v8a");
+        build.define("ANDROID_PLATFORM", "android-21");
+    }
+}
+
 fn main() {
     let os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS was not set");
     if cfg!(feature = "static") {
@@ -80,6 +93,10 @@ fn main() {
         build.out_dir(out_dir);
 
         build.define("LIBTYPE", "STATIC");
+        build.define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
+        if os.eq_ignore_ascii_case("android") {
+            define_android_toolchain(&mut build);
+        }
 
         // Don't build extras, we don't need them and they can encounter issues
         // when cross-compiling.

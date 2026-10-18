@@ -85,6 +85,14 @@ fn main() {
         build.define("CMAKE_SYSTEM_NAME", "Android");
         build.define("CMAKE_SYSTEM_VERSION", "21");
         build.define("ANDROID", "ON");
+        if let Some(ndk) = env::var_os("ANDROID_NDK_HOME").or_else(|| env::var_os("ANDROID_NDK_ROOT")) {
+            let toolchain = PathBuf::from(ndk).join("build/cmake/android.toolchain.cmake");
+            if toolchain.is_file() {
+                build.define("CMAKE_TOOLCHAIN_FILE", toolchain);
+                build.define("ANDROID_ABI", "arm64-v8a");
+                build.define("ANDROID_PLATFORM", "android-21");
+            }
+        }
         // Without this, CMake's architecture probe sees 32-bit `__arm__` and
         // builds dynarmic for arm instead of arm64, which breaks 64-bit FP
         // helpers (e.g. FPRecipExponent) when cross-compiling for AArch64.

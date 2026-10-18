@@ -1481,6 +1481,7 @@ pub fn configure_angle_driver(enabled: bool) {
         std::env::set_var("SDL_VIDEO_EGL_DRIVER", &egl_path);
         std::env::set_var("SDL_VIDEO_GL_DRIVER", &gles_path);
     }
+    #[cfg(not(feature = "embedded"))]
     sdl2::hint::set("SDL_OPENGL_ES_DRIVER", "1");
     log!(
         "ANGLE override requested: EGL={} (exists={}), GLES={} (exists={}); SDL will try these before the first window",

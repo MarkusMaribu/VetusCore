@@ -24,6 +24,7 @@
 
 use al_sys::alc_types::{ALCcontext, ALCdevice};
 use std::marker::PhantomData;
+use std::sync::Mutex;
 use touchHLE_openal_soft_wrapper as al_sys;
 use touchHLE_openal_soft_wrapper::alc_types::ALCint;
 
@@ -214,6 +215,7 @@ impl OpenALContext {
             device,
             context
         );
+        live_contexts().lock().unwrap().push(context as usize);
         Ok(Self { context, device })
     }
 
@@ -251,7 +253,29 @@ impl OpenALContext {
 
 impl Drop for OpenALContext {
     fn drop(&mut self) {
+        live_contexts()
+            .lock()
+            .unwrap()
+            .retain(|ptr| *ptr != self.context as usize);
         unsafe { al_sys::alcDestroyContext(self.context) };
+    }
+}
+
+fn live_contexts() -> &'static Mutex<Vec<usize>> {
+    static LIVE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    &LIVE
+}
+
+/// Stop OpenAL Soft's mixer thread while a Vetus session is parked.
+pub fn suspend_all_contexts() {
+    for ptr in live_contexts().lock().unwrap().iter().copied() {
+        unsafe { al_sys::alcSuspendContext(ptr as *mut ALCcontext) };
+    }
+}
+
+pub fn resume_all_contexts() {
+    for ptr in live_contexts().lock().unwrap().iter().copied() {
+        unsafe { al_sys::alcProcessContext(ptr as *mut ALCcontext) };
     }
 }
 

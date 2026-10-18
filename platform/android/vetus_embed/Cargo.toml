@@ -1,0 +1,15 @@
+[package]
+name = "vetus_embed"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+# JNI exports have to live in the cdylib. no_mangle symbols in the touchHLE
+# rlib are not exported from the final library.
+name = "vetus_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+touchHLE = { path = "../../..", default-features = false, features = ["embedded"] }

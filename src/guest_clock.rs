@@ -6,7 +6,41 @@
 //! Per-environment game time. Host UI, audio and diagnostics keep real time.
 //! Rebase at each speed change so guest clocks never jump backwards.
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
+
+struct Pause {
+    accumulated: Duration,
+    frozen_since: Option<Instant>,
+}
+
+static PAUSE: Mutex<Pause> = Mutex::new(Pause {
+    accumulated: Duration::ZERO,
+    frozen_since: None,
+});
+
+/// Freeze every guest clock. Unfreezing rebases host time so paused seconds
+/// are not delivered as a burst of guest timers.
+pub fn set_frozen(frozen: bool) {
+    let mut pause = PAUSE.lock().unwrap();
+    if frozen {
+        if pause.frozen_since.is_none() {
+            pause.frozen_since = Some(Instant::now());
+        }
+    } else if let Some(start) = pause.frozen_since.take() {
+        pause.accumulated += Instant::now().saturating_duration_since(start);
+    }
+}
+
+fn effective_now() -> Instant {
+    let now = Instant::now();
+    let pause = PAUSE.lock().unwrap();
+    let frozen = pause
+        .frozen_since
+        .map(|start| now.saturating_duration_since(start))
+        .unwrap_or_default();
+    now.checked_sub(pause.accumulated + frozen).unwrap_or(now)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Speed {
@@ -74,11 +108,11 @@ impl GuestClock {
     }
 
     pub fn now(&self) -> Instant {
-        self.guest_anchor + self.elapsed_at(Instant::now())
+        self.guest_anchor + self.elapsed_at(effective_now())
     }
 
     pub fn system_time(&self) -> SystemTime {
-        self.wall_anchor + self.elapsed_at(Instant::now())
+        self.wall_anchor + self.elapsed_at(effective_now())
     }
 
     pub fn speed(&self) -> Speed {
@@ -86,7 +120,7 @@ impl GuestClock {
     }
 
     pub fn set_speed(&mut self, speed: Speed) {
-        self.set_speed_at(speed, Instant::now());
+        self.set_speed_at(speed, effective_now());
     }
 
     fn set_speed_at(&mut self, speed: Speed, host: Instant) {
@@ -100,7 +134,7 @@ impl GuestClock {
     /// Convert a guest deadline to host time before comparing with audio,
     /// composition or scheduler deadlines. Recompute after a speed change.
     pub fn host_deadline(&self, guest: Instant) -> Instant {
-        self.host_deadline_at(guest, Instant::now())
+        self.host_deadline_at(guest, effective_now())
     }
 
     fn host_deadline_at(&self, guest: Instant, host: Instant) -> Instant {
@@ -147,6 +181,21 @@ mod tests {
                    start + Duration::from_secs(12));
         assert_eq!(clock.host_deadline_at(due, start + Duration::from_secs(13)),
                    start + Duration::from_secs(13));
+    }
+
+    #[test]
+    fn freeze_does_not_deliver_paused_time() {
+        let mut clock = GuestClock::new();
+        let before = clock.now();
+        set_frozen(true);
+        std::thread::sleep(Duration::from_millis(40));
+        let during = clock.now().saturating_duration_since(before);
+        assert!(during < Duration::from_millis(20), "guest time moved while frozen: {during:?}");
+        set_frozen(false);
+        std::thread::sleep(Duration::from_millis(40));
+        let after = clock.now().saturating_duration_since(before);
+        assert!(after >= Duration::from_millis(20), "guest time did not resume: {after:?}");
+        assert!(after < Duration::from_millis(200), "paused time leaked into the guest: {after:?}");
     }
 
     #[test]

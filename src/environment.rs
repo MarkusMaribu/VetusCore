@@ -1838,6 +1838,14 @@ impl Environment {
         let panic_cell = self.panic_cell.clone();
         let mut stepping = false;
         loop {
+            #[cfg(feature = "embedded")]
+            if crate::embed::is_paused() || crate::embed::native_window() == 0 {
+                if let Some(window) = self.window.as_mut() {
+                    window.on_main_stack = true;
+                    window.poll_for_events(self.options.as_ref());
+                }
+            }
+
             #[cfg(target_os = "ios")]
             if crate::take_host_exit_request() {
                 echo!("Returning to the iOS host library.");

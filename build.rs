@@ -84,21 +84,22 @@ pub fn main() {
     // libc++_shared.so has to be copied into the APK. See README of cargo-ndk.
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "android" {
         println!("cargo:rustc-link-lib=c++_shared");
-        let sysroot_libs_path =
-            PathBuf::from(std::env::var_os("CARGO_NDK_SYSROOT_LIBS_PATH").unwrap());
-        let lib_path = sysroot_libs_path.join("libc++_shared.so");
-        std::fs::copy(
-            lib_path,
-            // cargo-ndk as invoked by cargo-ndk-android-gradle actually
-            // copies from the target directory, using this hacky path
-            // concatenation approach. :(
-            package_root
+        // cargo-ndk sets this and copies the library into the APK. A plain
+        // cargo build (Alpine commits libc++_shared.so itself) leaves it unset.
+        if let Some(sysroot_libs_path) = std::env::var_os("CARGO_NDK_SYSROOT_LIBS_PATH") {
+            let lib_path = PathBuf::from(sysroot_libs_path).join("libc++_shared.so");
+            let dest = package_root
                 .join("target")
                 .join(std::env::var("TARGET").unwrap())
                 .join(std::env::var("PROFILE").unwrap())
-                .join("libc++_shared.so"),
-        )
-        .unwrap();
+                .join("libc++_shared.so");
+            if lib_path.is_file() {
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::copy(lib_path, dest).unwrap();
+            }
+        }
     }
 
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {

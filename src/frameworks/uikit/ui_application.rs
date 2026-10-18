@@ -135,6 +135,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setStatusBarHidden:(bool)hidden {
     env.framework_state.uikit.ui_application.status_bar_hidden = hidden;
+    crate::embed::notify_status_bar(hidden);
 }
 - (())setStatusBarHidden:(bool)hidden
                 animated:(bool)_animated {

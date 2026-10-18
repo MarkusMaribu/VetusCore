@@ -24,7 +24,7 @@
 /// A live overlay id, or `-1` when no overlay could be created.
 pub type OverlayId = i32;
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", not(feature = "embedded")))]
 mod imp {
     use super::*;
     use std::ffi::CString;
@@ -651,7 +651,7 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(any(not(target_os = "android"), feature = "embedded"))]
 mod imp {
     use super::OverlayId;
 

@@ -2,7 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 [workspace]
-members = ["platform/ios/rust-entry"]
+members = ["platform/ios/rust-entry", "platform/android/vetus_embed"]
 
 [workspace.package]
 version = "0.2.3"
@@ -28,6 +28,8 @@ path = "src/bin.rs"
 [features]
 default = ["static"]
 static = [
+    "dep:sdl2",
+    "dep:sdl2-sys",
     "sdl2/bundled",
     "sdl2/static-link",
     "touchHLE_openal_soft_wrapper/static",
@@ -38,6 +40,14 @@ static = [
 # SDL owns the process entry point and the UIApplicationDelegate, so the app and
 # the core have to be the same SDL — a core cannot bring its own copy.
 dynamic-sdl = [
+    "dep:sdl2",
+    "dep:sdl2-sys",
+    "touchHLE_openal_soft_wrapper/static",
+    "touchHLE_libxml2_wrapper/static",
+]
+# Android library used by Alpine's Vetus app. No SDL, no app picker window:
+# the host supplies an ANativeWindow and drives one IPA per process.
+embedded = [
     "touchHLE_openal_soft_wrapper/static",
     "touchHLE_libxml2_wrapper/static",
 ]
@@ -109,8 +119,8 @@ encoding_rs = "0.8.35"
 # behind this, but the actual HIDAPI is not used by touchHLE (see window.rs).
 # Note that the submodule in vendor/SDL2/ must use exactly the same revision of
 # SDL2 that rust-sdl2 uses, so that the Android JNI interface matches.
-sdl2 = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3", features = ["hidapi"] }
-sdl2-sys = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3" }
+sdl2 = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3", features = ["hidapi"], optional = true }
+sdl2-sys = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3", optional = true }
 touchHLE_dynarmic_wrapper = { path = "src/cpu/dynarmic_wrapper" }
 touchHLE_gl_bindings = { path = "src/gles/gl_bindings" }
 touchHLE_libxml2_wrapper = { path = "src/frameworks/libxml2_wrapper" }

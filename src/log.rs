@@ -75,10 +75,12 @@ macro_rules! echo {
         {
             let mut formatted_str = format!($($arg)+);
 
-            #[cfg(target_os = "android")]
+            #[cfg(all(target_os = "android", not(feature = "embedded")))]
             {
                 sdl2::log::log(&formatted_str);
             }
+            #[cfg(all(target_os = "android", feature = "embedded"))]
+            $crate::log::android_log(&formatted_str);
             #[cfg(not(target_os = "android"))]
             eprintln!("{}", formatted_str);
 
@@ -93,10 +95,12 @@ macro_rules! echo {
     };
     () => {
         {
-            #[cfg(target_os = "android")]
+            #[cfg(all(target_os = "android", not(feature = "embedded")))]
             {
                 sdl2::log::log("");
             }
+            #[cfg(all(target_os = "android", feature = "embedded"))]
+            $crate::log::android_log("");
             #[cfg(not(target_os = "android"))]
             eprintln!("");
 
@@ -156,3 +160,18 @@ pub const ENABLED_MODULES: &[&str] = &["touchHLE::frameworks::media_player::movi
 // run-loop time it needs to dispatch touches.
 #[cfg(target_os = "ios")]
 pub const ENABLED_MODULES: &[&str] = &[];
+
+#[cfg(all(target_os = "android", feature = "embedded"))]
+pub fn android_log(message: &str) {
+    let mut line = String::with_capacity(message.len() + 1);
+    line.push_str(message);
+    line.push('\0');
+    unsafe {
+        __android_log_write(4, b"VetusCore\0".as_ptr() as *const i8, line.as_ptr() as *const i8);
+    }
+}
+
+#[cfg(all(target_os = "android", feature = "embedded"))]
+unsafe extern "C" {
+    fn __android_log_write(priority: i32, tag: *const i8, text: *const i8) -> i32;
+}

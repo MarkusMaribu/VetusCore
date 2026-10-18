@@ -29,7 +29,7 @@ mod log;
 mod env_flags;
 mod fastmap;
 mod abi;
-mod android_jni;
+pub mod android_jni;
 mod android_media;
 mod android_web_view;
 mod audio;
@@ -57,7 +57,12 @@ mod stack;
 mod guest_clock;
 mod trainer;
 mod trainer_ui;
+#[cfg(not(feature = "embedded"))]
 mod window;
+#[cfg(feature = "embedded")]
+#[path = "window_embedded.rs"]
+mod window;
+pub mod embed;
 
 // Environment is used very frequently used and used to be in this module, so
 // it is re-exported to avoid having to update lots of imports. The other things
@@ -163,7 +168,7 @@ fn take_host_exit_request() -> bool {
 
 /// This is the true entry point on Android (SDLActivity calls it after
 /// initialization). On other platforms the true entry point is in src/bin.rs.
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", not(feature = "embedded")))]
 #[no_mangle]
 pub extern "C" fn SDL_main(
     _argc: std::ffi::c_int,
@@ -230,7 +235,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         }
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", not(feature = "embedded")))]
     {
         // PERF: raise the scheduling priority of the thread that runs the
         // emulation loop. Android aggressively deprioritises background-ish

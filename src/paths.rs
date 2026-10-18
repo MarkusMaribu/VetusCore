@@ -53,6 +53,12 @@ pub fn default_options_file() -> String {
 /// [None].
 #[allow(dead_code)]
 fn get_bundled_resources_path() -> Option<PathBuf> {
+    #[cfg(feature = "embedded")]
+    {
+        return None;
+    }
+    #[cfg(not(feature = "embedded"))]
+    {
     if !matches!(std::env::consts::OS, "ios" | "macos") {
         return None;
     }
@@ -62,13 +68,16 @@ fn get_bundled_resources_path() -> Option<PathBuf> {
     } else {
         None
     }
+    }
 }
 
 /// Abstraction over a platform-specific type for accessing a resource bundled
 /// with touchHLE.
 pub struct ResourceFile {
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", not(feature = "embedded")))]
     file: sdl2::rwops::RWops<'static>,
+    #[cfg(all(target_os = "android", feature = "embedded"))]
+    file: std::io::Cursor<Vec<u8>>,
     #[cfg(not(target_os = "android"))]
     file: std::fs::File,
 }
@@ -77,8 +86,14 @@ impl ResourceFile {
         Ok(Self {
             // On Android, these resources are included as "assets" within the
             // APK. We access them via SDL2's wrapper of Android's assets API.
-            #[cfg(target_os = "android")]
+            #[cfg(all(target_os = "android", not(feature = "embedded")))]
             file: sdl2::rwops::RWops::from_file(path, "r")?,
+
+            #[cfg(all(target_os = "android", feature = "embedded"))]
+            file: std::io::Cursor::new(
+                crate::embed::read_resource(path)
+                    .ok_or_else(|| format!("Missing bundled resource {path}"))?,
+            ),
 
             // On other OSes, resources are accessed as ordinary files.
             #[cfg(not(target_os = "android"))]
@@ -134,7 +149,11 @@ pub const PHOTO_ALBUM_DIR: &str = "DCIM/100APPLE";
 /// Get a platform-specific base path needed for accessing touchHLE's
 /// user-modifiable files. This is empty on platforms other than Android.
 pub fn user_data_base_path() -> Cow<'static, Path> {
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", feature = "embedded"))]
+    {
+        return Cow::from(crate::embed::user_data_path());
+    }
+    #[cfg(all(target_os = "android", not(feature = "embedded")))]
     unsafe {
         // This is an exception to the rule that SDL2 should only be used
         // directly from src/window.rs. This is just too distant from windowing
@@ -165,6 +184,7 @@ pub fn user_data_base_path() -> Cow<'static, Path> {
         // When touchHLE is run from a .app bundle on macOS, the user might not
         // be able to control the current directory, so user data needs to go in
         // a standard location.
+        #[cfg(not(feature = "embedded"))]
         if get_bundled_resources_path().is_some() {
             return Cow::from(PathBuf::from(
                 sdl2::filesystem::pref_path("touchhle.org", "touchHLE").unwrap(),
