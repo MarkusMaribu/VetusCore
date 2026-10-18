@@ -127,16 +127,24 @@ fn main() {
         // Figure out the real static lib name on Windows (debug `libxml2sd`
         // vs release `libxml2s`) by probing the install dir.
         if os.eq_ignore_ascii_case("windows") {
-            win_static_lib = ["libxml2sd", "libxml2s"]
-                .into_iter()
-                .find(|name| {
-                    install_dir.join("lib").join(format!("{name}.lib")).exists()
-                        || install_dir
-                            .join("lib64")
-                            .join(format!("{name}.lib"))
-                            .exists()
-                })
-                .map(|name| name.to_string());
+            let gnu = ["lib", "lib64"].iter().any(|dir| {
+                install_dir.join(dir).join("libxml2.a").is_file()
+            });
+            win_static_lib = if gnu {
+                // MinGW/LLVM CMake emits libxml2.a. rustc looks that up as "xml2".
+                Some("xml2".to_string())
+            } else {
+                ["libxml2sd", "libxml2s"]
+                    .into_iter()
+                    .find(|name| {
+                        install_dir.join("lib").join(format!("{name}.lib")).exists()
+                            || install_dir
+                                .join("lib64")
+                                .join(format!("{name}.lib"))
+                                .exists()
+                    })
+                    .map(|name| name.to_string())
+            };
         }
 
         include_dirs.push(install_dir.join("include").join("libxml2"));
