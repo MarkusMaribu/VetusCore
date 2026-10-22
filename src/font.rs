@@ -104,7 +104,27 @@ impl RasterGlyph<'_> {
 
 impl Font {
     pub fn glyph_id_for_char(&self, c: u16) -> GlyphId {
-        self.rt().glyph(char::from_u32(c as u32).unwrap()).id()
+        self.glyph_id_for_unicode(char::from_u32(c as u32).unwrap())
+    }
+
+    /// Look up a glyph using the font's Unicode cmap for a full codepoint.
+    /// Unlike `glyph_id_for_char`, this also supports supplementary-plane
+    /// characters that cannot be represented by a single UTF-16 code unit.
+    pub fn glyph_id_for_unicode(&self, c: char) -> GlyphId {
+        self.rt().glyph(c).id()
+    }
+
+    /// Guest-provided glyph IDs may belong to another font (for example,
+    /// when a requested font was substituted). RustType panics on IDs outside
+    /// this font's glyph range, so use the missing-glyph outline instead.
+    fn glyph(&self, glyph_id: GlyphId) -> rusttype::Glyph<'_> {
+        let font = self.rt();
+        let glyph_id = if (glyph_id.0 as usize) < font.glyph_count() {
+            glyph_id
+        } else {
+            GlyphId(0)
+        };
+        font.glyph(glyph_id)
     }
 
     /// Returns the total number of glyphs in the font.
@@ -128,16 +148,32 @@ impl Font {
         2048
     }
 
+    /// The rusttype [Scale] at which one em is `font_size` pixels, which is
+    /// what Core Graphics means by a font size. rusttype's scale is the
+    /// height from descent to ascent instead, so the two differ by a factor
+    /// that depends on the font: about 1.12 for the bundled fonts (hence the
+    /// UIKit fudge factor in [scale]), but over 1.5 for e.g. Papyrus.
+    fn em_scale(&self, font_size: f32) -> Scale {
+        let v_metrics = self.rt().v_metrics_unscaled();
+        let height_per_em = (v_metrics.ascent - v_metrics.descent) / self.units_per_em() as f32;
+        Scale::uniform(font_size * height_per_em)
+    }
+
+    /// Returns the ascent, descent and line gap in design units.
+    pub fn design_v_metrics(&self) -> (f32, f32, f32) {
+        let v_metrics = self.rt().v_metrics_unscaled();
+        (v_metrics.ascent, v_metrics.descent, v_metrics.line_gap)
+    }
+
     /// Returns the advance width (in design units) for a glyph.
     pub fn glyph_advance(&self, glyph_id: GlyphId) -> i32 {
         let upm = self.units_per_em() as f32;
-        let g = self.rt().glyph(glyph_id).scaled(Scale::uniform(upm));
+        let g = self.glyph(glyph_id).scaled(self.em_scale(upm));
         g.h_metrics().advance_width.round() as i32
     }
 
     pub(crate) fn glyph_advance_at_size(&self, glyph_id: GlyphId, font_size: f32) -> f32 {
-        self.rt()
-            .glyph(glyph_id)
+        self.glyph(glyph_id)
             .scaled(scale(font_size))
             .h_metrics()
             .advance_width
@@ -150,17 +186,14 @@ impl Font {
         glyphs
             .iter()
             .map(|glyph_id| {
+                let glyph = self.glyph(*glyph_id);
+                let glyph_id = glyph.id();
                 if let Some(previous) = previous {
-                    x += self.rt().pair_kerning(font_scale, previous, *glyph_id);
+                    x += self.rt().pair_kerning(font_scale, previous, glyph_id);
                 }
                 let position = x;
-                x += self
-                    .rt()
-                    .glyph(*glyph_id)
-                    .scaled(font_scale)
-                    .h_metrics()
-                    .advance_width;
-                previous = Some(*glyph_id);
+                x += glyph.scaled(font_scale).h_metrics().advance_width;
+                previous = Some(glyph_id);
                 position
             })
             .collect()
@@ -172,14 +205,16 @@ impl Font {
         font_size: f32,
     ) -> (f32, f32, f32, f32) {
         let glyph = self
-            .rt()
             .glyph(glyph_id)
             .scaled(scale(font_size))
             .positioned(Point { x: 0.0, y: 0.0 });
         match glyph.pixel_bounding_box() {
             Some(bb) => (
                 bb.min.x as f32,
-                bb.min.y as f32,
+                // As in `glyph_bbox`, CoreText returns a baseline-relative
+                // rect in a y-up coordinate system, while rusttype's raster
+                // bounds have y increasing downwards.
+                -(bb.max.y as f32),
                 (bb.max.x - bb.min.x) as f32,
                 (bb.max.y - bb.min.y) as f32,
             ),
@@ -190,7 +225,7 @@ impl Font {
     /// Returns the left side bearing (in design units) for a glyph.
     pub fn glyph_left_side_bearing(&self, glyph_id: GlyphId) -> i32 {
         let upm = self.units_per_em() as f32;
-        let g = self.rt().glyph(glyph_id).scaled(Scale::uniform(upm));
+        let g = self.glyph(glyph_id).scaled(self.em_scale(upm));
         g.h_metrics().left_side_bearing.round() as i32
     }
 
@@ -200,14 +235,17 @@ impl Font {
     pub fn glyph_bbox(&self, glyph_id: GlyphId) -> (f32, f32, f32, f32) {
         let upm = self.units_per_em() as f32;
         let g = self
-            .rt()
             .glyph(glyph_id)
-            .scaled(Scale::uniform(upm))
+            .scaled(self.em_scale(upm))
             .positioned(Point { x: 0.0, y: 0.0 });
         match g.pixel_bounding_box() {
             Some(bb) => {
                 let x = bb.min.x as f32;
-                let y = bb.min.y as f32;
+                // rusttype's raster bounds use a top-left origin with y
+                // increasing downwards. CGFont glyph bounds are in the
+                // Core Graphics font coordinate system (baseline origin,
+                // y increasing upwards), so the lower edge is -bb.max.y.
+                let y = -(bb.max.y as f32);
                 let w = (bb.max.x - bb.min.x) as f32;
                 let h = (bb.max.y - bb.min.y) as f32;
                 (x, y, w, h)
@@ -671,16 +709,15 @@ impl Font {
             .max(1.0);
 
         let start = Point { x: 0.0, y: 0.0 };
+        let glyph_scale = self.em_scale(font_size * tmp_font_scale);
         // This code is adapted from documentation of [rusttype::Font::layout].
-        let iter = self
-            .rt()
-            .glyphs_for(glyphs.into_iter())
+        let iter = glyphs
+            .into_iter()
+            .map(|glyph_id| self.glyph(glyph_id))
             .scan((None, 0.0), |(last, x), g| {
-                let g = g.scaled(scale(font_size * tmp_font_scale));
+                let g = g.scaled(glyph_scale);
                 if let Some(last) = last {
-                    *x += self
-                        .rt()
-                        .pair_kerning(scale(font_size * tmp_font_scale), *last, g.id());
+                    *x += self.rt().pair_kerning(glyph_scale, *last, g.id());
                 }
                 let w = g.h_metrics().advance_width;
                 let next = g.positioned(start + vector(*x, 0.0));
@@ -800,9 +837,8 @@ impl Font {
             let y = origin.1 + pos.1;
 
             let g = self
-                .rt()
                 .glyph(*glyph_id)
-                .scaled(scale(font_size))
+                .scaled(self.em_scale(font_size))
                 .positioned(Point { x, y: 0.0 });
 
             let Some(glyph_bounds) = g.pixel_bounding_box() else {
@@ -853,9 +889,8 @@ impl Font {
 
         for (i, glyph_id) in glyphs.iter().enumerate() {
             let g = self
-                .rt()
                 .glyph(*glyph_id)
-                .scaled(scale(font_size))
+                .scaled(self.em_scale(font_size))
                 .positioned(Point {
                     x: current_x,
                     y: 0.0,
@@ -1342,6 +1377,88 @@ fn glyph_id_from_post_table(post_data: &[u8], name: &str, _glyph_count: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_glyph_metrics_use_notdef() {
+        let font = Font::sans_regular();
+        let count = font.glyph_count();
+        assert!(count > 0 && count < u16::MAX as u32);
+        for id in [0, 1, count as u16 - 1] {
+            assert_eq!(font.glyph(GlyphId(id)).id(), GlyphId(id));
+        }
+
+        let missing = GlyphId(0);
+        let valid = font.glyph_id_for_unicode('A');
+        for invalid in [GlyphId(count as u16), GlyphId(u16::MAX)] {
+            assert_eq!(font.glyph(invalid).id(), missing);
+            assert_eq!(font.glyph_advance(invalid), font.glyph_advance(missing));
+            assert_eq!(
+                font.glyph_left_side_bearing(invalid),
+                font.glyph_left_side_bearing(missing)
+            );
+            assert_eq!(font.glyph_bbox(invalid), font.glyph_bbox(missing));
+            assert_eq!(
+                font.glyph_advance_at_size(invalid, 20.0),
+                font.glyph_advance_at_size(missing, 20.0)
+            );
+            assert_eq!(
+                font.glyph_bbox_at_size(invalid, 20.0),
+                font.glyph_bbox_at_size(missing, 20.0)
+            );
+            // Exercise invalid IDs as both sides of a kerning pair.
+            assert_eq!(
+                font.glyph_positions_at_size(20.0, &[valid, invalid, invalid, valid]),
+                font.glyph_positions_at_size(20.0, &[valid, missing, missing, valid])
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_glyph_rendering_matches_notdef_in_all_draw_paths() {
+        let font = Font::sans_regular();
+        let valid = font.glyph_id_for_unicode('A');
+        let render = |mode, glyphs: &[GlyphId]| {
+            let mut rasters = Vec::new();
+            let capture = |glyph: RasterGlyph<'_>| {
+                rasters.push((glyph.origin, glyph.dimensions, glyph.pixels.to_vec()));
+            };
+            match mode {
+                0 => font.draw_glyphs(
+                    20.0,
+                    glyphs.iter().copied(),
+                    (0.0, 0.0),
+                    CGAffineTransform {
+                        a: 1.0,
+                        d: 1.0,
+                        ..Default::default()
+                    },
+                    capture,
+                ),
+                1 => font.draw_glyphs_at_positions(
+                    20.0,
+                    glyphs,
+                    &[(0.0, 0.0), (20.0, 0.0), (40.0, 0.0), (60.0, 0.0)],
+                    (0.0, 0.0),
+                    capture,
+                ),
+                _ => font.draw_glyphs_with_advances(
+                    20.0,
+                    glyphs,
+                    &[(20.0, 0.0); 4],
+                    (0.0, 0.0),
+                    capture,
+                ),
+            }
+            rasters
+        };
+        for mode in 0..3 {
+            let expected = render(mode, &[valid, GlyphId(0), GlyphId(0), valid]);
+            assert!(!expected.is_empty());
+            for invalid in [GlyphId(font.glyph_count() as u16), GlyphId(u16::MAX)] {
+                assert_eq!(render(mode, &[valid, invalid, invalid, valid]), expected);
+            }
+        }
+    }
 
     #[test]
     fn core_text_glyph_positions_match_raster_scale_and_kerning() {

@@ -283,7 +283,12 @@ impl ToOwned for GuestPath {
 }
 
 /// Like [PathBuf] but for the virtual filesystem.
-#[derive(Debug, Clone, Default)]
+///
+/// Equality, ordering and hashing are those of the path string. They are
+/// derived here so that guest paths can be sorted and used as `HashSet` /
+/// `HashMap` keys (e.g. when an app bundle's icon candidates are deduplicated
+/// and ordered by resolution).
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GuestPathBuf(String);
 impl From<String> for GuestPathBuf {
     fn from(string: String) -> GuestPathBuf {
@@ -915,8 +920,10 @@ impl Fs {
     ) -> (Fs, GuestPathBuf) {
         const FAKE_UUID: &str = "00000000-0000-0000-0000-000000000000";
         let home_directory = APPLICATIONS.join(FAKE_UUID);
+        // As on iPhone OS 2 and iOS 4, apps start in `/`. Some games rely on
+        // it and open paths like `var/mobile/...` relative to it.
+        let working_directory = GuestPathBuf::from("/".to_string());
         let bundle_guest_path = home_directory.join(&bundle_dir_name);
-        let working_directory = bundle_guest_path.clone();
 
         let directories = ["Documents", "Library", "tmp"];
         let host_path_directories = directories.map(|dir| {

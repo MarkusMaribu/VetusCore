@@ -69,6 +69,7 @@ pub mod embed;
 // probably shouldn't be, but they need a new home (TODO).
 // Unlike its siblings, this module should be considered private and only used
 // via re-exports.
+pub use environment::GuestTermination;
 use environment::{Environment, MutexId, MutexType, ThreadId, PTHREAD_MUTEX_DEFAULT};
 
 use std::path::PathBuf;
@@ -192,10 +193,16 @@ pub extern "C" fn SDL_main(
     }));
     // Empty args: brings up app picker.
     match main([String::new()].into_iter()) {
-        Ok(_) => echo!("touchHLE finished"),
-        Err(e) => echo!("touchHLE errored: {e:?}"),
+        Ok(termination) => {
+            let code = termination.map_or(0, |result| result.exit_code());
+            echo!("touchHLE finished with status {code}");
+            code
+        }
+        Err(e) => {
+            echo!("touchHLE errored: {e:?}");
+            1
+        }
     }
-    0
 }
 
 const USAGE: &str = "\
@@ -213,7 +220,9 @@ Special options:
     --info
         Print basic information about the app bundle without running the app.
 ";
-pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
+/// Run a guest session, keeping its termination separate from emulator errors.
+/// `None` denotes a host-only operation or a return without guest termination.
+pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermination>, String> {
     crash_handler::install();
     crash_handler::install_panic_hook();
 
@@ -294,7 +303,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         } else if arg == "--help" {
             echo!("{}", USAGE);
             echo!("{}", options::OPTIONS_HELP);
-            return Ok(());
+            return Ok(None);
         } else if arg == "--info" {
             just_info = true;
         // Parse an option and store a backup in option_args so that we can
@@ -314,7 +323,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     if options.dumping_options.symbols {
         let mut file = std::fs::File::create(&options.dumping_file).map_err(|e| e.to_string())?;
         dyld::Dyld::dump_host_symbols(&mut file).unwrap();
-        return Ok(());
+        return Ok(None);
     }
 
     let bundle_path = if let Some(bundle_path) = bundle_path {
@@ -520,7 +529,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     }
 
     if just_info {
-        return Ok(());
+        return Ok(None);
     }
 
     // Apply options from files
@@ -605,7 +614,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     };
     let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.run()));
     match run_result {
-        Ok(()) => Ok(()),
+        Ok(termination) => Ok(termination),
         Err(payload) => {
             let message = if let Some(s) = payload.downcast_ref::<&str>() {
                 (*s).to_string()

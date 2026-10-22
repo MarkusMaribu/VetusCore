@@ -884,6 +884,20 @@ pub fn populate_battery_cache() {
     let _ = BATTERY_CACHE.set((percent, state));
 }
 
+/// The app picker refreshes its status-bar battery from here. The embedded
+/// host pushes readings through [crate::embed::set_battery], so there is no
+/// SDL query to repeat; this just makes sure the cache has been seeded.
+pub fn refresh_battery_cache() {
+    if BATTERY_CACHE.get().is_none() {
+        populate_battery_cache();
+    }
+}
+
+/// Cached battery reading, safe to call from a guest coroutine (no JNI).
+pub fn cached_battery_status() -> Option<(i32, BatteryState)> {
+    BATTERY_CACHE.get().copied()
+}
+
 pub fn get_battery_status() -> (i32, BatteryState) {
     if let Some((percent, state)) = BATTERY_CACHE.get() {
         return (*percent, *state);

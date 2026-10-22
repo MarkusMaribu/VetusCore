@@ -127,6 +127,9 @@ pub const APPS_DIR: &str = "touchHLE_apps";
 /// Name of the file intended for the user's own options.
 pub const USER_OPTIONS_FILE: &str = "touchHLE_options.txt";
 
+/// Persistent preferences for the graphical app picker.
+pub const PICKER_SETTINGS_FILE: &str = "touchHLE_picker_settings.txt";
+
 /// Names of files the user can put a wallpaper image (for the app picker) in.
 #[allow(unused)]
 pub const WALLPAPER_FILES: &[&str] = &[
@@ -194,31 +197,94 @@ pub fn user_data_base_path() -> Cow<'static, Path> {
     }
 }
 
+/// The Android application id, as set by `applicationId` in
+/// `android/app/build.gradle`. The documents provider is registered with
+/// `${applicationId}.provider` as its authority, so this must be kept in sync
+/// with the Gradle file (only the branding suffix is appended separately).
+const ANDROID_APPLICATION_ID: &str = "org.hyperhle.reborn";
+
+/// The authority of the documents provider that exposes the user data
+/// directory to the system file manager on Android. A build with branding
+/// (e.g. "UNOFFICIAL") gets `applicationIdSuffix`ed, so the authority carries
+/// the lowercased branding too.
+fn android_documents_authority() -> String {
+    let branding = crate::branding();
+    if branding.is_empty() {
+        format!("{ANDROID_APPLICATION_ID}.provider")
+    } else {
+        format!(
+            "{ANDROID_APPLICATION_ID}.{}.provider",
+            branding.to_lowercase()
+        )
+    }
+}
+
+/// A `content://` URI for one document of the provider above, using the
+/// `…/document/<document id>` form that `DocumentsContract` understands. The
+/// document id is a single path segment, so the slashes in it (the provider
+/// uses hierarchical ids like `root/<name>`) must be percent-encoded.
+fn android_document_uri(document_id: &str) -> String {
+    format!(
+        "content://{}/document/{}",
+        android_documents_authority(),
+        document_id.replace('/', "%2F")
+    )
+}
+
+fn path_to_file_url(path: &std::path::Path) -> Result<String, String> {
+    // Canonicalize when possible, but don't require the directory to already
+    // exist — the file manager button may be pressed before any app has been
+    // added and the apps directory lazily created. Falling back to an
+    // absolute non-canonical path is better than failing with
+    // "Can't canonicalize".
+    let abs_path = if path.exists() {
+        path.canonicalize()
+            .map_err(|e| format!("Can't canonicalize path {}: {e}", path.display()))?
+    } else {
+        // Build an absolute path without requiring existence.
+        let cur = std::env::current_dir().map_err(|e| format!("Can't get current dir: {e}"))?;
+        let joined = cur.join(path);
+        // Try to canonicalize the parent if it exists, otherwise keep joined.
+        if let Some(parent) = joined.parent().filter(|p| p.exists()) {
+            if let Ok(canonical_parent) = parent.canonicalize() {
+                if let Some(file_name) = joined.file_name() {
+                    canonical_parent.join(file_name)
+                } else {
+                    canonical_parent
+                }
+            } else {
+                joined
+            }
+        } else {
+            joined
+        }
+    };
+    // Ensure the directory exists so file managers have something to show.
+    if !abs_path.exists() {
+        let _ = std::fs::create_dir_all(&abs_path);
+    }
+    let path_str = abs_path
+        .to_str()
+        .ok_or_else(|| "Path is not UTF-8".to_string())?;
+    let path_str = if std::env::consts::OS == "windows" {
+        path_str.strip_prefix("\\\\?\\").unwrap_or(path_str)
+    } else {
+        path_str
+    };
+    Ok(format!("file://{path_str}"))
+}
+
 /// Get a URI that can be used to open a file manager or similar for the path
 /// that [user_data_base_path] represents.
 pub fn url_for_opening_user_data_dir() -> Result<String, String> {
     if std::env::consts::OS == "android" {
         // See DocumentsProvider.kt, app/build.gradle and AndroidManifest.xml
-        let brand = crate::branding();
         Ok(format!(
-            "content://org.touchhle.android{}{}.provider/root/root",
-            if brand.is_empty() { "" } else { "." },
-            brand.to_lowercase()
+            "content://{}/root/root",
+            android_documents_authority()
         ))
     } else {
-        let path = user_data_base_path()
-            .join(".")
-            .canonicalize()
-            .map_err(|e| format!("Can't canonicalize path to user data directory: {e}"))?;
-        let path = path
-            .to_str()
-            .ok_or_else(|| "User data directory path is not UTF-8".to_string())?;
-        let path = if std::env::consts::OS == "windows" {
-            path.strip_prefix("\\\\?\\").unwrap_or(path)
-        } else {
-            path
-        };
-        Ok(format!("file://{path}"))
+        path_to_file_url(&user_data_base_path().join("."))
     }
 }
 
@@ -229,26 +295,11 @@ pub fn url_for_opening_apps_dir() -> Result<String, String> {
         // folder, but the app's Documents directory is shown in "On My iPhone".
         Ok("shareddocuments://".to_string())
     } else if std::env::consts::OS == "android" {
-        let brand = crate::branding();
-        Ok(format!(
-            "content://org.touchhle.android{}{}.provider/root/root/{}",
-            if brand.is_empty() { "" } else { "." },
-            brand.to_lowercase(),
-            APPS_DIR
-        ))
+        // Opening the apps folder directly, rather than the provider's root,
+        // so the file manager starts where the games are.
+        Ok(android_document_uri(&format!("root/{APPS_DIR}")))
     } else {
-        let path = apps_dir
-            .canonicalize()
-            .map_err(|e| format!("Can't canonicalize apps directory: {e}"))?;
-        let path = path
-            .to_str()
-            .ok_or_else(|| "Apps directory path is not UTF-8".to_string())?;
-        let path = if std::env::consts::OS == "windows" {
-            path.strip_prefix("\\\\?\\").unwrap_or(path)
-        } else {
-            path
-        };
-        Ok(format!("file://{path}"))
+        path_to_file_url(&apps_dir)
     }
 }
 

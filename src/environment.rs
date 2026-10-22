@@ -28,6 +28,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::libc::pthread::cond::pthread_cond_t;
+use crate::libc::stdio::FILE;
 use crate::window::DeviceFamily;
 use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, Yielder};
@@ -48,7 +49,7 @@ pub struct Thread {
     pub blocked_by: ThreadBlock,
     /// Container for thread local state of various child modules
     pub thread_local_framework_state: frameworks::ThreadLocalState,
-    /// After a secondary thread finishes, this is set to the returned value.
+    /// The thread's return value, including an explicit main-thread pthread_exit.
     return_value: Option<MutVoidPtr>,
     /// Context object containing the CPU state for this thread.
     ///
@@ -129,6 +130,24 @@ pub static LAST_HOST_CALL_SYMBOL_PTR: std::sync::atomic::AtomicUsize =
 pub static LAST_HOST_CALL_SYMBOL_LEN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// How a guest process ended, independently of the host process.
+#[derive(Clone, Copy, Debug)]
+pub enum GuestTermination {
+    Exit(i32),
+    Signal(i32),
+}
+
+impl GuestTermination {
+    /// Map the guest result to a CLI or SDL process status.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Exit(code) => code & 0xff,
+            // Shell convention; do not send a host signal to the emulator.
+            Self::Signal(signal) => 128 + signal,
+        }
+    }
+}
+
 /// The struct containing the entire emulator state. Methods are provided for
 /// execution and management of threads.
 pub struct Environment {
@@ -177,25 +196,15 @@ pub struct Environment {
     /// pointer. See `debug_cpu_error`.
     cpu_error_bypass_last_lr: Option<u32>,
     cpu_error_bypass_lr_count: u32,
-    /// The thread and stack pointer of the most recent *deliberate* guest trap
-    /// (`udf`/`trap`/`bkpt`) that was bypassed. A deliberate trap means the
-    /// guest decided its own process is dead (failed assert, unhandled
-    /// managed exception, `__builtin_trap`); bypassing it keeps the emulator
-    /// alive but leaves that call chain running on state its author never
-    /// intended to be reachable. See `guest_trap_bypass_still_on_stack`.
-    last_deliberate_trap_bypass: Option<(ThreadId, u32)>,
     /// Per-site counters for instructions dynarmic could not decode inside a
     /// code section and that were skipped as no-ops (keyed on the fault PC).
     /// Only used to rate-limit logging. See `debug_cpu_error`.
     cpu_skipped_instruction_sites: HashMap<u32, u32>,
-    /// A guest `exit`/`abort` had no safe frame to recover to. This is consumed
-    /// at the existing return-to-host boundary so it cannot terminate the host
-    /// process from inside a linked libc function.
-    guest_termination_requested: bool,
+    /// Guest process result, consumed at the return-to-host boundary without
+    /// terminating the host process inside a linked libc function.
+    guest_termination_requested: Option<GuestTermination>,
     /// A required Unity player archive could not be resolved or read from the
-    /// mounted bundle. Continuing after Unity calls its fatal exit would
-    /// execute a half-initialized engine, so termination recovery is disabled
-    /// for this guest session.
+    /// mounted bundle. Retained to report the first missing archive once.
     missing_unity_player_archive: Option<String>,
     /// A linked host function deliberately redirected the guest PC. This skips
     /// the normal post-SVC return, which would overwrite the new continuation
@@ -279,6 +288,15 @@ enum GuestTrapRecovery {
         frame: GuestFrameRecord,
         reason: &'static str,
     },
+    /// Pop the return address of the frame that trapped off the guest stack
+    /// (the word at SP after a normal `push {..., lr}` prologue) and continue
+    /// in its caller. Used when the frame-pointer chain is unusable but the
+    /// stack still holds a plausible call return address.
+    UnwindStack {
+        return_addr: u32,
+        caller_sp: u32,
+        reason: &'static str,
+    },
     /// Step over the faulting instruction and continue in the same function.
     SkipInstruction { reason: &'static str },
 }
@@ -307,6 +325,10 @@ pub enum ThreadBlock {
     // resuming.
     #[allow(dead_code)]
     Suspended(usize, Box<ThreadBlock>),
+    // Thread is waiting on a FILE object lock.
+    FileObjectLock(MutPtr<FILE>),
+    // Thread is waiting for a KeyMgr process-wide pointer lock.
+    KeymgrLock(i32),
 }
 
 struct BinaryDependencyNode {
@@ -625,22 +647,26 @@ impl Environment {
                 log!("Warning: {}", e);
             }
 
-            let launch_image_path = bundle.launch_image_path(&fs, device_family);
-            let launch_image = if fs.is_file(&launch_image_path) {
-                let res = fs
-                    .read(launch_image_path)
-                    .map_err(|_| "Could not read launch image file".to_string())
-                    .and_then(|bytes| {
-                        image::Image::from_bytes(&bytes)
-                            .map_err(|e| format!("Could not parse launch image: {e}"))
-                    });
-                if let Err(ref e) = res {
-                    log!("Warning: {}", e);
-                };
-                res.ok()
-            } else {
-                None
-            };
+            // `launch_image_path` already resolved the spelling of the file
+            // that exists in the bundle, so no extra is_file() check here:
+            // doing an exact-match check on the plist's spelling instead was
+            // what made the picker log "Using launch image" for a file that
+            // then silently wasn't shown.
+            let launch_image = bundle
+                .launch_image_path(&fs, device_family)
+                .and_then(|path| {
+                    let res = fs
+                        .read(path)
+                        .map_err(|_| "Could not read launch image file".to_string())
+                        .and_then(|bytes| {
+                            image::Image::from_bytes(&bytes)
+                                .map_err(|e| format!("Could not parse launch image: {e}"))
+                        });
+                    if let Err(ref e) = res {
+                        log!("Warning: {}", e);
+                    };
+                    res.ok()
+                });
             Some(Box::new(window::Window::new(
                 &format!(
                     "{} (touchHLE {}{}{})",
@@ -672,9 +698,13 @@ impl Environment {
             .bundle_identifier()
             .starts_with("com.robtop.geometryjump");
         let is_wheres_my_water = bundle.bundle_identifier() == "com.disney.SwampyGame";
+        let is_gravity_guy = bundle.bundle_identifier() == "com.miniclip.gravityguy";
         // We always reset this flag depending on which game is launched.
-        mem.zero_memory_on_free =
-            !is_spore && !is_critter_crunch && !is_geometry_dash && !is_wheres_my_water;
+        mem.zero_memory_on_free = !is_spore
+            && !is_critter_crunch
+            && !is_geometry_dash
+            && !is_wheres_my_water
+            && !is_gravity_guy;
         if is_spore {
             log!("Applying game-specific hack for Spore Origins: zeroing memory on alloc instead of free.");
         }
@@ -704,6 +734,15 @@ impl Environment {
             // loops forever on the null page, freezing the game on the first
             // dig. Real malloc leaves the stale link in place.
             log!("Applying game-specific hack for Where's My Water: zeroing memory on alloc instead of free.");
+        }
+        if is_gravity_guy {
+            // Gravity Guy reads memory it has already freed while the first
+            // level starts. With freed memory scrubbed, the camera usually
+            // races tens of thousands of points ahead within a few frames, so
+            // the player is never on screen and the tutorial never appears.
+            // Real malloc leaves the freed bytes in place. (This makes a good
+            // start much more likely but not certain yet.)
+            log!("Applying game-specific hack for Gravity Guy: zeroing memory on alloc instead of free.");
         }
         let executable = mach_o::MachO::load_from_bytes(
             &executable_bytes,
@@ -936,11 +975,22 @@ impl Environment {
 
                         env.run_call();
 
-                        if env.guest_termination_requested {
+                        let exited_via_pthread = env.threads[0].return_value.is_some();
+                        if exited_via_pthread {
+                            env.exit_if_last_thread();
+                        } else if entry_point_is_lc_main && !env.is_guest_termination_requested() {
+                            // LC_MAIN enters main directly: dyld normally
+                            // passes its return value to exit(), including
+                            // the registered atexit handlers.
+                            let code = env.cpu.regs()[0] as i32;
+                            crate::libc::stdlib::exit(env, code);
+                        }
+
+                        if env.guest_termination_requested.is_some() {
                             echo!(
                                 "Guest requested controlled termination; returning to the host."
                             );
-                        } else {
+                        } else if !exited_via_pthread {
                             panic!("Main function exited unexpectedly!");
                         }
                     })
@@ -994,10 +1044,9 @@ impl Environment {
             cpu_error_bypass_count: 0,
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
-            last_deliberate_trap_bypass: None,
             cpu_error_bypass_lr_count: 0,
             cpu_skipped_instruction_sites: HashMap::new(),
-            guest_termination_requested: false,
+            guest_termination_requested: None,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
@@ -1005,6 +1054,7 @@ impl Environment {
         };
 
         env.trainer = crate::trainer::Trainer::new(!env.options.trainer_disabled);
+        env.set_tpidruro_for_current_thread();
 
         if env.options.dumping_options.any() {
             env.dump_file =
@@ -1101,6 +1151,16 @@ impl Environment {
         let launch_image = None;
 
         assert!(!options.headless);
+        // On macOS, leave NSApp's icon alone so Launch Services keeps the
+        // bundled HyperHLE.icns icon. SDL_SetWindowIcon would replace the Dock
+        // icon with the app picker's fallback artwork.
+        #[cfg(target_os = "macos")]
+        let window_icon = {
+            let _ = icon;
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
+        let window_icon = Some(icon);
         let window = Some(Box::new(window::Window::new(
             &format!(
                 "touchHLE {}{}{}",
@@ -1112,7 +1172,7 @@ impl Environment {
                 },
                 super::VERSION
             ),
-            Some(icon),
+            window_icon,
             launch_image,
             &options,
         )?));
@@ -1171,10 +1231,9 @@ impl Environment {
             cpu_error_bypass_count: 0,
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
-            last_deliberate_trap_bypass: None,
             cpu_error_bypass_lr_count: 0,
             cpu_skipped_instruction_sites: HashMap::new(),
-            guest_termination_requested: false,
+            guest_termination_requested: None,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
@@ -1243,10 +1302,9 @@ impl Environment {
             cpu_error_bypass_count: 0,
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
-            last_deliberate_trap_bypass: None,
             cpu_error_bypass_lr_count: 0,
             cpu_skipped_instruction_sites: HashMap::new(),
-            guest_termination_requested: false,
+            guest_termination_requested: None,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
@@ -1549,7 +1607,8 @@ impl Environment {
                             start_routine.call_from_host(env, (user_data,));
                         let curr_thread = &mut env.threads[env.current_thread];
                         curr_thread.return_value = Some(return_value);
-                        curr_thread.active = false;
+                        env.exit_if_last_thread();
+                        env.threads[env.current_thread].active = false;
                     });
                 }));
                 if let Err(e) = res {
@@ -1833,7 +1892,7 @@ impl Environment {
 
     /// Run the emulator. This is the main loop and won't return until app exit.
     /// Only `main.rs` should call this.
-    pub fn run(mut self) {
+    pub(crate) fn run(mut self) -> Option<GuestTermination> {
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();
         let mut stepping = false;
@@ -1852,7 +1911,7 @@ impl Environment {
                 let thread = &mut self.threads[self.current_thread];
                 assert!(thread.host_context.is_none());
                 thread.host_context = Some(curr_host_context);
-                return;
+                return None;
             }
 
             if stepping {
@@ -1975,7 +2034,10 @@ impl Environment {
                 let stack = self.threads[self.current_thread].stack.take().unwrap();
                 let stack: mem::MutVoidPtr = mem::Ptr::from_bits(*stack.start());
                 log_dbg!("Freeing thread {} stack {:?}", self.current_thread, stack);
-                self.mem.free(stack);
+                // The main stack is a fixed mapping, not a heap allocation.
+                if self.current_thread != 0 {
+                    self.mem.free(stack);
+                }
                 None
             } else {
                 Some(curr_host_context)
@@ -1992,18 +2054,18 @@ impl Environment {
                 self.stall_diag();
             }
 
-            if kill_current_thread && self.guest_termination_requested {
+            if kill_current_thread && self.guest_termination_requested.is_some() {
                 echo!("Guest session ended through the controlled return-to-host path.");
-                return;
+                return self.guest_termination_requested;
             }
-            if self.guest_termination_requested {
+            if self.guest_termination_requested.is_some() {
                 // A host callback may have yielded before its linked-function
                 // dispatch reached the return-to-host check. Put this live
                 // context back so `Environment::drop` can unwind it safely,
                 // then stop before the scheduler resumes another guest thread.
                 self.threads[self.current_thread].host_context = old_context.take();
                 echo!("Guest session ended while returning from a host callback.");
-                return;
+                return self.guest_termination_requested;
             }
 
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2115,51 +2177,38 @@ impl Environment {
         }
     }
 
+    /// Record explicit thread exit separately from returning from main.
+    pub(crate) fn note_pthread_exit(&mut self, retval: mem::MutVoidPtr) {
+        self.threads[self.current_thread].return_value = Some(retval);
+    }
+
+    /// The last thread ends the process as exit(0), while its coroutine can
+    /// still execute guest atexit handlers. Other threads must remain alive
+    /// when only the main thread calls pthread_exit.
+    fn exit_if_last_thread(&mut self) {
+        if !self.is_guest_termination_requested()
+            && !self
+                .threads
+                .iter()
+                .enumerate()
+                .any(|(id, thread)| id != self.current_thread && thread.active)
+        {
+            crate::libc::stdlib::exit(self, 0);
+        }
+    }
+
     /// Request that active guest execution returns through its host boundary.
     ///
-    /// Linked libc functions use this when an `exit`/`abort` cannot be safely
-    /// unwound. The request is observed by the CPU loop after the host function
+    /// Linked libc functions use this for process termination. The request is
+    /// observed by the CPU loop after the host function
     /// returns, so no guest instruction after a `noreturn` call is executed.
-    pub(crate) fn request_guest_termination(&mut self) {
-        self.guest_termination_requested = true;
+    pub(crate) fn request_guest_termination(&mut self, termination: GuestTermination) {
+        self.guest_termination_requested = Some(termination);
     }
 
     /// Whether a linked guest termination function has requested session end.
     pub(crate) fn is_guest_termination_requested(&self) -> bool {
-        self.guest_termination_requested
-    }
-
-    /// Whether the current thread is still inside the call chain in which a
-    /// deliberate guest trap (`udf`/`trap`, i.e. a failed assert, a
-    /// `__builtin_trap`, or a Unity/Mono unhandled-exception abort) was
-    /// bypassed.
-    ///
-    /// The stack grows downwards, so the chain that trapped is still live
-    /// while the stack pointer has not risen back above the value it had at
-    /// the trap. Once it has, the guest genuinely returned past the dead
-    /// frames and a later `exit`/`abort` is unrelated to the trap, so the
-    /// normal compatibility recovery applies again.
-    ///
-    /// Observed case (Turbo Dismount, Unity 4.5.4): managed code throws
-    /// `System.NullReferenceException`, Unity logs it and branches to its
-    /// one-instruction `trap` helper, then calls `exit(1)` from the same
-    /// chain. Recovering that `exit` resumed the engine inside its own
-    /// death path, which immediately dereferenced NULL (SIGSEGV), ran the
-    /// crash reporter and aborted — turning a clean shutdown into a crash
-    /// cascade that hid the original managed exception.
-    pub(crate) fn guest_trap_bypass_still_on_stack(&mut self) -> bool {
-        let Some((thread, trap_sp)) = self.last_deliberate_trap_bypass else {
-            return false;
-        };
-        if thread != self.current_thread {
-            return false;
-        }
-        if self.cpu.regs()[cpu::Cpu::SP] > trap_sp {
-            // The guest unwound past the trapping frame under its own power.
-            self.last_deliberate_trap_bypass = None;
-            return false;
-        }
-        true
+        self.guest_termination_requested.is_some()
     }
 
     /// Remember that Unity's mandatory serialized player archive is unavailable.
@@ -2199,16 +2248,9 @@ impl Environment {
         self.missing_unity_player_archive = Some(path.to_owned());
         log!(
             "Required Unity player archive {:?} is unavailable from the mounted \
-             bundle. A following guest termination will return to the host instead \
-             of resuming a \
-             half-initialized Unity engine.",
+             bundle.",
             path
         );
-    }
-
-    /// The unavailable Unity player archive, if a resource probe found one.
-    pub(crate) fn missing_unity_player_archive(&self) -> Option<&str> {
-        self.missing_unity_player_archive.as_deref()
     }
 
     /// Preserve a deliberate guest-PC redirect across linked-stub dispatch.
@@ -2282,6 +2324,14 @@ impl Environment {
         self.threads[self.current_thread].host_context = old_context.take();
         *old_context = Some(new_host_ctx);
         self.current_thread = new_thread;
+        self.set_tpidruro_for_current_thread();
+    }
+
+    /// Point the CPU's TPIDRURO register at the current thread's guest
+    /// thread-specific data array. See [libc::pthread::key].
+    fn set_tpidruro_for_current_thread(&mut self) {
+        let array = libc::pthread::key::tsd_array_for_thread(self, self.current_thread);
+        self.cpu.set_tpidruro(array.to_bits());
     }
 
     fn is_recoverable_guest_cpu_error(error: &cpu::CpuError) -> bool {
@@ -2350,6 +2400,36 @@ impl Environment {
                     && addr.wrapping_sub(section.addr) < section.size
             })
         })
+    }
+
+    /// Best-effort recovery for a guest that jumped into garbage: scan the
+    /// words at and above SP for one that looks like a return address (it
+    /// points into a code section and is preceded by a direct `bl`/`blx`).
+    /// Returns `(return_addr, caller_sp)` where `caller_sp` is the SP the
+    /// caller will have after the abandoned function's frame is gone.
+    ///
+    /// This is deliberately conservative and only used when branching to LR
+    /// has already been shown not to make progress, because a bogus unwind
+    /// skips whatever the abandoned call was supposed to do.
+    fn validated_stack_return_address(&self, sp: u32) -> Option<(u32, u32)> {
+        const MAX_SCAN_WORDS: u32 = 64;
+        let mut addr = sp;
+        for _ in 0..MAX_SCAN_WORDS {
+            let word = self.read_guest_u32_fallible(addr)?;
+            let candidate = word & !1;
+            if self.is_guest_code_address(candidate)
+                && decode_direct_call_before(
+                    word,
+                    |a| self.read_guest_u16_fallible(a),
+                    |a| self.read_guest_u32_fallible(a),
+                )
+                .is_some()
+            {
+                return Some((word, addr.wrapping_add(4)));
+            }
+            addr = addr.checked_add(4)?;
+        }
+        None
     }
 
     /// Decode what kind of instruction raised an UndefinedInstruction or
@@ -2675,6 +2755,25 @@ impl Environment {
                 self.cpu
                     .branch(GuestFunction::from_addr_with_thumb_bit(frame.saved_lr));
             }
+            GuestTrapRecovery::UnwindStack {
+                return_addr,
+                caller_sp,
+                ..
+            } => {
+                // LR and the frame record are both unusable (the jump came
+                // from garbage), so take the return address that the call
+                // left on the stack and resume the caller after its call.
+                // LR is pointed at the thread-exit routine so a `bx lr`
+                // epilogue in that caller cannot jump back into the mess.
+                let thread_exit = self.dyld.thread_exit_routine().addr_with_thumb_bit();
+                let regs = self.cpu.regs_mut();
+                regs[cpu::Cpu::SP] = caller_sp;
+                regs[cpu::Cpu::LR] = thread_exit;
+                regs[abi::FRAME_POINTER] = 0;
+                regs[0] = 0;
+                self.cpu
+                    .branch(GuestFunction::from_addr_with_thumb_bit(return_addr));
+            }
             GuestTrapRecovery::SkipInstruction { .. } => {
                 // Advance past the faulting instruction so the guest makes
                 // forward progress, and clear the bypass counters since we're
@@ -2724,6 +2823,19 @@ impl Environment {
             // GDB to detect its software breakpoints. For some reason this
             // isn't correct for memory errors however.
             self.cpu.regs_mut()[cpu::Cpu::PC] = fault_pc;
+        }
+
+        // Some NEON instructions are missing from dynarmic and raise an
+        // UndefinedInstruction. Perform them in software and carry on.
+        if is_undefined_instruction && self.is_guest_code_address(fault_pc) {
+            let guest_mem = &self.mem;
+            let read_u16 = |addr: u32| Some(guest_mem.read(mem::ConstPtr::<u16>::from_bits(addr)));
+            if let Some(len) =
+                cpu::asimd_fallback::emulate(fault_pc, is_thumb, read_u16, self.cpu.extregs_mut())
+            {
+                self.cpu.regs_mut()[cpu::Cpu::PC] = fault_pc.wrapping_add(len);
+                return;
+            }
         }
 
         if self.gdb_server.is_none() {
@@ -3148,19 +3260,32 @@ impl Environment {
                 // so only the dynamic escalation applies on top of the legacy
                 // branch-to-LR.
                 const UNWIND_AFTER_REPEATS: u32 = 4;
-                if let GuestTrapKind::DeliberateTrap { .. } = trap_kind {
-                    // Remember where this happened. A deliberate trap is the
-                    // guest declaring its own process dead; if it later calls
-                    // `exit`/`abort` without having unwound past this frame,
-                    // splicing execution back into that call chain resumes a
-                    // corpse. See `guest_trap_bypass_still_on_stack`.
-                    let sp = self.cpu.regs()[cpu::Cpu::SP];
-                    self.last_deliberate_trap_bypass = Some((self.current_thread, sp));
-                }
+                // Number of wild-PC bypasses after which "fake return to LR"
+                // is assumed to be the thing keeping the guest stuck.
+                const WILD_PC_UNWIND_AFTER: u32 = 32;
                 let recovery = match trap_kind {
                     GuestTrapKind::DeliberateTrap { .. }
                     | GuestTrapKind::MisalignedInstruction { .. } => {
                         self.plan_guest_trap_recovery(pc, lr, count >= UNWIND_AFTER_REPEATS)
+                    }
+                    GuestTrapKind::OutsideCode | GuestTrapKind::ExecutionInData { .. }
+                        if total >= WILD_PC_UNWIND_AFTER
+                            && self.lr_is_consistent_with_fault(lr, pc) != Some(true) =>
+                    {
+                        // LR is not a plausible return address (or there is
+                        // no call instruction before it), so "return to LR"
+                        // is what bounces the guest between garbage PCs.
+                        // Find the real return address on the stack instead.
+                        let sp = self.cpu.regs()[cpu::Cpu::SP];
+                        match self.validated_stack_return_address(sp) {
+                            Some((return_addr, caller_sp)) => GuestTrapRecovery::UnwindStack {
+                                return_addr,
+                                caller_sp,
+                                reason: "LR does not look like a return address and \
+                                         branching to it keeps leaving the code",
+                            },
+                            None => GuestTrapRecovery::ReturnToLr,
+                        }
                     }
                     GuestTrapKind::OutsideCode | GuestTrapKind::ExecutionInData { .. }
                         if (lr & !1) == pc =>
@@ -3177,7 +3302,17 @@ impl Environment {
                                 frame,
                                 reason: "branching to LR keeps re-trapping at the same site",
                             },
-                            None => GuestTrapRecovery::ReturnToLr,
+                            None => match self
+                                .validated_stack_return_address(self.cpu.regs()[cpu::Cpu::SP])
+                            {
+                                Some((return_addr, caller_sp)) => GuestTrapRecovery::UnwindStack {
+                                    return_addr,
+                                    caller_sp,
+                                    reason: "branching to LR keeps re-trapping at the same site \
+                                             and the frame-pointer chain is unusable",
+                                },
+                                None => GuestTrapRecovery::ReturnToLr,
+                            },
                         }
                     }
                     _ => GuestTrapRecovery::ReturnToLr,
@@ -3218,6 +3353,16 @@ impl Environment {
                              saved LR={:#x}, caller SP={:#x}) and returning 0 to bypass \
                              the guest trap, because {}.",
                             frame.fp, frame.saved_fp, frame.saved_lr, frame.caller_sp, reason
+                        ),
+                        GuestTrapRecovery::UnwindStack {
+                            return_addr,
+                            caller_sp,
+                            reason,
+                        } => format!(
+                            "Unwinding the return address {:#x} from the guest stack \
+                             (caller SP={:#x}) and returning 0 to bypass the guest \
+                             trap, because {}.",
+                            return_addr, caller_sp, reason
                         ),
                         GuestTrapRecovery::SkipInstruction { reason } => format!(
                             "Skipping the faulting instruction (continuing at {:#x}), because {}.",
@@ -3425,7 +3570,7 @@ impl Environment {
 
                             let guest_control_flow_redirected =
                                 std::mem::take(&mut self.guest_control_flow_redirected);
-                            if self.guest_termination_requested {
+                            if self.guest_termination_requested.is_some() {
                                 log_dbg!(
                                     "Guest termination requested on thread {}; \
                                      returning through the host boundary.",
@@ -3520,7 +3665,7 @@ impl Environment {
             );
             return;
         }
-        if self.guest_termination_requested {
+        if self.guest_termination_requested.is_some() {
             log_dbg!(
                 "Guest termination is pending on thread {}; returning to host.",
                 initial_thread
@@ -3801,7 +3946,7 @@ impl Environment {
                         next_awakening = Some(next_awakening.map_or(host_due, |d| d.min(host_due)));
                     }
                     ThreadBlock::Mutex(mutex_id) => {
-                        if !self.mutex_state.mutex_is_locked(mutex_id) {
+                        if self.mutex_state.mutex_can_be_locked_by(mutex_id, thread_id) {
                             log_dbg!("Thread {} was unblocked due to mutex #{} unlocking, relocking mutex.", thread_id, mutex_id);
                             self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
                             self.relock_unblocked_mutex_for_thread(thread_id, mutex_id);
@@ -3855,7 +4000,7 @@ impl Environment {
                             .waking
                             .front()
                             .is_some_and(|waking_thread| *waking_thread == thread_id)
-                            && !self.mutex_state.mutex_is_locked(mutex)
+                            && self.mutex_state.mutex_can_be_locked_by(mutex, thread_id)
                         {
                             log_dbg!("Thread {} is unblocking on cond var {:?}.", thread_id, cond);
                             host_cond.waking.pop_front();
@@ -3889,7 +4034,7 @@ impl Environment {
                                 // ожидание
                                 // мьютекса (как в настоящем
                                 // pthread_cond_timedwait).
-                                if self.mutex_state.mutex_is_locked(mutex) {
+                                if !self.mutex_state.mutex_can_be_locked_by(mutex, thread_id) {
                                     log_dbg!(
                                         "Thread {} timed out on cond var {:?} but mutex is locked, blocking on mutex.",
                                         thread_id,
@@ -3951,6 +4096,23 @@ impl Environment {
                     ThreadBlock::Suspended(cnt, _) => {
                         // Original enforced assertion
                         assert!(cnt > 0);
+                    }
+                    ThreadBlock::FileObjectLock(file_ptr) => {
+                        let acquired = self.libc_state.stdio.try_acquire_file_object_lock(
+                            &mut self.mem,
+                            file_ptr,
+                            thread_id,
+                        );
+                        if acquired {
+                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                            return thread_id;
+                        }
+                    }
+                    ThreadBlock::KeymgrLock(key) => {
+                        if self.libc_state.keymgr_processwide_ptr_is_unlocked(key) {
+                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                            return thread_id;
+                        }
                     }
                 }
             }

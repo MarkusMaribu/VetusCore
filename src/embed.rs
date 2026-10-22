@@ -338,7 +338,7 @@ pub fn start_session(ipa: &Path, data_dir: &Path, options_json: &str) -> Result<
         .spawn(move || {
             let args = session_args(&ipa, &options_json);
             match crate::main(args.into_iter()) {
-                Ok(()) => log!("Vetus session ended"),
+                Ok(termination) => log!("Vetus session ended ({termination:?})"),
                 Err(err) => report_crash(&err),
             }
         })

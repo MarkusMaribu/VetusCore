@@ -24,6 +24,32 @@ pub(super) struct NSDataHostObject {
 
 impl HostObject for NSDataHostObject {}
 
+/// Standard Base64 (RFC 4648, `+/` alphabet, `=` padding), as produced by
+/// Apple's `-base64EncodedDataWithOptions:` with no options.
+fn base64_encode(input: &[u8]) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(ALPHABET[(b0 >> 2) as usize]);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize]);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize]);
+        } else {
+            out.push(b'=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(b2 & 0x3f) as usize]);
+        } else {
+            out.push(b'=');
+        }
+    }
+    out
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -167,10 +193,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithContentsOfURL:(id)url
                     options:(NSUInteger)_options
                       error:(MutVoidPtr)error_ptr {
-    if !error_ptr.is_null() {
-        env.mem.write(error_ptr.cast(), nil);
-    }
+    // `*error` is only written on failure: callers may pass an uninitialized
+    // pointer.
     if url == nil {
+        if !error_ptr.is_null() {
+            env.mem.write(error_ptr.cast(), nil);
+        }
         release(env, this);
         return nil;
     }
@@ -178,7 +206,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     let is_file: bool = msg![env; url isFileURL];
     if is_file {
         let path: id = msg![env; url path];
-        return msg![env; this initWithContentsOfFile:path];
+        let result: id = msg![env; this initWithContentsOfFile:path];
+        if result == nil && !error_ptr.is_null() {
+            env.mem.write(error_ptr.cast(), nil);
+        }
+        return result;
     }
 
     let result = crate::frameworks::foundation::url_loading::send(
@@ -308,6 +340,28 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSUInteger)length {
     env.objc.borrow::<NSDataHostObject>(this).length
+}
+- (id)base64EncodedDataWithOptions:(NSUInteger)_options {
+    let source = {
+        let host = env.objc.borrow::<NSDataHostObject>(this);
+        if host.length == 0 || host.bytes.is_null() {
+            Vec::new()
+        } else {
+            env.mem
+                .bytes_at(host.bytes.cast_const().cast(), host.length)
+                .to_vec()
+        }
+    };
+    let encoded = base64_encode(&source);
+    let len = encoded.len() as NSUInteger;
+    if len == 0 {
+        return msg_class![env; NSData data];
+    }
+    let buffer: MutVoidPtr = env.mem.alloc(len);
+    env.mem
+        .bytes_at_mut(buffer.cast(), len)
+        .copy_from_slice(&encoded);
+    msg_class![env; NSData dataWithBytesNoCopy:buffer length:len freeWhenDone:true]
 }
 
 // =========================================================================
@@ -452,10 +506,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     let success: bool = msg![env; this writeToFile:path atomically:false];
     if !success {
         log!("Warning: NSData writeToFile:options:error: failed");
-    }
-    if !error.is_null() {
-        let error_ptr: MutPtr<id> = error.cast();
-        env.mem.write(error_ptr, nil);
+        if !error.is_null() {
+            let error_ptr: MutPtr<id> = error.cast();
+            env.mem.write(error_ptr, nil);
+        }
     }
     success
 }

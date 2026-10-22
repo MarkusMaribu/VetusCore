@@ -88,8 +88,9 @@ public class MainActivity extends SDLActivity {
     // to notify the emulated app that a page finished loading in a real
     // WebView overlay. Payload packs (overlay id, action) into one long.
 
-    // Request code for the system file picker started by this activity.
+    // Request codes for system document pickers started by this activity.
     private static final int REQUEST_ADD_IPA = 1;
+    private static final int REQUEST_OPEN_APPS_FOLDER = 2;
 
     // =====================================================================
     // Real WebView overlay support (called from Rust via JNI; see
@@ -115,6 +116,23 @@ public class MainActivity extends SDLActivity {
             android.content.Intent i = new android.content.Intent(
                     android.content.Intent.ACTION_VIEW);
             i.setData(android.net.Uri.parse(url));
+            // For content:// URIs from our DocumentsProvider the receiving
+            // file manager needs read/write permission granted explicitly.
+            if (url != null && url.startsWith("content://")) {
+                i.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                // Try to give a MIME type so the system can find a handler.
+                // DocumentsProvider directories use vnd.android.document/directory.
+                // Using setDataAndType instead of setData alone helps the
+                // chooser on some OEMs.
+                try {
+                    i.setDataAndType(android.net.Uri.parse(url), "vnd.android.document/directory");
+                    i.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                } catch (Throwable ignore) {
+                    i.setData(android.net.Uri.parse(url));
+                }
+            }
             i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
             act.startActivity(i);
         } catch (Throwable t) {
@@ -122,6 +140,49 @@ public class MainActivity extends SDLActivity {
             return -1;
         }
         return 0;
+    }
+
+    // Open a content:// URI from our DocumentsProvider in the system file
+    // manager. This is used for the "File manager" button on Android.
+    // Unlike openExternalUrl it always grants URI permissions and uses a
+    // chooser so the user can pick a file manager if there are multiple.
+    public static int openContentUri(final String uriStr) {
+        android.app.Activity act = mSingleton;
+        if (act == null || uriStr == null || uriStr.isEmpty()) {
+            return -1;
+        }
+        // ACTION_VIEW with a directory MIME type is not consistently handled
+        // by Android file managers (many devices have no matching activity).
+        // Use the Storage Access Framework's tree picker instead; it is backed
+        // by DocumentsProvider and works even when no third-party file manager
+        // is installed. EXTRA_INITIAL_URI asks Android 8+ to start in the
+        // touchHLE apps directory.
+        try {
+            final android.net.Uri uri = android.net.Uri.parse(uriStr);
+            final android.content.Intent intent = new android.content.Intent(
+                    android.content.Intent.ACTION_OPEN_DOCUMENT_TREE);
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                intent.putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI, uri);
+            }
+            // ACTION_OPEN_DOCUMENT_TREE is an activity-for-result contract.
+            // Start it on the UI thread and use startActivityForResult rather
+            // than a fire-and-forget startActivity; some Android versions do
+            // not present the picker reliably without the result contract.
+            act.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        act.startActivityForResult(intent, REQUEST_OPEN_APPS_FOLDER);
+                    } catch (Throwable t) {
+                        Log.e(TAG, "Couldn't launch apps folder picker for " + uri, t);
+                    }
+                }
+            });
+            return 0;
+        } catch (Throwable t) {
+            Log.e(TAG, "openContentUri tree picker setup failed for " + uriStr, t);
+            return -1;
+        }
     }
 
     // Create a new overlay WebView loading `url` (may be empty to create it

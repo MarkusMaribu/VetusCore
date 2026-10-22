@@ -52,12 +52,21 @@ extern "C" {
     pub fn touchHLE_DynarmicWrapper_new(
         dynamic_memory_access_ptr: *mut std::ffi::c_void,
         null_page_count: usize,
+        fastmem_enabled: bool,
     ) -> *mut touchHLE_DynarmicWrapper;
     pub fn touchHLE_DynarmicWrapper_delete(cpu: *mut touchHLE_DynarmicWrapper);
     pub fn touchHLE_DynarmicWrapper_regs_const(cpu: *const touchHLE_DynarmicWrapper) -> *const u32;
     pub fn touchHLE_DynarmicWrapper_regs_mut(cpu: *mut touchHLE_DynarmicWrapper) -> *mut u32;
+    pub fn touchHLE_DynarmicWrapper_extregs_const(
+        cpu: *const touchHLE_DynarmicWrapper,
+    ) -> *const u32;
+    pub fn touchHLE_DynarmicWrapper_extregs_mut(cpu: *mut touchHLE_DynarmicWrapper) -> *mut u32;
     pub fn touchHLE_DynarmicWrapper_cpsr(cpu: *const touchHLE_DynarmicWrapper) -> u32;
     pub fn touchHLE_DynarmicWrapper_set_cpsr(cpu: *mut touchHLE_DynarmicWrapper, cpsr: u32);
+    pub fn touchHLE_DynarmicWrapper_fpscr(cpu: *const touchHLE_DynarmicWrapper) -> u32;
+    pub fn touchHLE_DynarmicWrapper_set_fpscr(cpu: *mut touchHLE_DynarmicWrapper, fpscr: u32);
+    pub fn touchHLE_DynarmicWrapper_set_tpidruro(cpu: *mut touchHLE_DynarmicWrapper, value: u32);
+
     pub fn touchHLE_DynarmicWrapper_last_exception_pc(
         cpu: *const touchHLE_DynarmicWrapper,
     ) -> VAddr;

@@ -260,6 +260,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)autoupdatingCurrentCalendar {
     msg![env; this currentCalendar]
 }
+// iOS 8+. Appodeal and other SDKs prefer this over the deprecated
+// `initWithCalendarIdentifier:`, and a missing selector aborts their init.
++ (id)calendarWithIdentifier:(id)identifier {
+    let calendar: id = msg![env; this alloc];
+    let calendar: id = msg![env; calendar initWithCalendarIdentifier:identifier];
+    autorelease(env, calendar)
+}
 
 - (id)initWithCalendarIdentifier:(id)identifier { // NSString *
     // Only the Gregorian calendar is supported for now.

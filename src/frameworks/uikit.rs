@@ -50,6 +50,7 @@ pub mod ui_layout_placeholders;
 pub mod ui_local_notification;
 pub mod ui_navigation_bar;
 pub mod ui_nib;
+pub mod ui_page_view_controller;
 pub mod ui_pasteboard;
 pub mod ui_pinch_gesture_recognizer;
 pub mod ui_popover_controller;
@@ -61,8 +62,8 @@ pub mod ui_search_bar;
 pub mod ui_split_view_controller;
 pub mod ui_storyboard;
 pub mod ui_tab_bar_controller;
-pub mod ui_text_input;
 pub mod ui_tab_bar_item;
+pub mod ui_text_input;
 pub mod ui_touch;
 pub mod ui_view;
 pub mod ui_view_controller;
@@ -279,6 +280,14 @@ pub const CONSTANTS: &[(&str, HostConstant)] = &[
     (
         "_UIScreenDidConnectNotification",
         HostConstant::NSString("UIScreenDidConnectNotification"),
+    ),
+    (
+        "_UIPageViewControllerOptionSpineLocationKey",
+        HostConstant::NSString("UIPageViewControllerOptionSpineLocationKey"),
+    ),
+    (
+        "_UIPageViewControllerOptionInterPageSpacingKey",
+        HostConstant::NSString("UIPageViewControllerOptionInterPageSpacingKey"),
     ),
     // -----------------------------------------------------------------
     // UIPasteboard well-known pasteboard names.
@@ -981,6 +990,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_view::ui_web_view::CLASSES,
         ui_view::ui_window::CLASSES,
         ui_view_controller::CLASSES,
+        ui_page_view_controller::CLASSES,
         ui_view_controller::ui_navigation_controller::CLASSES,
     ],
     constant_exports: &[
@@ -1028,6 +1038,11 @@ pub struct State {
 /// Returns the next time this function must be called, if any, e.g. the next
 /// time an accelerometer input is due.
 pub fn handle_events(env: &mut Environment) -> Option<Instant> {
+    handle_events_with_result(env).0
+}
+
+/// The run loop must distinguish input delivery from timer deadlines.
+pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instant>, bool) {
     use crate::window::Event;
     use crate::window::TextInputEvent;
 
@@ -1036,14 +1051,16 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     // launching enters the main run loop, which calls this unconditionally —
     // so guard explicitly instead of unwrapping the absent window and panicking.
     if env.window.is_none() {
-        return None;
+        return (None, false);
     }
 
+    let mut handled = false;
     loop {
         let Some(event) = env.window_mut().pop_event() else {
             break;
         };
 
+        handled = true;
         match event {
             Event::Quit => {
                 echo!("User requested quit, exiting.");
@@ -1153,7 +1170,7 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
         }
     }
 
-    ui_accelerometer::handle_accelerometer(env)
+    (ui_accelerometer::handle_accelerometer(env), handled)
 }
 
 #[cfg(test)]

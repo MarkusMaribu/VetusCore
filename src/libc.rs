@@ -22,6 +22,7 @@ pub mod ctype;
 pub mod cxxabi;
 pub mod dirent;
 pub mod dispatch;
+pub mod dispatch_source;
 pub mod dlfcn;
 pub mod dns_sd;
 pub mod errno;
@@ -180,7 +181,7 @@ pub struct State {
     stdlib: stdlib::State,
     string: string::State,
     signal: signal::State,
-    stdio: stdio::State,
+    pub stdio: stdio::State,
     time: time::State,
     errno: errno::State,
     clocale: clocale::State,
@@ -189,4 +190,11 @@ pub struct State {
     mach_ports: mach::mach_port::State,
     mach_error: mach::error::State,
     mmap: mmap::State,
+}
+
+impl State {
+    /// Whether a guest thread waiting on KeyMgr can retry its acquisition.
+    pub(crate) fn keymgr_processwide_ptr_is_unlocked(&self, key: i32) -> bool {
+        self.keymgr.processwide_ptr_is_unlocked(key)
+    }
 }

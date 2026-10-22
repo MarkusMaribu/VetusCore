@@ -874,6 +874,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     let str = to_rust_string(env, str).to_string();
     to_rust_string(env, this).ends_with(&str)
 }
+// iOS 8+. `rangeOfString:` would work but returns an NSRange; SDKs such as
+// Appodeal call this directly during start-up and expect a BOOL.
+- (bool)containsString:(id)str {
+    if str == nil {
+        return false;
+    }
+    let str = to_rust_string(env, str).to_string();
+    to_rust_string(env, this).contains(&str)
+}
 
 - (NSComparisonResult)localizedCompare:(id)other {
     assert!(to_rust_string(env, this).is_ascii());
@@ -2192,9 +2201,11 @@ pub const CLASSES: ClassExports = objc_classes! {
         let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(96)]);
         log!("[RESOURCE-TRACE] NSString fnt bytes={} preview={:?}", bytes.len(), preview);
     }
-    if !error.is_null() {
-        env.mem.write(error, nil);
-    }
+    // Like Apple's implementation, leave `*error` alone on success: callers
+    // may pass a pointer they never initialized, since it's only meant to be
+    // read on failure. Gangstar: Miami Vindication passes stack garbage that
+    // happens to point at one of its C++ vtables, and writing nil there made
+    // a later virtual call jump to address 0.
     let host_object = StringHostObject::decode(Cow::Owned(bytes), encoding);
     *env.objc.borrow_mut(this) = host_object;
     this
@@ -2231,9 +2242,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if !enc.is_null() {
         env.mem.write(enc, encoding);
     }
-    if !error.is_null() {
-        env.mem.write(error, nil);
-    }
+    // `*error` is left alone on success, see above.
     let host_object = StringHostObject::decode(Cow::Owned(bytes), encoding);
     *env.objc.borrow_mut(this) = host_object;
     this

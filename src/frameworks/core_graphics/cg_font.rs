@@ -85,12 +85,8 @@ fn font_from_name(env: &mut Environment, name: CFStringRef) -> id {
     if name == nil {
         return nil;
     }
-    let size: f32 = 12.0;
-    let font: id = msg_class![env; UIFont fontWithName:name size:size];
-    if font != nil {
-        return font;
-    }
-    msg_class![env; UIFont systemFontOfSize:size]
+    let name = ns_string::to_rust_string(env, name).into_owned();
+    crate::frameworks::uikit::ui_font::new_uifont_with_name(env, &name, 12.0)
 }
 
 // =========================================================================
@@ -99,15 +95,22 @@ fn font_from_name(env: &mut Environment, name: CFStringRef) -> id {
 
 /// `CGFontRef CGFontCreateWithFontName(CFStringRef name)`
 pub fn CGFontCreateWithFontName(env: &mut Environment, name: CFStringRef) -> CGFontRef {
-    let font = font_from_name(env, name);
-    if font == nil {
+    let ui_font = font_from_name(env, name);
+    if ui_font == nil {
         log!(
             "CGFontCreateWithFontName: could not create font for {:?}",
             name
         );
         return Ptr::null();
     }
-    retain(env, font);
+    // CGFont is not toll-free bridged to UIFont in touchHLE. Returning the
+    // UIFont here makes CGFontCopyTableForTag and CGFontGetGlyphsForUnichars
+    // treat a valid font as an unsupported foreign object, so apps that build
+    // their own cmap from the 'cmap' table receive no mapping data. Wrap the
+    // rasterizable font in the same host object used by CGFont data providers.
+    let font = crate::frameworks::uikit::ui_font::font_from_uifont(env, ui_font)
+        .unwrap_or_else(Font::sans_regular);
+    let cg_font = cg_font_with_font(env, font);
     log_dbg!(
         "CGFontCreateWithFontName({}) => {:?}",
         if name != nil {
@@ -115,9 +118,9 @@ pub fn CGFontCreateWithFontName(env: &mut Environment, name: CFStringRef) -> CGF
         } else {
             "(null)".into()
         },
-        font
+        cg_font
     );
-    font
+    cg_font
 }
 
 /// `CGFontRef CGFontCreateCopyWithVariations(CGFontRef font,
@@ -453,10 +456,11 @@ fn CGFontGetAscent(env: &mut Environment, font: CGFontRef) -> i32 {
         return 0;
     }
     if is_data_provider_font(env, font) {
-        let host = env.objc.borrow::<CGFontHostObject>(font);
-        let upm = host.font.units_per_em() as f32;
-        // rusttype's ascent at scale=upm gives design units directly
-        let ascent = host.font.ascent(upm / 1.125); // undo the iPhone scale
+        let (ascent, _, _) = env
+            .objc
+            .borrow::<CGFontHostObject>(font)
+            .font
+            .design_v_metrics();
         return ascent.round() as i32;
     }
     let ascender: f32 = msg![env; font ascender];
@@ -476,9 +480,11 @@ fn CGFontGetDescent(env: &mut Environment, font: CGFontRef) -> i32 {
         return 0;
     }
     if is_data_provider_font(env, font) {
-        let host = env.objc.borrow::<CGFontHostObject>(font);
-        let upm = host.font.units_per_em() as f32;
-        let descent = host.font.descent(upm / 1.125);
+        let (_, descent, _) = env
+            .objc
+            .borrow::<CGFontHostObject>(font)
+            .font
+            .design_v_metrics();
         return descent.round() as i32;
     }
     let descender: f32 = msg![env; font descender];
@@ -498,9 +504,11 @@ fn CGFontGetLeading(env: &mut Environment, font: CGFontRef) -> i32 {
         return 0;
     }
     if is_data_provider_font(env, font) {
-        let host = env.objc.borrow::<CGFontHostObject>(font);
-        let upm = host.font.units_per_em() as f32;
-        let line_gap = host.font.line_gap(upm / 1.125);
+        let (_, _, line_gap) = env
+            .objc
+            .borrow::<CGFontHostObject>(font)
+            .font
+            .design_v_metrics();
         return line_gap.round() as i32;
     }
     let leading: f32 = msg![env; font leading];

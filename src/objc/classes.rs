@@ -60,6 +60,9 @@ pub(super) struct ClassHostObject {
     pub(super) properties: HashMap<String, ConstVoidPtr>,
     /// Protocols directly adopted by the class or one of its categories.
     pub(super) protocols: Vec<id>,
+    /// Whether this class comes from the app binary, so that `protocols` is
+    /// complete. touchHLE doesn't model which protocols host classes adopt.
+    pub(super) is_from_bin: bool,
     /// Offset into the allocated memory for the object where the ivars of
     /// instances of this class or metaclass (respectively: normal objects or
     /// classes) should live. This is always >= the value in the superclass.
@@ -335,6 +338,7 @@ impl ClassHostObject {
             scalar_ivars: Default::default(),
             properties: HashMap::default(),
             protocols: Vec::new(),
+            is_from_bin: false,
         }
     }
 
@@ -386,6 +390,7 @@ impl ClassHostObject {
             scalar_ivars: Default::default(),
             properties: HashMap::new(),
             protocols: protocol_list_entries(mem, base_protocols),
+            is_from_bin: true,
         };
         if !base_methods.is_null() {
             host_object.add_methods_from_bin(base_methods, mem, objc);
@@ -489,7 +494,7 @@ fn substitute_classes(
         }
     }
 
-    log!(
+    log_dbg!(
         "Note: substituting fake class for {} to improve compatibility",
         name
     );
@@ -960,7 +965,7 @@ impl ObjC {
                     (host.name.clone(), host.superclass)
                 };
                 let superclass_name = self.borrow::<ClassHostObject>(superclass).name.clone();
-                log!(
+                log_dbg!(
                     "Class {} need ivar reconciliation with superclass {}!",
                     name,
                     superclass_name
@@ -1213,6 +1218,7 @@ impl ObjC {
                         scalar_ivars: Default::default(),
                         properties: Default::default(),
                         protocols: Default::default(),
+                        is_from_bin: Default::default(),
                     },
                 );
                 log_dbg!(
@@ -1303,6 +1309,61 @@ impl ObjC {
             );
             "<unknown>"
         })
+    }
+
+    /// Whether instances of `class` conform to `protocol`, a `protocol_t` from
+    /// the app binary (touchHLE doesn't fix up protocol references, so that's
+    /// what `@protocol()` gives). Protocols are compared by name. Returns
+    /// `None` if this can't be known because the class inherits from a host
+    /// class other than `NSObject`.
+    pub fn class_conforms_to_bin_protocol(
+        &self,
+        mem: &Mem,
+        class: Class,
+        protocol: id,
+    ) -> Option<bool> {
+        if protocol == nil {
+            return Some(false);
+        }
+        let name_ptr = protocol_get_name(mem, protocol);
+        if name_ptr.is_null() {
+            return None;
+        }
+        let name = mem.cstr_at(name_ptr);
+        if name == b"NSObject" {
+            return Some(true);
+        }
+        let mut class = class;
+        while class != nil {
+            let ClassHostObject {
+                name: class_name,
+                protocols,
+                is_from_bin,
+                superclass,
+                ..
+            } = self.get_host_object(class)?.as_any().downcast_ref()?;
+            if protocols
+                .iter()
+                .any(|&adopted| protocol_adopts_protocol_named(mem, adopted, name, 0))
+            {
+                return Some(true);
+            }
+            if !is_from_bin {
+                return if class_name == "NSObject" {
+                    Some(false)
+                } else {
+                    None
+                };
+            }
+            class = *superclass;
+        }
+        Some(false)
+    }
+
+    pub fn class_is_metaclass(&self, class: Class) -> bool {
+        self.get_host_object(class)
+            .and_then(|host_object| host_object.as_any().downcast_ref::<ClassHostObject>())
+            .is_some_and(|class| class.is_metaclass)
     }
 
     pub fn get_superclass(&self, class: Class) -> Class {
@@ -1573,18 +1634,37 @@ fn set_imp_at(env: &mut crate::Environment, cls: Class, sel: SEL, imp: IMP) {
 /// Convert an [IMP] into the guest pointer that Apple's `IMP` type is (a
 /// function pointer). Guest implementations expose their real code address;
 /// host (Rust-backed) implementations have no guest address, so we mint a
-/// stable token pointer for the (class, selector) and remember which host
-/// IMP it stands for, allowing it to be round-tripped back through
+/// stable, callable stub for the host IMP and remember which IMP it stands
+/// for, allowing it to be round-tripped back through
 /// `method_setImplementation` / `method_exchangeImplementations`.
-fn imp_to_guest_ptr(env: &mut crate::Environment, cls: Class, sel: SEL, imp: IMP) -> ConstVoidPtr {
+fn imp_to_guest_ptr(
+    env: &mut crate::Environment,
+    _cls: Class,
+    _sel: SEL,
+    imp: IMP,
+) -> ConstVoidPtr {
     match imp {
         IMP::Guest(gf) => gf.to_ptr(),
-        IMP::Host(_) => {
-            let token = if let Some(&t) = env.objc.host_imp_tokens.get(&(cls, sel)) {
+        IMP::Host(host_imp) => {
+            // The token must be callable: swizzling code commonly stores the
+            // original IMP and later calls it directly (Firebase Analytics'
+            // screen tracking does this for -[UIViewController viewDidAppear:]).
+            // So it is a real SVC stub that calls the host implementation with
+            // the caller's registers, just like a message send would. Tokens
+            // are keyed by the implementation itself rather than by
+            // (class, selector), because a stub keeps calling the host
+            // function it was made for even after the method is swizzled.
+            let key = host_imp as *const dyn HostIMP as *const () as usize;
+            let token = if let Some(&t) = env.objc.host_imp_tokens.get(&key) {
                 t
             } else {
-                let t = env.mem.alloc(4);
-                env.objc.host_imp_tokens.insert((cls, sel), t);
+                let stub = env
+                    .dyld
+                    .create_guest_function(&mut env.mem, "[host IMP]", host_imp);
+                env.cpu
+                    .invalidate_cache_range(stub.addr_without_thumb_bit(), 8);
+                let t = MutVoidPtr::from_bits(stub.addr_with_thumb_bit());
+                env.objc.host_imp_tokens.insert(key, t);
                 t
             };
             env.objc.imp_tokens.insert(token.to_bits(), imp);
@@ -2411,15 +2491,14 @@ pub fn objc_autorelease(env: &mut crate::Environment, obj: id) -> id {
 /// id objc_retainBlock(id x) { return (id)_Block_copy(x); }
 /// ```
 ///
-/// touchHLE's `_Block_copy` (see `src/libc/blocks.rs`) does not physically
-/// duplicate the block — global blocks (the common case for static literal
-/// blocks) are not reference-counted, and stack-block promotion needs deeper
-/// Block ABI work — so it returns the same pointer. Mirroring that here keeps
-/// `objc_retainBlock` consistent with the rest of the Block runtime, while
-/// still providing the correct return value the ARC-generated code expects.
+/// ARC emits this whenever a block is stored, so a stack block has to be
+/// promoted to the heap here like in `_Block_copy` (see `src/libc/blocks.rs`).
+/// Returning the stack block itself left a dangling pointer once its frame
+/// was gone: Bolts' `BFExecutor` (Charlie, the Steak) then jumped to whatever
+/// the reused stack held in place of the invoke function.
 pub fn objc_retainBlock(env: &mut crate::Environment, block: id) -> id {
-    let _ = env;
-    block
+    let copy = crate::libc::blocks::_Block_copy(env, block.cast().cast_const());
+    copy.cast_mut().cast()
 }
 
 /// `IMP imp_implementationWithBlock(id block)` — returns an IMP that invokes
@@ -2760,6 +2839,23 @@ pub fn protocol_getMethodDescription(
     objc_method_description { name: sel, types }
 }
 
+/// Whether `protocol` is named `name` or adopts a protocol named `name`.
+fn protocol_adopts_protocol_named(mem: &Mem, protocol: id, name: &[u8], depth: u32) -> bool {
+    if protocol.is_null() || depth > 16 {
+        return false;
+    }
+    let name_ptr = protocol_get_name(mem, protocol);
+    if !name_ptr.is_null() && mem.cstr_at(name_ptr) == name {
+        return true;
+    }
+    // Layout of the 32-bit `protocol_t`, in words: isa, name, protocols, ...
+    let words: ConstPtr<u32> = Ptr::from_bits(protocol.to_bits());
+    let adopted_list: ConstVoidPtr = Ptr::from_bits(mem.read(words + 2));
+    protocol_list_entries(mem, adopted_list)
+        .into_iter()
+        .any(|adopted| protocol_adopts_protocol_named(mem, adopted, name, depth + 1))
+}
+
 fn find_protocol_method_types(
     mem: &Mem,
     proto: id,
@@ -2894,6 +2990,36 @@ pub fn objc_copyClassNamesForImage(
         env.mem.write(out_count, 0);
     }
     Ptr::null()
+}
+
+/// `const char **objc_copyImageNames(unsigned int *outCount)` — the names of
+/// all loaded images, as a malloc-allocated array of C strings, with the
+/// count written to `outCount`. Firebase's FIRCoreDiagnostics calls this at
+/// launch and loops over `outCount` entries, so `outCount` must always be
+/// written: leaving it unset (as the old return-0 stub did) made Stickman
+/// Rope Hero walk billions of garbage pointers and never draw a frame.
+pub fn objc_copyImageNames(
+    env: &mut crate::Environment,
+    out_count: crate::mem::MutPtr<u32>,
+) -> crate::mem::MutPtr<ConstPtr<u8>> {
+    use crate::mem::Ptr;
+    let names: Vec<String> = env.bins.iter().map(|bin| bin.name.clone()).collect();
+    let count = names.len() as u32;
+    if !out_count.is_null() {
+        env.mem.write(out_count, count);
+    }
+    if count == 0 {
+        return Ptr::null();
+    }
+    let array: crate::mem::MutPtr<ConstPtr<u8>> = env
+        .mem
+        .alloc(count * guest_size_of::<ConstPtr<u8>>())
+        .cast();
+    for (index, name) in names.iter().enumerate() {
+        let name_ptr = env.mem.alloc_and_write_cstr(name.as_bytes());
+        env.mem.write(array + index as u32, name_ptr.cast_const());
+    }
+    array
 }
 
 /// `void *object_getIndexedIvars(id obj)` — returns a pointer to the

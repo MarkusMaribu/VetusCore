@@ -6,7 +6,7 @@
 //! The `NSScanner` class.
 
 use crate::frameworks::foundation::ns_string::{from_u16_vec, to_rust_string};
-use crate::frameworks::foundation::{unichar, NSNotFound, NSRange, NSUInteger};
+use crate::frameworks::foundation::{unichar, NSInteger, NSNotFound, NSRange, NSUInteger};
 use crate::mem::MutPtr;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
@@ -45,6 +45,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     // superclass alloc then.
     assert!(this == env.objc.get_known_class("NSScanner", &mut env.mem));
     msg_class![env; _touchHLE_NSScanner allocWithZone:zone]
+}
+
+- (bool)scanInteger:(MutPtr<NSInteger>)result {
+    msg![env; this scanInt:result]
 }
 
 @end
@@ -231,6 +235,55 @@ pub const CLASSES: ClassExports = objc_classes! {
     true
 }
 
+- (bool)scanHexLongLong:(MutPtr<u64>)result {
+    skip_characters(env, this);
+
+    let NSScannerHostObject { to_be_skipped, string, len, pos } =
+        std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
+    if pos >= len {
+        *env.objc.borrow_mut::<NSScannerHostObject>(this) =
+            NSScannerHostObject { to_be_skipped, string, len, pos };
+        return false;
+    }
+
+    let substring: id = msg![env; string substringFromIndex:pos];
+    let st = to_rust_string(env, substring);
+    let chars: Vec<char> = st.chars().collect();
+    let mut i = 0usize;
+    if chars.len() >= 3
+        && chars[0] == '0'
+        && (chars[1] == 'x' || chars[1] == 'X')
+        && chars[2].is_ascii_hexdigit()
+    {
+        i = 2;
+    }
+
+    let digits_start = i;
+    let mut value = 0u64;
+    while i < chars.len() && chars[i].is_ascii_hexdigit() {
+        value = value
+            .saturating_mul(16)
+            .saturating_add(chars[i].to_digit(16).unwrap() as u64);
+        i += 1;
+    }
+
+    if i == digits_start {
+        *env.objc.borrow_mut::<NSScannerHostObject>(this) =
+            NSScannerHostObject { to_be_skipped, string, len, pos };
+        return false;
+    }
+
+    if !result.is_null() {
+        env.mem.write(result, value);
+    }
+
+    let consumed = i as NSUInteger;
+    *env.objc.borrow_mut::<NSScannerHostObject>(this) =
+        NSScannerHostObject { to_be_skipped, string, len, pos: pos + consumed };
+    log_dbg!("scanHexLongLong: from '{}' -> {:#x}", st, value);
+    true
+}
+
 - (bool)scanUpToString:(id)stop_string // NSString *
             intoString:(MutPtr<id>)result { // NSString **
     skip_characters(env, this);
@@ -323,6 +376,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos: pos + cutoff as NSUInteger };
     true
+}
+
+
+- (bool)scanInteger:(MutPtr<NSInteger>)result {
+    msg![env; this scanInt:result]
 }
 
 - (bool)scanFloat:(MutPtr<f32>)result {

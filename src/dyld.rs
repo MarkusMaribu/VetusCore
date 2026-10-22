@@ -451,6 +451,16 @@ pub struct Dyld {
     swift_data_slots: HashMap<String, u32>,
     cxxabi_typeinfo_vtable_kinds: HashMap<u32, CxxAbiTypeInfoKind>,
     guest_sjlj_runtime_available: bool,
+    /// Guest (main executable or bundled dylib) implementations of the
+    /// Itanium/SjLj C++ ABI.
+    ///
+    /// When an app ships a complete SjLj runtime (libgcc_s + libc++abi /
+    /// libstdc++), its own unwinder can handle `throw`/`catch` correctly.
+    /// Host-side stubs can only fake a non-local return, so resolving any of
+    /// these symbols to the host breaks C++ exception handling. This map is
+    /// built from *defined* symbols (not just external ones) so that a
+    /// non-exported-but-defined `___cxa_throw` still wins over the host stub.
+    guest_cxxabi_exports: HashMap<String, u32>,
 }
 
 impl Dyld {
@@ -486,6 +496,7 @@ impl Dyld {
             swift_data_slots: HashMap::new(),
             cxxabi_typeinfo_vtable_kinds: HashMap::new(),
             guest_sjlj_runtime_available: false,
+            guest_cxxabi_exports: HashMap::new(),
         }
     }
 
@@ -496,6 +507,15 @@ impl Dyld {
         self.cxxabi_typeinfo_vtable_kinds
             .get(&typeinfo_vtable_addrpoint)
             .copied()
+    }
+
+    /// Guest address of an app-provided C++ ABI implementation, if the app
+    /// ships a working SjLj runtime and defines the symbol itself.
+    pub(crate) fn guest_cxxabi_export(&self, name: &str) -> Option<u32> {
+        if !self.guest_sjlj_runtime_available {
+            return None;
+        }
+        self.guest_cxxabi_exports.get(name).copied()
     }
 
     pub fn return_to_host_routine(&self) -> GuestFunction {
@@ -525,6 +545,27 @@ impl Dyld {
             "Guest C++ SjLj runtime available: {}",
             self.guest_sjlj_runtime_available
         );
+        self.guest_cxxabi_exports.clear();
+        if self.guest_sjlj_runtime_available {
+            // Prefer the dylibs' definitions to the app's own. An app may
+            // define a C++ ABI function as a hook that forwards to the real
+            // one through `dlsym(RTLD_NEXT, ...)` (Unity's IL2CPP does this
+            // for `__cxa_throw`); resolving to the hook then makes it call
+            // itself until its stack overflows into another thread's.
+            for bin in bins.iter().skip(1).chain(bins.first()) {
+                for (name, &addr) in bin.exported_symbols.iter() {
+                    if addr != 0 && is_guest_cxxabi_symbol(name) {
+                        self.guest_cxxabi_exports
+                            .entry(name.clone())
+                            .or_insert(addr);
+                    }
+                }
+            }
+            log!(
+                "Guest C++ ABI implementations: {} symbols will bypass host stubs",
+                self.guest_cxxabi_exports.len()
+            );
+        }
         self.return_to_host_routine =
             Some(write_return_to_host_routine(mem, Self::SVC_RETURN_TO_HOST));
         self.thread_exit_routine = Some(write_return_to_host_routine(mem, Self::SVC_THREAD_EXIT));
@@ -832,6 +873,8 @@ impl Dyld {
 
         assert!(stubs.size % entry_size == 0);
         let stub_count = stubs.size / entry_size;
+        let mut skipped_stubs: Vec<u32> = Vec::new();
+        let mut skipped_stub_count = 0usize;
         for i in 0..stub_count {
             let ptr: MutPtr<u32> = Ptr::from_bits(stubs.addr + i * entry_size);
 
@@ -855,6 +898,10 @@ impl Dyld {
                 }
             }
             if mismatch {
+                skipped_stub_count += 1;
+                if skipped_stubs.len() < 8 {
+                    skipped_stubs.push(stubs.addr + i * entry_size);
+                }
                 continue;
             }
 
@@ -873,6 +920,17 @@ impl Dyld {
             }
             // Leave the __la_symbol_ptr intact in case we want to link it to
             // a real symbol later.
+        }
+        if !skipped_stubs.is_empty() {
+            log!(
+                "Warning: setup_lazy_linking: {} of {} stubs in {:?} did not match the \
+                 expected pattern and were left unpatched (first: {:#x?}). Calls through \
+                 them jump to the unrelocated __la_symbol_ptr and can land on the image base.",
+                skipped_stub_count,
+                stub_count,
+                bin.name,
+                skipped_stubs
+            );
         }
     }
 
@@ -915,9 +973,7 @@ impl Dyld {
             let offset: u32 = mem.read(ptr_ptr).to_bits();
             let guest_cxxabi_export =
                 if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(name) {
-                    bins.iter()
-                        .find_map(|other_bin| other_bin.external_symbols.get(name))
-                        .copied()
+                    self.guest_cxxabi_export(name)
                 } else {
                     None
                 };
@@ -1141,6 +1197,7 @@ impl Dyld {
                 || name == "__dispatch_source_type_timer"
                 || name == "__dispatch_source_type_data_add"
                 || name == "__dispatch_source_type_data_or"
+                || name == "__dispatch_source_type_data_replace"
                 || name == "__dispatch_source_type_signal"
                 || name == "__dispatch_source_type_proc"
                 || name == "__dispatch_source_type_vnode"
@@ -1156,15 +1213,10 @@ impl Dyld {
                 || name == "__dispatch_main_q"
                 || name == "__dispatch_queue_main"
             {
-                // GCD dispatch_source_type_t / queue-attribute / data-marker
-                // pointers are opaque "type tag" identifiers; touchHLE's
-                // libdispatch implementation never inspects their contents,
-                // only their identity. A small non-NULL allocation satisfies
-                // that contract and prevents NULL-page reads when an app
-                // passes one to dispatch_source_create / dispatch_queue_create
-                // / dispatch_data_create.
+                // Dispatch source types carry small internal tags; other
+                // libdispatch constants remain opaque non-NULL markers.
                 let p: MutPtr<u32> = mem.alloc(4).cast();
-                mem.write(p, 0);
+                mem.write(p, crate::libc::dispatch_source::source_type_tag(name));
                 p.cast().cast_const()
             } else if name == "_in6addr_any" || name == "_in6addr_loopback" {
                 // `struct in6_addr` is 16 bytes. `in6addr_any` is all zeros
@@ -1295,6 +1347,19 @@ impl Dyld {
                     mem.write(ptr_ptr, Ptr::from_bits(addr));
                     continue 'ptr_loop;
                 }
+            }
+
+            // A defined-but-not-external C++ ABI symbol (common in
+            // libc++abi.dylib, whose `___cxa_throw` is not marked N_EXT)
+            // would otherwise fall through to the host stub below.
+            if let Some(addr) = self.guest_cxxabi_export(symbol) {
+                register_cxxabi_typeinfo_vtable(
+                    symbol,
+                    addr,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                );
+                mem.write(ptr_ptr, Ptr::from_bits(addr));
+                continue 'ptr_loop;
             }
 
             if symbol == "dyld_stub_binder" || symbol == "_dyld_stub_binder" {
@@ -1456,6 +1521,7 @@ impl Dyld {
                 || symbol == "__dispatch_source_type_timer"
                 || symbol == "__dispatch_source_type_data_add"
                 || symbol == "__dispatch_source_type_data_or"
+                || symbol == "__dispatch_source_type_data_replace"
                 || symbol == "__dispatch_source_type_signal"
                 || symbol == "__dispatch_source_type_proc"
                 || symbol == "__dispatch_source_type_vnode"
@@ -1473,10 +1539,10 @@ impl Dyld {
             {
                 // See the matching branch in the external-relocation loop.
                 let p: MutPtr<u32> = mem.alloc(4).cast();
-                mem.write(p, 0);
+                mem.write(p, crate::libc::dispatch_source::source_type_tag(symbol));
                 mem.write(ptr_ptr, p.cast().cast_const());
                 log_dbg!(
-                    "Stubbed libdispatch identity tag {} -> {:#x}",
+                    "libdispatch identity tag {} -> {:#x}",
                     symbol,
                     p.to_bits()
                 );
@@ -1797,10 +1863,7 @@ impl Dyld {
         };
 
         if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(symbol) {
-            if let Some(&addr) = bins
-                .iter()
-                .find_map(|dylib| dylib.external_symbols.get(symbol))
-            {
+            if let Some(addr) = self.guest_cxxabi_export(symbol) {
                 register_cxxabi_typeinfo_vtable(
                     symbol,
                     addr,
@@ -2026,6 +2089,14 @@ impl Dyld {
             return Ok(stub);
         }
 
+        // `dlsym`-style lookups must not hand out a host C++ ABI stub when the
+        // app brought its own working SjLj runtime: the host can only fake a
+        // non-local return, which makes `throw` skip the guest's catch block
+        // and re-throw forever. Return the real guest implementation instead.
+        if let Some(addr) = self.guest_cxxabi_export(symbol) {
+            return Ok(GuestFunction::from_addr_with_thumb_bit(addr));
+        }
+
         let &(symbol, f) = search_host_dylibs(|dylib| dylib.function_exports, symbol).ok_or(())?;
         if let Some(&cached_fn) = self.non_lazy_host_functions.get(symbol) {
             return Ok(cached_fn);
@@ -2051,9 +2122,8 @@ impl Dyld {
         let function_ptr: MutPtr<u32> = function_ptr.cast();
         mem.write(function_ptr + 0, encode_a32_svc(svc));
         mem.write(function_ptr + 1, encode_a32_ret());
-        // Crash diagnostics: map stub addresses to symbols so a FATAL SIGNAL
-        // report with `last guest PC` identifies the aborting host function.
-        log!("host fn stub {} at {:#x}", symbol, function_ptr.to_bits());
+        // Keep address-to-symbol mappings available when dyld debugging is enabled.
+        log_dbg!("host fn stub {} at {:#x}", symbol, function_ptr.to_bits());
         GuestFunction::from_addr_with_thumb_bit(function_ptr.to_bits())
     }
 

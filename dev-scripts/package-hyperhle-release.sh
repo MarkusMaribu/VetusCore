@@ -48,7 +48,7 @@ done
 
 android_apk=""
 for candidate in \
-    artifacts/android/HyperHLE-Fork.apk \
+    artifacts/android/HyperHLE-Reborn.apk \
     artifacts/android/touchHLE.apk
 do
     if [ -e "$candidate" ]; then
@@ -65,6 +65,11 @@ for path in "$macos_dmg" "$android_apk"; do
 done
 if [ -z "$windows_exe" ]; then
     echo "Missing build artifact (all platform builds must succeed): artifacts/windows/touchHLE.exe" >&2
+    exit 1
+fi
+windows_installer="artifacts/windows-installer/HyperHLE_Windows_x86_64_Setup.exe"
+if [ ! -f "$windows_installer" ]; then
+    echo "Missing build artifact (all platform builds must succeed): $windows_installer" >&2
     exit 1
 fi
 if [ -z "$linux_bin" ]; then
@@ -177,6 +182,8 @@ prefix="HyperHLE"
 ./prepare-release.sh --create-zip-linux \
     "$ROOT/$linux_bin" \
     -o "$ROOT/release/${prefix}_Linux_x86_64.zip"
+# The Windows installer is attached as it is (see build-win).
+cp "$ROOT/$windows_installer" "$ROOT/release/HyperHLE_Windows_x86_64_Setup.exe"
 # The iOS IPAs are attached as they are (see build-ios in HyperHLE_release.yml).
 for ipa in $ios_ipas; do
     cp "$ROOT/artifacts/ios/$ipa" "$ROOT/release/$ipa"
