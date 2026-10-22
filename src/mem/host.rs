@@ -98,6 +98,45 @@ pub(super) unsafe fn allocate_memory(size: usize) -> std::io::Result<*mut core::
     Ok(ptr)
 }
 
+/// Freed blocks smaller than this are scrubbed with `fill(0)`; the syscall
+/// and the page faults on reuse cost more than writing a few pages.
+pub(super) const DISCARD_MIN_SIZE: u32 = 64 * 1024;
+
+/// Host page size (may be 16 KiB on newer Android devices).
+pub(super) fn host_page_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if size > 0 {
+                return size as usize;
+            }
+        }
+        crate::mem::PAGE_SIZE as usize
+    })
+}
+
+/// Hand whole host pages of the guest mapping back to the kernel so they
+/// stop counting towards the process footprint. Returns `true` only if the
+/// range is now guaranteed to read as zeroes, so callers can skip scrubbing
+/// it. That guarantee only holds for private anonymous mappings on Linux and
+/// Android (`MADV_DONTNEED`); everywhere else this does nothing and returns
+/// `false`.
+///
+/// # Safety
+/// `address` and `size` must be host page aligned and inside the mapping
+/// returned by [`allocate_guest_memory`].
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) unsafe fn discard_pages(address: *mut core::ffi::c_void, size: usize) -> bool {
+    unsafe { libc::madvise(address, size, libc::MADV_DONTNEED) == 0 }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(super) unsafe fn discard_pages(_address: *mut core::ffi::c_void, _size: usize) -> bool {
+    false
+}
+
 #[cfg(windows)]
 pub(super) unsafe fn allocate_guest_memory(size: usize) -> std::io::Result<*mut core::ffi::c_void> {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_READWRITE};

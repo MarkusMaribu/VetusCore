@@ -12,6 +12,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -373,7 +374,78 @@ pub fn join_session(timeout: Duration) -> bool {
     rx.recv_timeout(timeout).is_ok()
 }
 
+/// Resident memory limit in bytes for this process; 0 disables the guard.
+static MEMORY_LIMIT_BYTES: AtomicU64 = AtomicU64::new(0);
+static MEMORY_LIMIT_HIT: AtomicBool = AtomicBool::new(false);
+const MEMORY_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Resident set size of this process in bytes, if the host can tell us.
+pub fn resident_bytes() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+        Some(pages * page_size)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        None
+    }
+}
+
+/// Called once per run loop iteration on every thread. Every
+/// [`MEMORY_LOG_INTERVAL`] it logs how much memory the process, the guest
+/// heap and the Objective-C object table use, so growth is visible in
+/// logcat, and it enforces the optional `memoryLimitMb` guard: a runaway
+/// guest is stopped with a clear error instead of being left to push the
+/// whole phone into the low-memory killer.
+pub fn watch_memory(env: &mut crate::Environment) {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    if env.current_thread != 0 {
+        return;
+    }
+    {
+        let mut last = LAST.lock().unwrap();
+        let now = std::time::Instant::now();
+        if last.is_some_and(|at| now.duration_since(at) < MEMORY_LOG_INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+    }
+
+    const MB: u64 = 1024 * 1024;
+    let rss = resident_bytes();
+    let (chunks, guest_bytes) = env.mem.used_stats();
+    log!(
+        "Memory: rss={} MiB, guest_used={} MiB in {} blocks, objc_objects={}",
+        rss.map_or(0, |bytes| bytes / MB),
+        guest_bytes / MB,
+        chunks,
+        env.objc.object_count(),
+    );
+
+    let limit = MEMORY_LIMIT_BYTES.load(Ordering::Relaxed);
+    if let (true, Some(rss)) = (limit > 0, rss) {
+        if rss > limit && !MEMORY_LIMIT_HIT.swap(true, Ordering::Relaxed) {
+            let message = format!(
+                "The app used too much memory ({} MiB, limit {} MiB) and was stopped.",
+                rss / MB,
+                limit / MB
+            );
+            log!("{message}");
+            report_crash(&message);
+            request_quit();
+        }
+    }
+}
+
 fn apply_screen_from_json(json: &str) {
+    MEMORY_LIMIT_HIT.store(false, Ordering::Relaxed);
+    MEMORY_LIMIT_BYTES.store(
+        u64::from(json_u32(json, "memoryLimitMb").unwrap_or(0)) * 1024 * 1024,
+        Ordering::Relaxed,
+    );
     if let (Some(w), Some(h)) = (json_u32(json, "screenWidth"), json_u32(json, "screenHeight")) {
         set_host_screen(w, h);
     }

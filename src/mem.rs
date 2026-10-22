@@ -1079,6 +1079,47 @@ impl Mem {
         new_ptr
     }
 
+    /// Returns `(allocation_count, bytes)` currently in use in the guest
+    /// address space. For diagnostics only.
+    pub fn used_stats(&self) -> (usize, u64) {
+        self.allocator.used_stats()
+    }
+
+    /// Zero a freed block.
+    ///
+    /// Scrubbing with `fill(0)` writes to every page of the block. That
+    /// commits pages the guest never touched (a large `malloc` that was
+    /// freed unused costs its full size in RSS) and, worse, leaves every
+    /// freed page resident for the lifetime of the process, so the process
+    /// footprint can only ever grow to the guest's peak heap use. For big
+    /// blocks the whole host pages are instead handed back to the kernel,
+    /// which also makes them read as zero again on the next touch. Only the
+    /// unaligned head and tail are scrubbed by hand.
+    fn zero_freed(&mut self, addr: VAddr, size: GuestUSize) {
+        if size >= host::DISCARD_MIN_SIZE {
+            let host_page = host::host_page_size();
+            let start = self.bytes as usize + addr as usize;
+            let end = start + size as usize;
+            let inner_start = start.next_multiple_of(host_page);
+            let inner_end = end & !(host_page - 1);
+            if inner_end > inner_start
+                && unsafe { host::discard_pages(inner_start as *mut _, inner_end - inner_start) }
+            {
+                let head = (inner_start - start) as GuestUSize;
+                let tail = (end - inner_end) as GuestUSize;
+                if head > 0 {
+                    self.bytes_at_mut(Ptr::from_bits(addr), head).fill(0);
+                }
+                if tail > 0 {
+                    self.bytes_at_mut(Ptr::from_bits(addr + (size - tail)), tail)
+                        .fill(0);
+                }
+                return;
+            }
+        }
+        self.bytes_at_mut(Ptr::from_bits(addr), size).fill(0);
+    }
+
     /// Free an allocation made with one of the `alloc` methods on this type.
     pub fn free(&mut self, ptr: MutVoidPtr) {
         if ptr.is_null() {
@@ -1098,7 +1139,7 @@ impl Mem {
         }
         let size = self.allocator.free(addr);
         if self.zero_memory_on_free {
-            self.bytes_at_mut(ptr.cast(), size).fill(0);
+            self.zero_freed(addr, size);
         }
 
         log_dbg!("Freed {:?} ({:#x} bytes)", ptr, size);

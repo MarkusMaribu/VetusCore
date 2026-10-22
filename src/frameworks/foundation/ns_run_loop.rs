@@ -19,7 +19,7 @@ use crate::frameworks::core_foundation::cf_run_loop::{
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoopRef,
 };
 use crate::frameworks::{core_animation, media_player, uikit};
-use crate::objc::{id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject};
+use crate::objc::{id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports, HostObject};
 use crate::Environment;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -371,6 +371,15 @@ pub fn run_run_loop(
     loop {
         let mut sleep_until = None;
 
+        // Every real run loop iteration runs inside its own autorelease pool.
+        // Audio queue/unit callbacks, system sound completions, media player
+        // notifications and composition (which calls into guest drawing code)
+        // all run here with no pool of their own, so anything they
+        // autoreleased used to pile up in the app's outermost pool, which is
+        // only drained when the app exits. That is a leak that grows with
+        // every frame.
+        let iteration_pool: id = msg_class![env; NSAutoreleasePool new];
+
         // Commit implicit CATransactions
         // From the CATransaction docs:
         //  "Implicit transactions are created automatically when the layer
@@ -438,6 +447,11 @@ pub fn run_run_loop(
         if is_main_run_loop {
             media_player::handle_players(env);
         }
+
+        // Release everything this iteration autoreleased before sleeping.
+        let _: () = msg![env; iteration_pool drain];
+
+        crate::embed::watch_memory(env);
 
         // Unfortunately, touchHLE has to poll for certain things repeatedly;
         // it can't just wait until the next event appears.

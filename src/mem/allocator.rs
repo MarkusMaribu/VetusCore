@@ -557,6 +557,17 @@ impl Allocator {
         freed.size.get()
     }
 
+    /// Returns `(chunk_count, total_bytes)` of everything currently in use
+    /// (heap allocations plus reserved segments and stacks), without
+    /// materialising a snapshot. Used for memory diagnostics.
+    pub fn used_stats(&self) -> (usize, u64) {
+        self.used_chunks
+            .iter()
+            .fold((0, 0), |(count, bytes), chunk| {
+                (count + 1, bytes + u64::from(chunk.size.get()))
+            })
+    }
+
     /// Returns a snapshot of all currently-live allocations as
     /// `(base_address, size_in_bytes)` pairs.
     ///

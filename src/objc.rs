@@ -234,6 +234,11 @@ impl ObjC {
         }
     }
 
+    /// Number of live Objective-C objects. For memory diagnostics.
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+
     /// Returns the name of a selector, panicking if it is unknown.
     pub fn get_selector_name(&self, sel: SEL) -> &str {
         self.selectors
