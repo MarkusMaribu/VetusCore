@@ -75,6 +75,8 @@ pub struct Window {
     angle: bool,
     adreno: bool,
     blocked: bool,
+    /// When the host first asked to pause while this thread was between frames.
+    pause_seen: Option<Instant>,
     bound_window: usize,
     show_fps_counter: Cell<bool>,
     fps_frame_count: Cell<u32>,
@@ -143,6 +145,7 @@ impl Window {
             angle: egl.angle,
             adreno: false,
             blocked: false,
+            pause_seen: None,
             bound_window: 0,
             show_fps_counter: Cell::new(false),
             fps_frame_count: Cell::new(0),
@@ -203,7 +206,7 @@ impl Window {
         if !self.on_main_stack {
             return;
         }
-        self.service_host();
+        self.service_host(false);
         let now = Instant::now();
         if now.duration_since(self.last_polled) < Duration::from_secs_f64(1.0 / 120.0) {
             return;
@@ -216,7 +219,26 @@ impl Window {
         self.drain_input();
     }
 
-    fn service_host(&mut self) {
+    /// t_swap is true when called right before a frame is presented, so the
+    /// back buffer holds the finished frame. Parking there lets the last frame
+    /// be read back before the surface goes away; between frames the buffer is
+    /// undefined, so a pause waits (briefly) for the next swap instead.
+    fn service_host(&mut self, at_swap: bool) {
+        let parking = !self.blocked
+            && !crate::embed::should_quit()
+            && !crate::embed::is_runnable();
+        if parking {
+            if at_swap {
+                self.capture_frame();
+            } else {
+                let since = *self.pause_seen.get_or_insert_with(Instant::now);
+                if since.elapsed() < Duration::from_millis(300) {
+                    return;
+                }
+            }
+        } else {
+            self.pause_seen = None;
+        }
         self.sync_surface();
         if crate::embed::should_quit() {
             return;
@@ -230,7 +252,7 @@ impl Window {
             return;
         }
         if !self.blocked {
-            self.capture_frame();
+            self.pause_seen = None;
             crate::audio::openal::suspend_all_contexts();
             crate::guest_clock::set_frozen(true);
             self.blocked = true;
@@ -480,7 +502,7 @@ impl Window {
     }
 
     pub fn swap_window(&mut self) {
-        self.service_host();
+        self.service_host(true);
         #[cfg(target_os = "android")]
         self.egl.swap();
         self.perf_hints.frame_presented();
