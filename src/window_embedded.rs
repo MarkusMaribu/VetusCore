@@ -55,6 +55,26 @@ thread_local! {
     static CURRENT_CONTEXT: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Pausing the app is not just freezing it: like iOS, it first gets
+/// `applicationWillResignActive:` and `applicationDidEnterBackground:` so it
+/// can save its progress, and on return `applicationWillEnterForeground:` and
+/// `applicationDidBecomeActive:`. Apps that were evicted while parked (or
+/// killed by the memory guard) can only restore what they saved here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Background {
+    /// Running normally.
+    Active,
+    /// The two background events are queued; the app is still running so it
+    /// can handle them.
+    Notifying,
+    /// The app has handled them and may be parked.
+    Notified,
+}
+
+/// How long to let the app handle the background events before parking it
+/// anyway (a guest that never polls events must not be able to ignore pause).
+const BACKGROUND_GRACE: Duration = Duration::from_millis(1000);
+
 pub struct Window {
     event_queue: VecDeque<Event>,
     high_priority_event: Option<Event>,
@@ -77,6 +97,11 @@ pub struct Window {
     blocked: bool,
     /// When the host first asked to pause while this thread was between frames.
     pause_seen: Option<Instant>,
+    /// How far the app is through being told it is going to the background.
+    background: Background,
+    /// Set once the app has been running; before that a pause (waiting for the
+    /// first surface) is not a trip to the background.
+    has_run: bool,
     bound_window: usize,
     show_fps_counter: Cell<bool>,
     fps_frame_count: Cell<u32>,
@@ -146,6 +171,8 @@ impl Window {
             adreno: false,
             blocked: false,
             pause_seen: None,
+            background: Background::Active,
+            has_run: false,
             bound_window: 0,
             show_fps_counter: Cell::new(false),
             fps_frame_count: Cell::new(0),
@@ -219,25 +246,67 @@ impl Window {
         self.drain_input();
     }
 
-    /// t_swap is true when called right before a frame is presented, so the
-    /// back buffer holds the finished frame. Parking there lets the last frame
-    /// be read back before the surface goes away; between frames the buffer is
-    /// undefined, so a pause waits (briefly) for the next swap instead.
+    fn lifecycle_queued(&self) -> bool {
+        self.event_queue.iter().any(|event| {
+            matches!(
+                event,
+                Event::AppWillResignActive | Event::AppDidEnterBackground
+            )
+        })
+    }
+
+    /// Tell the app it is back in the foreground (after a pause).
+    fn resume_lifecycle(&mut self) {
+        if self.background == Background::Active {
+            return;
+        }
+        self.background = Background::Active;
+        self.event_queue.push_back(Event::AppWillEnterForeground);
+        self.event_queue.push_back(Event::AppDidBecomeActive);
+    }
+
+    /// `at_swap` is true when called right before a frame is presented, so
+    /// the back buffer holds the finished frame and the last frame can be read
+    /// back before the surface goes away.
+    ///
+    /// A pause is not applied at once: the app first runs on for a moment so
+    /// it can handle `applicationWillResignActive:` and
+    /// `applicationDidEnterBackground:` (see [Background]). Those events are
+    /// only queued from the event poll, which runs between frames, so the
+    /// swap path just keeps rendering until the poll has delivered them.
     fn service_host(&mut self, at_swap: bool) {
         let parking = !self.blocked
             && !crate::embed::should_quit()
             && !crate::embed::is_runnable();
         if parking {
+            let since = *self.pause_seen.get_or_insert_with(Instant::now);
+            let notified = match self.background {
+                _ if !self.has_run => true,
+                Background::Notified => true,
+                Background::Active => {
+                    if !at_swap {
+                        self.event_queue.push_back(Event::AppWillResignActive);
+                        self.event_queue.push_back(Event::AppDidEnterBackground);
+                        self.background = Background::Notifying;
+                    }
+                    false
+                }
+                Background::Notifying => !at_swap && !self.lifecycle_queued(),
+            };
+            if !notified && since.elapsed() < BACKGROUND_GRACE {
+                return;
+            }
+            self.background = Background::Notified;
             if at_swap {
                 self.capture_frame();
-            } else {
-                let since = *self.pause_seen.get_or_insert_with(Instant::now);
-                if since.elapsed() < Duration::from_millis(300) {
-                    return;
-                }
             }
         } else {
             self.pause_seen = None;
+            if !self.blocked && !crate::embed::should_quit() && crate::embed::is_runnable() {
+                self.has_run = true;
+                // Resumed before the app was parked.
+                self.resume_lifecycle();
+            }
         }
         self.sync_surface();
         if crate::embed::should_quit() {
@@ -248,6 +317,7 @@ impl Window {
                 crate::guest_clock::set_frozen(false);
                 crate::audio::openal::resume_all_contexts();
                 self.blocked = false;
+                self.resume_lifecycle();
             }
             return;
         }
@@ -263,6 +333,7 @@ impl Window {
             crate::guest_clock::set_frozen(false);
             crate::audio::openal::resume_all_contexts();
             self.blocked = false;
+            self.resume_lifecycle();
         }
     }
 
