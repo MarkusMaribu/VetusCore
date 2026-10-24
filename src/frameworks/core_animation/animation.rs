@@ -80,7 +80,14 @@ impl State {
                 continue;
             }
 
-            let effective_begin_time = start_time.unwrap_or(begin_time);
+            // An explicit beginTime is on the layer's timeline. Sampling the
+            // first frame later must not restart its duration: a busy main
+            // thread may already have consumed part of the interval.
+            let effective_begin_time = if begin_time > 0.0 {
+                begin_time
+            } else {
+                start_time.unwrap_or(begin_time)
+            };
 
             if let Some(key) = key {
                 log_dbg!(
@@ -167,6 +174,27 @@ impl State {
             // Only these properties are animatable
             // TODO: Implement for all properties
             match &*key_path {
+                "transform" => {
+                    use super::ca_transform3d::{interpolate, CATransform3D};
+                    let from: Option<CATransform3D> =
+                        id_as_option(from_value).map(|obj| msg![env; obj CATransform3DValue]);
+                    let to: Option<CATransform3D> =
+                        id_as_option(to_value).map(|obj| msg![env; obj CATransform3DValue]);
+                    let by: Option<CATransform3D> =
+                        id_as_option(by_value).map(|obj| msg![env; obj CATransform3DValue]);
+                    let current = presentation.transform_3d;
+                    let (from, to) = match (from, to, by) {
+                        (Some(from), Some(to), _) => (from, to),
+                        (Some(from), None, Some(by)) => (from, from.concat(by)),
+                        (None, Some(to), Some(by)) => (to.concat(by.invert()), to),
+                        (Some(from), None, None) => (from, current),
+                        (None, Some(to), None) => (current, to),
+                        (None, None, Some(by)) => (current, current.concat(by)),
+                        (None, None, None) => (current, current),
+                    };
+                    presentation.transform_3d = interpolate(from, to, interpolation_amount);
+                    presentation.affine_transform = presentation.transform_3d.to_affine();
+                }
                 "anchorPoint" => {
                     let from_value =
                         id_as_option(from_value).map(|obj| msg![env; obj CGPointValue]);

@@ -67,7 +67,10 @@ impl Default for UITextViewHostObject {
             superclass: Default::default(),
             editable: true,
             text: nil,
-            selected_range: NSRange { location: 0, length: 0 },
+            selected_range: NSRange {
+                location: 0,
+                length: 0,
+            },
             font: nil,
             text_color: nil,
             text_alignment: UITextAlignmentLeft,
@@ -448,7 +451,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 };
 
 fn text_view_selected_range(env: &Environment, text_view: id) -> NSRange {
-    env.objc.borrow::<UITextViewHostObject>(text_view).selected_range
+    env.objc
+        .borrow::<UITextViewHostObject>(text_view)
+        .selected_range
 }
 
 fn post_text_view_text_did_change(env: &mut Environment, text_view: id) {
@@ -464,19 +469,16 @@ fn post_text_view_text_did_change(env: &mut Environment, text_view: id) {
         false
     };
     if delegate_alive {
-        let selector = env.objc.register_host_selector("textViewDidChange:".to_string(), &mut env.mem);
+        let selector = env
+            .objc
+            .register_host_selector("textViewDidChange:".to_string(), &mut env.mem);
         if msg![env; delegate respondsToSelector:selector] {
             let _: () = msg![env; delegate textViewDidChange:text_view];
         }
     }
 }
 
-fn replace_text_view_range(
-    env: &mut Environment,
-    text_view: id,
-    range: NSRange,
-    replacement: id,
-) {
+fn replace_text_view_range(env: &mut Environment, text_view: id, range: NSRange, replacement: id) {
     if !msg![env; text_view isEditable] {
         return;
     }
@@ -512,7 +514,8 @@ fn replace_text_view_range(
     }
 
     let replacement_length: NSUInteger = msg![env; replacement length];
-    let new_text: id = msg![env; text stringByReplacingCharactersInRange:range withString:replacement];
+    let new_text: id =
+        msg![env; text stringByReplacingCharactersInRange:range withString:replacement];
     let _: () = msg![env; text_view setText:new_text];
     let new_range = NSRange {
         location: range.location + replacement_length,

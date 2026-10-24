@@ -1588,8 +1588,8 @@ impl Environment {
             DefaultStack::new(16 * 1024 * 1024).expect("failed to allocate guest coroutine stack");
         let thread_routine =
             Coroutine::with_stack(thread_stack, move |yielder, mut env: Environment| {
-                log_dbg!(
-                    "touchHLE: guest worker thread now running (start_routine={:#x})",
+                log!(
+                    "THREAD-DIAG: guest worker thread now running (start_routine={:#x})",
                     start_routine.addr_with_thumb_bit()
                 );
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1631,6 +1631,7 @@ impl Environment {
 
         let new_thread_id = self.threads.len() - 1;
 
+        log!("THREAD-DIAG: created thread {} (routine {:?})", new_thread_id, start_routine);
         log_dbg!("Created new thread {} with stack {:#x}–{:#x}, will execute function {:?} with data {:?}", new_thread_id, stack_alloc.to_bits(), (stack_high_addr - 1), start_routine, user_data);
 
         new_thread_id
@@ -2309,6 +2310,18 @@ impl Environment {
     fn switch_thread(&mut self, old_context: &mut Option<HostContext>, new_thread: ThreadId) {
         assert!(new_thread != self.current_thread);
         assert!(self.threads[new_thread].active);
+        {
+            static SWITCH_DIAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SWITCH_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 30 {
+                log!(
+                    "THREAD-DIAG: switching thread {} => {} (threads={})",
+                    self.current_thread,
+                    new_thread,
+                    self.threads.len()
+                );
+            }
+        }
         log_dbg!(
             "Switching thread: {} => {}",
             self.current_thread,
@@ -3913,6 +3926,24 @@ impl Environment {
         // GDB can allow schedule_next_thread to be called twice in a row -
         // we make sure that this works by immediately fufilling conditions
         // (relocking mutexes, decrementing semaphores, etc.)!
+        {
+            static SCHED_DIAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SCHED_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.threads.len() > 1 && (n < 10 || n % 3000 == 0) && n < 30000 {
+                let states: Vec<String> = self
+                    .threads
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| format!("{}:{}:{:?}", i, t.active, t.blocked_by))
+                    .collect();
+                log!(
+                    "THREAD-DIAG: schedule #{} current={} states=[{}]",
+                    n,
+                    self.current_thread,
+                    states.join(", ")
+                );
+            }
+        }
         loop {
             // Try to find a new thread to execute, starting with the thread
             // following the one currently executing.

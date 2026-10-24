@@ -268,14 +268,30 @@ fn live_contexts() -> &'static Mutex<Vec<usize>> {
 
 /// Stop OpenAL Soft's mixer thread while a Vetus session is parked.
 pub fn suspend_all_contexts() {
-    for ptr in live_contexts().lock().unwrap().iter().copied() {
-        unsafe { al_sys::alcSuspendContext(ptr as *mut ALCcontext) };
-    }
+    set_playback_paused(true);
 }
 
 pub fn resume_all_contexts() {
-    for ptr in live_contexts().lock().unwrap().iter().copied() {
-        unsafe { al_sys::alcProcessContext(ptr as *mut ALCcontext) };
+    set_playback_paused(false);
+}
+
+fn set_playback_paused(paused: bool) {
+    // alcSuspendContext defers property updates; it does not stop sources.
+    // ALC_SOFT_pause_device freezes playback and source offsets together.
+    // https://openal-soft.org/openal-extensions/SOFT_pause_device.txt
+    let contexts = live_contexts().lock().unwrap();
+    let mut devices = std::collections::HashSet::new();
+    for &context in contexts.iter() {
+        unsafe {
+            let device = al_sys::alcGetContextsDevice(context as *mut ALCcontext);
+            if !device.is_null() && devices.insert(device as usize) {
+                if paused {
+                    al_sys::alcDevicePauseSOFT(device);
+                } else {
+                    al_sys::alcDeviceResumeSOFT(device);
+                }
+            }
+        }
     }
 }
 
@@ -500,5 +516,94 @@ impl OpenAL<'_> {
     }
     pub unsafe fn SpeedOfSound(&self, speed: ALfloat) {
         al_sys::alSpeedOfSound(speed)
+    }
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Exercise the actual mixer: a parked game's looping source must stop
+    /// advancing, then continue from that offset when the game resumes.
+    /// https://openal-soft.org/openal-extensions/SOFT_pause_device.txt
+    #[test]
+    fn parking_freezes_and_resumes_playback() {
+        // OpenAL selects its backend once per process. Use null playback on
+        // desktop; exercise the actual OpenSL stop/start lifecycle on Android.
+        const CHILD: &str = "VETUS_AUDIO_PAUSE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "audio::openal::pause_tests::parking_freezes_and_resumes_playback",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(
+                    "ALSOFT_DRIVERS",
+                    if cfg!(target_os = "android") {
+                        "opensl"
+                    } else {
+                        "null"
+                    },
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut manager = OpenALManager::new().unwrap();
+        let mut context = OpenALContext::new(&mut manager).unwrap();
+        let al = context.make_current(&mut manager);
+        let mut buffer = 0;
+        let mut source = 0;
+        let samples = vec![1000i16; 44100];
+        unsafe {
+            al.GenBuffers(1, &mut buffer);
+            al.BufferData(
+                buffer,
+                AL_FORMAT_MONO16,
+                samples.as_ptr().cast(),
+                (samples.len() * 2) as i32,
+                44100,
+            );
+            al.GenSources(1, &mut source);
+            al.Sourcei(source, AL_BUFFER, buffer as i32);
+            al.Sourcei(source, 0x1007 /* AL_LOOPING */, 1);
+            al.SourcePlay(source);
+            assert_eq!(al.GetError(), AL_NO_ERROR);
+        }
+        let offset = || {
+            let mut offset = 0;
+            unsafe {
+                al.GetSourcei(source, 0x1025 /* AL_SAMPLE_OFFSET */, &mut offset)
+            };
+            offset
+        };
+        let wait_for_progress = |previous| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while offset() == previous && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_ne!(offset(), previous, "playback did not advance");
+        };
+        wait_for_progress(0);
+        suspend_all_contexts();
+        let paused = offset();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(offset(), paused, "parked audio kept playing");
+        resume_all_contexts();
+        wait_for_progress(paused);
+        unsafe {
+            al.DeleteSources(1, &source);
+            al.DeleteBuffers(1, &buffer);
+            assert_eq!(al.GetError(), AL_NO_ERROR);
+        }
     }
 }

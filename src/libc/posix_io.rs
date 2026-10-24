@@ -471,6 +471,13 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         return -1;
     }
 
+    // Darwin open(2): a directory opened for writing fails with EISDIR,
+    // including O_CREAT. Preserve EEXIST precedence for O_CREAT|O_EXCL above.
+    if (flags & O_ACCMODE) != O_RDONLY && env.fs.is_dir(GuestPath::new(&actual_path_string)) {
+        set_errno(env, EISDIR);
+        return -1;
+    }
+
     let res = match env
         .fs
         .open_with_options(GuestPath::new(&actual_path_string), options)
@@ -1556,7 +1563,7 @@ fn truncate(env: &mut Environment, path_ptr: ConstPtr<u8>, len: off_t) -> i32 {
 /// Оценить readiness одного fd для poll(2): возвращает `revents`.
 /// Нормальные биты (POLLIN/POLLOUT/…) отдаются только если запросили их в
 /// `events`; POLLERR/POLLHUP/POLLNVAL — всегда (POSIX).
-fn evaluate_poll_fd(env: &mut Environment, fd: FileDescriptor, events: i16) -> i16 {
+pub(crate) fn evaluate_poll_fd(env: &mut Environment, fd: FileDescriptor, events: i16) -> i16 {
     if fd < 0 {
         // Отрицательные fd игнорируются: revents=0, в счёт не идут.
         return 0;

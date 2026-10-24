@@ -115,14 +115,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: - Scale / Retina Support
 
-// NOTE: unlike the previous hardcoded-1.0 stubs, contentsScale is NOT
-// overridden here. It is inherited from CALayer, whose host object stores a
-// real `contents_scale` field. `UIView.init_common` seeds every view's
-// backing layer with the main screen's scale, so on retina devices (iPhone
-// 4/4s/5/5c, iPod touch 4/5, iPad 3/4/5/mini 2/3) the EAGL renderbuffer is
-// allocated at bounds * 2.0 and games render at native resolution instead of
-// being zoomed/cropped into a half-size framebuffer. Apps that explicitly
-// call setContentScaleFactor: / setContentsScale: round-trip correctly.
+// contentsScale is inherited from CALayer. EAGL-backed views retain the
+// documented default of 1.0; apps opt into Retina with setContentScaleFactor:
+// or setContentsScale:. Renderbuffer storage honors the selected scale.
 
 - (id)initWithLayer:(id)layer {
     let _: () = msg![env; this setOpaque:true];
@@ -283,7 +278,7 @@ fn fullscreen_frame_matches_screen(frame: CGRect, screen: CGRect) -> bool {
 /// If there is an opaque `CAEAGLLayer` that covers the entire screen, this
 /// returns a pointer to it. Otherwise, it returns [nil].
 pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
-    if env.options.force_composition {
+    if env.options.force_composition || super::view_transition::has_active(env) {
         return nil;
     }
 
@@ -331,6 +326,13 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
             opacity,
         ) = {
             let host = env.objc.borrow::<CALayerHostObject>(layer);
+            // Direct presentation would bypass the animated presentation transform.
+            if !host.transform_3d.is_affine()
+                || !host.animations.is_empty()
+                || !host.anonymous_animations.is_empty()
+            {
+                return nil;
+            }
             (
                 host.affine_transform,
                 host.bounds,
@@ -432,7 +434,10 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
     let ca_eagl_layer_class: Class = msg_class![env; CAEAGLLayer class];
     if !msg![env; layer isKindOfClass:ca_eagl_layer_class] {
         if crate::env_flag_cached!("TOUCHHLE_TRACE_PRESENT") {
-            log!("FULLSCREEN-DIAG layer {:?} rejected: not a CAEAGLLayer", layer);
+            log!(
+                "FULLSCREEN-DIAG layer {:?} rejected: not a CAEAGLLayer",
+                layer
+            );
         }
         return nil;
     }
@@ -577,7 +582,10 @@ mod fullscreen_layer_tests {
             },
         };
         let almost_fullscreen = CGRect {
-            origin: CGPoint { x: -0.002, y: 0.003 },
+            origin: CGPoint {
+                x: -0.002,
+                y: 0.003,
+            },
             size: crate::frameworks::core_graphics::CGSize {
                 width: 320.001,
                 height: 567.999,

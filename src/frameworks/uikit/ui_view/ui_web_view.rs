@@ -937,7 +937,12 @@ fn overlay_show_or_update(env: &mut Environment, this: id) -> Option<i32> {
 /// extent when the app initiated it. Called from `-setFrame:`; keeps the
 /// load deferred if the view still can't be shown.
 fn retry_pending_load(env: &mut Environment, this: id) {
-    if env.objc.borrow::<UIWebViewHostObject>(this).pending_load.is_none() {
+    if env
+        .objc
+        .borrow::<UIWebViewHostObject>(this)
+        .pending_load
+        .is_none()
+    {
         return;
     }
     if !android_web_view::native_webview_available() {
@@ -971,7 +976,9 @@ fn retry_pending_load(env: &mut Environment, this: id) {
     if !shown {
         // The overlay still couldn't be shown (e.g. the host window
         // viewport isn't ready); keep the load deferred.
-        env.objc.borrow_mut::<UIWebViewHostObject>(this).pending_load = Some(pending);
+        env.objc
+            .borrow_mut::<UIWebViewHostObject>(this)
+            .pending_load = Some(pending);
     }
 }
 
@@ -1055,10 +1062,9 @@ pub(crate) fn retry_pending_loads_in_subtree(env: &mut Environment, root: id) {
 fn fire_did_finish_load(env: &mut Environment, this: id) {
     let delegate = env.objc.borrow::<UIWebViewHostObject>(this).delegate;
     if delegate != nil {
-        let sel = env.objc.register_host_selector(
-            "webViewDidFinishLoad:".to_string(),
-            &mut env.mem,
-        );
+        let sel = env
+            .objc
+            .register_host_selector("webViewDidFinishLoad:".to_string(), &mut env.mem);
         let responds: bool = msg![env; delegate respondsToSelector:sel];
         if responds {
             let _: () = msg![env; delegate webViewDidFinishLoad:this];
@@ -1070,10 +1076,9 @@ fn fire_did_finish_load(env: &mut Environment, this: id) {
 fn fire_did_start_load(env: &mut Environment, this: id) {
     let delegate = env.objc.borrow::<UIWebViewHostObject>(this).delegate;
     if delegate != nil {
-        let sel = env.objc.register_host_selector(
-            "webViewDidStartLoad:".to_string(),
-            &mut env.mem,
-        );
+        let sel = env
+            .objc
+            .register_host_selector("webViewDidStartLoad:".to_string(), &mut env.mem);
         let responds: bool = msg![env; delegate respondsToSelector:sel];
         if responds {
             let _: () = msg![env; delegate webViewDidStartLoad:this];
@@ -1143,7 +1148,7 @@ fn unwrap_js_result(result: &str) -> String {
             .replace("\\n", "\n")
             .replace("\\r", "\r")
             .replace("\\t", "\t")
-            .replace("\\\"","\"")
+            .replace("\\\"", "\"")
             .replace('\u{1}', "\\");
     }
     t.to_string()

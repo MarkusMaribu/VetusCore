@@ -49,6 +49,7 @@
 + (instancetype)bundleWithPath:(NSString *)path;
 + (instancetype)bundleWithIdentifier:(NSString *)identifier;
 - (NSString *)pathForResource:(NSString *)name ofType:(NSString *)extension;
+- (NSString *)pathForResource:(NSString *)name ofType:(NSString *)extension inDirectory:(NSString *)directory;
 - (NSString *)bundleIdentifier;
 @end
 
@@ -74,6 +75,14 @@ int test_NSHashTable_copy_is_independent(void);
 int test_NSHashTable_copy_owns_members(void);
 int test_NSHashTable_copy_empty(void);
 int test_NSData_base64_data(void);
+int test_UIView_layout_deferred_and_coalesced(void);
+int test_UIView_layout_dirty_descendants(void);
+int test_UIView_layout_reentry_and_reinvalidation(void);
+int test_UIView_layout_preserves_autoresizing_geometry(void);
+int test_UIView_flip_keeps_removed_layers_alive(void);
+int test_UIView_block_interpolates_layer_transform(void);
+int test_UIView_EAGL_retina_is_opt_in(void);
+int test_UIView_flip_preserves_nested_removed_layers(void);
 
 static int perform_selector_on_main_thread_calls;
 
@@ -464,6 +473,12 @@ int test_runloop_nested_stop(void) {
 typedef void *dispatch_queue_t;
 typedef uint64_t dispatch_time_t;
 extern dispatch_queue_t dispatch_get_main_queue(void);
+extern dispatch_queue_t dispatch_get_current_queue(void);
+extern dispatch_queue_t dispatch_get_global_queue(long priority, unsigned long flags);
+extern dispatch_queue_t dispatch_queue_create(const char *label, void *attributes);
+extern void dispatch_sync(dispatch_queue_t queue, void (^block)(void));
+extern void dispatch_sync_f(dispatch_queue_t queue, void *context, void (*work)(void *));
+extern void dispatch_release(void *object);
 extern dispatch_time_t dispatch_time(dispatch_time_t when, int64_t delta);
 extern void dispatch_after(dispatch_time_t when, dispatch_queue_t queue,
                            void (^block)(void));
@@ -475,6 +490,62 @@ extern void dispatch_after(dispatch_time_t when, dispatch_queue_t queue,
 @end
 
 static int scheduled_dispatch_calls;
+
+// Outside a submitted block, iOS 4 reports the main queue on the main thread
+// and the default concurrent queue on an ordinary pthread. In particular, a
+// worker must not inherit a queue while the submitting thread waits for it.
+// https://developer.apple.com/documentation/dispatch/dispatch_get_current_queue()?language=objc
+static void *current_queue_worker(void *context) {
+  int *result = context;
+  dispatch_queue_t current = dispatch_get_current_queue();
+  *result = current != NULL && current != dispatch_get_main_queue() &&
+                    current == dispatch_get_global_queue(0, 0)
+                ? 0 : -1;
+  return NULL;
+}
+
+int test_dispatch_current_queue_worker(void) {
+  if (dispatch_get_current_queue() != dispatch_get_main_queue()) return -1;
+  pthread_t worker;
+  int result = -2;
+  if (pthread_create(&worker, NULL, current_queue_worker, &result)) return -3;
+  pthread_join(worker, NULL);
+  return result;
+}
+
+static void check_current_queue_function(void *context) {
+  void **values = context;
+  values[1] = dispatch_get_current_queue();
+}
+
+int test_dispatch_current_queue_nested(void) {
+  dispatch_queue_t outer = dispatch_queue_create("TestApp.outer", NULL);
+  dispatch_queue_t inner = dispatch_queue_create("TestApp.inner", NULL);
+  __block int result = 0;
+  dispatch_sync(outer, ^{
+    if (dispatch_get_current_queue() != outer) result = -1;
+    dispatch_sync(inner, ^{
+      if (dispatch_get_current_queue() != inner) result = -2;
+    });
+    if (dispatch_get_current_queue() != outer) result = -3;
+    void *values[] = {inner, NULL};
+    dispatch_sync_f(inner, values, check_current_queue_function);
+    if (values[1] != inner || dispatch_get_current_queue() != outer) result = -4;
+    pthread_t worker;
+    int worker_result = -1;
+    if (pthread_create(&worker, NULL, current_queue_worker, &worker_result)) {
+      result = -5;
+    } else {
+      pthread_join(worker, NULL);
+      if (worker_result != 0) result = -6;
+    }
+    if (dispatch_get_current_queue() != outer) result = -7;
+  });
+  if (dispatch_get_current_queue() != dispatch_get_main_queue()) result = -8;
+  dispatch_release(inner);
+  dispatch_release(outer);
+  return result;
+}
 
 static int check_scheduled_timer_default_mode(BOOL use_invocation) {
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
@@ -680,6 +751,21 @@ int test_NSBundle_subbundleCacheRetainsAutoreleasedBundle(void) {
   if ([cached pathForResource:@"marker" ofType:@"txt"] == nil)
     return -5;
   return 0;
+}
+
+// Qualified bundle lookups must not pick the same basename elsewhere.
+// https://developer.apple.com/library/archive/documentation/CoreFoundation/Conceptual/CFBundles/AccessingaBundlesContents/AccessingaBundlesContents.html
+int test_NSBundle_qualified_resource_stays_in_requested_directory(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  NSString *path = [[NSBundle mainBundle] pathForResource:@"TestResources" ofType:@"bundle"];
+  NSBundle *bundle = [NSBundle bundleWithPath:path];
+  int result = 0;
+  if ([bundle pathForResource:@"marker" ofType:@"txt"] == nil) result = -1;
+  else if ([bundle pathForResource:@"missing/marker" ofType:@"txt"] != nil) result = -2;
+  else if ([bundle pathForResource:@"marker" ofType:@"txt" inDirectory:@"missing"] != nil) result = -3;
+  else if ([bundle pathForResource:@"nested/missing/marker" ofType:@"txt"] != nil) result = -4;
+  [pool drain];
+  return result;
 }
 
 // TODO: include from <mach/thread_act.h> once available in the common-sdk
@@ -4403,6 +4489,25 @@ int test_funlockfile_from_other_thread_is_ignored() {
 
 // === end flockfile / funlockfile tests ===
 
+// Flurry is substituted by the emulator. Its version API promises a nonnull
+// NSString, including when analytics is disabled. Angry Birds passes its
+// UTF8String to std::string during startup.
+// https://flurry.github.io/flurry-ios-sdk/Flurry%20Analytics%20API%20Documentation/interface_flurry.html
+@interface Flurry : NSObject
++ (NSString *)getFlurryAgentVersion;
+@end
+@implementation Flurry
++ (NSString *)getFlurryAgentVersion { return @"test-sdk"; }
+@end
+
+int test_Flurry_version_is_a_string() {
+  NSString *version = [Flurry getFlurryAgentVersion];
+  if (version == nil) return -1;
+  const char *utf8 = [version UTF8String];
+  if (utf8 == NULL || strlen(utf8) == 0) return -2;
+  return 0;
+}
+
 int test_open() {
   int fd;
   // Test opening directories
@@ -4423,6 +4528,24 @@ int test_open() {
     close(fd);
     return -3;
   }
+
+  // O_CREAT must not turn an existing directory into a new-file target.
+  // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/open.2.html
+  errno = 0;
+  fd = open("/usr", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd != -1) {
+    close(fd);
+    return -4;
+  }
+  if (errno != EISDIR) return -5;
+
+  errno = 0;
+  fd = open("/usr", O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (fd != -1) {
+    close(fd);
+    return -6;
+  }
+  if (errno != EEXIST) return -7;
 
   return 0;
 }
@@ -7374,6 +7497,51 @@ int test_NSNotificationCenter_addObserver_nilName_removeObserver() {
 }
 
 // clang-format off
+// select applies to pipe descriptors, including EOF and cross-thread wakeups.
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/select.2.html
+static void *select_pipe_writer(void *context) {
+    usleep(20000);
+    int fd = *(int *)context;
+    return (void *)(intptr_t)(write(fd, "x", 1) == 1 ? 0 : 1);
+}
+int test_select_pipe_readiness(void) {
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    int result = 0;
+    fd_set reads, writes, errors;
+    struct timeval zero = {0, 0};
+    FD_ZERO(&reads); FD_SET(fds[0], &reads);
+    FD_ZERO(&writes); FD_SET(fds[1], &writes);
+    FD_ZERO(&errors); FD_SET(fds[0], &errors);
+    if (select(fds[1]+1, &reads, &writes, &errors, &zero) != 1 ||
+        FD_ISSET(fds[0], &reads) || !FD_ISSET(fds[1], &writes) ||
+        FD_ISSET(fds[0], &errors)) result = -2;
+    if (result == 0) {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, select_pipe_writer, &fds[1]) != 0) result = -3;
+        else {
+            FD_ZERO(&reads); FD_SET(fds[0], &reads);
+            struct timeval timeout = {1, 0};
+            int ready = select(fds[0]+1, &reads, NULL, NULL, &timeout);
+            void *status = NULL;
+            pthread_join(thread, &status);
+            char byte = 0;
+            if (ready != 1 || !FD_ISSET(fds[0], &reads) || status ||
+                read(fds[0], &byte, 1) != 1 || byte != 'x') result = -4;
+        }
+    }
+    close(fds[1]);
+    FD_ZERO(&reads); FD_SET(fds[0], &reads);
+    if (result == 0 && (select(fds[0]+1, &reads, NULL, NULL, &zero) != 1 ||
+        !FD_ISSET(fds[0], &reads))) result = -5;
+    close(fds[0]);
+    FD_ZERO(&reads); FD_SET(fds[0], &reads);
+    errno = 0;
+    if (result == 0 && (select(fds[0]+1, &reads, NULL, NULL, &zero) != -1 ||
+        errno != EBADF || !FD_ISSET(fds[0], &reads))) result = -6;
+    return result;
+}
+
 #define FUNC_DEF(func)                                                         \
   { &func, #func }
 struct {
@@ -7436,6 +7604,7 @@ struct {
     FUNC_DEF(test_fprintf_waits_for_other_thread_lock),
     FUNC_DEF(test_funlockfile_from_other_thread_is_ignored),
     FUNC_DEF(test_open),
+    FUNC_DEF(test_Flurry_version_is_a_string),
     FUNC_DEF(test_close),
     FUNC_DEF(test_cond_var),
     FUNC_DEF(test_cond_var_static),
@@ -7495,6 +7664,7 @@ struct {
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
+    FUNC_DEF(test_select_pipe_readiness),
     FUNC_DEF(test_selector_queue_order_and_initialization),
     FUNC_DEF(test_selector_queue_explicit_and_common_modes),
     FUNC_DEF(test_selector_queue_callback_and_nested_delivery),
@@ -7505,6 +7675,16 @@ struct {
     FUNC_DEF(test_scheduled_timer_default_mode),
     FUNC_DEF(test_scheduled_invocation_timer_default_mode),
     FUNC_DEF(test_dispatch_after_default_mode),
+    FUNC_DEF(test_dispatch_current_queue_worker),
+    FUNC_DEF(test_dispatch_current_queue_nested),
+    FUNC_DEF(test_UIView_layout_deferred_and_coalesced),
+    FUNC_DEF(test_UIView_layout_dirty_descendants),
+    FUNC_DEF(test_UIView_layout_reentry_and_reinvalidation),
+    FUNC_DEF(test_UIView_layout_preserves_autoresizing_geometry),
+    FUNC_DEF(test_UIView_flip_keeps_removed_layers_alive),
+    FUNC_DEF(test_UIView_block_interpolates_layer_transform),
+    FUNC_DEF(test_UIView_EAGL_retina_is_opt_in),
+    FUNC_DEF(test_UIView_flip_preserves_nested_removed_layers),
     FUNC_DEF(test_dispatch_after_f_default_mode),
     FUNC_DEF(test_dispatch_after_common_mode),
     FUNC_DEF(test_runloop_audio_queue),
@@ -7520,6 +7700,7 @@ struct {
     FUNC_DEF(test_NSHashTable_copy_empty),
     FUNC_DEF(test_NSData_base64_data),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
+    FUNC_DEF(test_NSBundle_qualified_resource_stays_in_requested_directory),
 };
 // clang-format on
 

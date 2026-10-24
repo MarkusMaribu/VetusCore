@@ -343,10 +343,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; image_view setFrame:bounds];
 }
 
-// touchHLE has no deferred layout pass (setNeedsLayout is a no-op), so
-// re-layout the title/image/background subviews whenever the button is
-// resized. Buttons made with `buttonWithType:` get their real frame (often via
-// `sizeToFit`) only after init, and would otherwise keep zero-sized subviews.
+// Keep title/image/background geometry current synchronously when resized.
+// Buttons made with `buttonWithType:` get their real frame (often via
+// `sizeToFit`) only after init.
 - (())setFrame:(CGRect)frame {
     () = msg_super![env; this setFrame:frame];
     () = msg![env; this layoutSubviews];

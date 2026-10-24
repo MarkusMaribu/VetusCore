@@ -1026,6 +1026,20 @@ Type mismatch when sending message {} to {:?}!
             .map(|co| (co.name.clone(), co.is_metaclass))
         {
             let sel_name = selector.as_str(&env.mem).to_owned();
+            // The substituted SDK must preserve this nonnull NSString API.
+            // A nil version becomes a null UTF8String, which makes clients
+            // constructing std::string throw before reaching their menu.
+            // https://flurry.github.io/flurry-ios-sdk/Flurry%20Analytics%20API%20Documentation/interface_flurry.html
+            if is_metaclass
+                && matches!(class_name_for_log.as_str(), "Flurry" | "FlurryAPI")
+                && sel_name == "getFlurryAgentVersion"
+            {
+                let version =
+                    crate::frameworks::foundation::ns_string::get_static_str(env, "0.0.0");
+                env.cpu.regs_mut()[0] = version.to_bits();
+                env.cpu.regs_mut()[1] = 0;
+                return;
+            }
             if let Some(result) =
                 fake_openfeint_should_autorotate(env, &class_name_for_log, is_metaclass, &sel_name)
             {

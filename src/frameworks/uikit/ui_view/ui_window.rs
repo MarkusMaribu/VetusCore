@@ -154,13 +154,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg_super![env; this dealloc]
 }
 
-- (())layoutIfNeeded {
-    log_dbg!("[(UIWindow*){:?} layoutIfNeeded]", this);
-    // Честная реализация: немедленно форсируем пересчет layout'а,
-    // отправляя сообщение layoutSubviews самому себе (наследуется от UIView)
-    () = msg![env; this layoutSubviews];
-}
-
 // Permissive hit-testing for the application window.
 //
 // On real iOS, UIWindow's frame matches UIScreen.bounds and touches always

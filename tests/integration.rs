@@ -395,6 +395,7 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         "-Wl,-U,___CFConstantStringClassReference",
         // Block classes are also provided directly by dyld, not the stubs.
         "-Wl,-U,__NSConcreteGlobalBlock",
+        "-Wl,-U,__NSConcreteStackBlock",
     ];
 
     // Generate symbol stubs.

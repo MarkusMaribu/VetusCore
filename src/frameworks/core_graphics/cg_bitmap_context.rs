@@ -638,11 +638,38 @@ pub(super) fn draw_image(
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
 
     let (image_width, image_height) = image.dimensions();
+    let mut visited = 0usize;
+    let mut src_nonzero = 0usize;
     for ((x, y), (texel_x, texel_y)) in drawer.iter_transformed_pixels(rect) {
         let texel_x = (image_width as f32 * texel_x) as i32;
         let texel_y = (image_height as f32 * (1.0 - texel_y)) as i32;
         if let Some(color) = image.get_pixel((texel_x, texel_y)) {
+            visited += 1;
+            if color.3 > 0.0 {
+                src_nonzero += 1;
+            }
             drawer.put_pixel((x, y), color, true)
+        }
+    }
+    {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 12 {
+            log!(
+                "DRAW-DIAG #{n} ctx={}x{} bpc={} bpr={} alpha={:#x} order={:#x} ctm={:?} rect={:?} image={}x{} visited={} src_alpha_nonzero={}",
+                drawer.bitmap_info.width,
+                drawer.bitmap_info.height,
+                drawer.bitmap_info.bits_per_component,
+                drawer.bitmap_info.bytes_per_row,
+                drawer.bitmap_info.alpha_info,
+                drawer.bitmap_info.byte_order,
+                drawer.transform,
+                rect,
+                image_width,
+                image_height,
+                visited,
+                src_nonzero
+            );
         }
     }
 }

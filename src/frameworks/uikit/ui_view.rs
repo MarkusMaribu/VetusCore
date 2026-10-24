@@ -25,6 +25,9 @@ pub mod ui_toolbar;
 pub mod ui_web_view;
 pub mod ui_window;
 
+use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
+use std::collections::HashMap;
+
 use super::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
 use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
 use crate::frameworks::core_graphics::cg_color::CGColorRef;
@@ -57,6 +60,9 @@ pub(super) struct AnimationBlockState {
     pub(super) delegate: id,
     pub(super) did_stop_selector: Option<SEL>,
     pub(super) will_start_selector: Option<SEL>,
+    transition: Option<crate::frameworks::core_animation::view_transition::Pending>,
+    curve: i32,
+    transforms: HashMap<id, (CATransform3D, CATransform3D)>,
 }
 impl Default for AnimationBlockState {
     fn default() -> AnimationBlockState {
@@ -69,7 +75,64 @@ impl Default for AnimationBlockState {
             delegate: nil,
             did_stop_selector: None,
             will_start_selector: None,
+            transition: None,
+            curve: 0,
+            transforms: HashMap::new(),
         }
+    }
+}
+
+/// Record a model-layer transform change inside a legacy UIView block.
+pub(crate) fn record_layer_transform_change(
+    env: &mut Environment,
+    layer: id,
+    from: CATransform3D,
+    to: CATransform3D,
+) -> bool {
+    let block = &mut env.framework_state.uikit.ui_view.animation_block;
+    if !block.in_block {
+        return false;
+    }
+    let first = !block.transforms.contains_key(&layer);
+    block
+        .transforms
+        .entry(layer)
+        .and_modify(|values| values.1 = to)
+        .or_insert((from, to));
+    if first {
+        retain(env, layer);
+    }
+    true
+}
+
+fn commit_transform_animations(env: &mut Environment, block: &mut AnimationBlockState) {
+    use crate::frameworks::core_animation::ca_media_timing_function::*;
+    let name = match block.curve {
+        1 => kCAMediaTimingFunctionEaseIn,
+        2 => kCAMediaTimingFunctionEaseOut,
+        3 => kCAMediaTimingFunctionLinear,
+        _ => kCAMediaTimingFunctionEaseInEaseOut,
+    };
+    for (layer, (from, to)) in block.transforms.drain() {
+        if block.duration.is_finite() && block.duration > 0.0 && from != to {
+            let key = get_static_str(env, "transform");
+            let animation: id = msg_class![env; CABasicAnimation animationWithKeyPath:key];
+            let from: id = msg_class![env; NSValue valueWithCATransform3D:from];
+            let to: id = msg_class![env; NSValue valueWithCATransform3D:to];
+            let begin = crate::frameworks::core_animation::CACurrentMediaTime(env) + block.delay;
+            let timing_name = get_static_str(env, name);
+            let timing: id = msg_class![env; CAMediaTimingFunction functionWithName:timing_name];
+            let fill = get_static_str(env, "backwards");
+            () = msg![env; animation setFromValue:from];
+            () = msg![env; animation setToValue:to];
+            let duration = block.duration;
+            () = msg![env; animation setDuration:duration];
+            () = msg![env; animation setBeginTime:begin];
+            () = msg![env; animation setTimingFunction:timing];
+            () = msg![env; animation setFillMode:fill];
+            () = msg![env; layer addAnimation:animation forKey:key];
+        }
+        release(env, layer);
     }
 }
 
@@ -79,6 +142,7 @@ pub struct State {
     pub ui_image_view: ui_image_view::State,
     pub ui_window: ui_window::State,
     pub(super) animation_block: AnimationBlockState,
+    layout_running: bool,
 }
 
 pub(crate) struct UIViewHostObject {
@@ -93,6 +157,8 @@ pub(crate) struct UIViewHostObject {
     content_mode: NSInteger,
     autoresizing_mask: NSUInteger,
     autoresizes_subviews: bool,
+    needs_layout: bool,
+    is_laying_out: bool,
     clears_context_before_drawing: bool,
     user_interaction_enabled: bool,
     multiple_touch_enabled: bool,
@@ -113,20 +179,20 @@ pub(crate) struct UIViewHostObject {
     // iOS, but in practice only meaningful for views). All properties
     // default per Apple's documented behaviour for plain `UIView`:
     // <https://developer.apple.com/documentation/objectivec/nsobject/uiaccessibility>
-    /// `BOOL isAccessibilityElement` — default `NO` for plain UIView.
+    /// `BOOL isAccessibilityElement` â€” default `NO` for plain UIView.
     is_accessibility_element: bool,
     /// `UIAccessibilityTraits accessibilityTraits` (uint64_t bitmask).
     /// Default is `UIAccessibilityTraitNone` (0).
     accessibility_traits: u64,
-    /// `NSString *accessibilityLabel` — retained; default `nil`.
+    /// `NSString *accessibilityLabel` â€” retained; default `nil`.
     accessibility_label: id,
-    /// `NSString *accessibilityHint` — retained; default `nil`.
+    /// `NSString *accessibilityHint` â€” retained; default `nil`.
     accessibility_hint: id,
-    /// `NSString *accessibilityValue` — retained; default `nil`.
+    /// `NSString *accessibilityValue` â€” retained; default `nil`.
     accessibility_value: id,
     /// `NSString *accessibilityIdentifier` (from UIAccessibilityIdentification).
     accessibility_identifier: id,
-    /// `NSString *accessibilityLanguage` — BCP-47 language tag; default `nil`.
+    /// `NSString *accessibilityLanguage` â€” BCP-47 language tag; default `nil`.
     accessibility_language: id,
     /// `BOOL accessibilityElementsHidden` (iOS 5+); default `NO`.
     accessibility_elements_hidden: bool,
@@ -148,6 +214,8 @@ impl Default for UIViewHostObject {
             content_mode: 0,      // UIViewContentModeScaleToFill
             autoresizing_mask: 0, // UIViewAutoresizingNone
             autoresizes_subviews: true,
+            needs_layout: true,
+            is_laying_out: false,
             clears_context_before_drawing: true,
             user_interaction_enabled: true,
             multiple_touch_enabled: false,
@@ -176,6 +244,52 @@ impl Default for UIViewHostObject {
 pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
     let host_obj = env.objc.borrow_mut::<UIViewHostObject>(view);
     host_obj.view_controller = controller;
+}
+
+/// Perform pending layouts before drawing, including clean ancestors of dirty
+/// descendants. Callbacks may present GL frames and reenter the compositor.
+pub(crate) fn layout_windows_if_needed(env: &mut Environment) {
+    if env.current_thread != 0 || env.framework_state.uikit.ui_view.layout_running {
+        return;
+    }
+    env.framework_state.uikit.ui_view.layout_running = true;
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    for &window in &windows {
+        retain(env, window);
+    }
+    for window in windows {
+        if !msg![env; window isHidden] {
+            () = msg![env; window layoutIfNeeded];
+        }
+        release(env, window);
+    }
+    env.framework_state.uikit.ui_view.layout_running = false;
+}
+
+fn layout_view_if_needed(env: &mut Environment, view: id) {
+    let host = env.objc.borrow_mut::<UIViewHostObject>(view);
+    if host.is_laying_out {
+        return;
+    }
+    host.is_laying_out = true;
+    // Clear before the callback so a new invalidation survives this pass.
+    let needs_layout = std::mem::take(&mut host.needs_layout);
+    retain(env, view);
+    if needs_layout {
+        () = msg![env; view layoutSubviews];
+    }
+    let subviews = env.objc.borrow::<UIViewHostObject>(view).subviews.clone();
+    for &subview in &subviews {
+        retain(env, subview);
+    }
+    for subview in subviews {
+        if env.objc.borrow::<UIViewHostObject>(subview).superview == view {
+            layout_view_if_needed(env, subview);
+        }
+        release(env, subview);
+    }
+    env.objc.borrow_mut::<UIViewHostObject>(view).is_laying_out = false;
+    release(env, view);
 }
 
 /// Distribute a change of the superview's size along one axis over the
@@ -212,8 +326,8 @@ fn autoresize_axis(
 }
 
 /// Apply the subviews' autoresizing masks after `view`'s bounds changed from
-/// `old_size`, like UIKit does when a view is resized, then lay out each
-/// subview whose size changed (e.g. so an EAGLView rebuilds its renderbuffer).
+/// `old_size`, like UIKit does when a view is resized. Frame changes invalidate
+/// subview layout for the next pass (e.g. rebuilding an EAGL renderbuffer).
 fn resize_subviews_with_old_size(env: &mut Environment, view: id, old_size: CGSize) {
     let autoresizes: bool = msg![env; view autoresizesSubviews];
     if !autoresizes {
@@ -257,19 +371,8 @@ fn resize_subviews_with_old_size(env: &mut Environment, view: id, old_size: CGSi
         if new_frame == frame {
             continue;
         }
-        let old_subview_size = {
-            let bounds: CGRect = msg![env; subview bounds];
-            bounds.size
-        };
         // This autoresizes the subview's own subviews in turn.
         () = msg![env; subview setFrame:new_frame];
-        let new_subview_size = {
-            let bounds: CGRect = msg![env; subview bounds];
-            bounds.size
-        };
-        if new_subview_size != old_subview_size {
-            () = msg![env; subview layoutSubviews];
-        }
     }
 }
 
@@ -286,21 +389,24 @@ fn init_common(env: &mut Environment, this: id) -> id {
     let layer: id = msg![env; layer_class layer];
     () = msg![env; layer setDelegate:this];
     () = msg![env; layer setOpaque:true];
-    // A view's backing layer inherits the view's contentScaleFactor, which
-    // defaults to the main screen's scale (1.0 on non-retina devices, 2.0 on
-    // retina ones). EAGL derives the renderbuffer size from the layer's
-    // bounds * contentsScale, so without this retina-aware apps would
-    // allocate a half-size framebuffer and render zoomed / cropped.
-    let screen_scale: crate::frameworks::core_graphics::CGFloat = {
+    // UIKit drawing follows the screen scale. EAGL-backed views instead
+    // default to 1.0 and require an explicit Retina opt-in; otherwise apps
+    // drawing in points get an unexpectedly doubled renderbuffer.
+    // See Apple's OpenGL ES guide, "Supporting High-Resolution Displays".
+    let eagl_class: Class = msg_class![env; CAEAGLLayer class];
+    let is_eagl: bool = msg![env; layer isKindOfClass:eagl_class];
+    let content_scale: crate::frameworks::core_graphics::CGFloat = if is_eagl {
+        1.0
+    } else {
         let screen: id = msg_class![env; UIScreen mainScreen];
         msg![env; screen scale]
     };
     env.objc
         .borrow_mut::<UIViewHostObject>(this)
-        .content_scale_factor = screen_scale;
+        .content_scale_factor = content_scale;
     env.objc
         .borrow_mut::<crate::frameworks::core_animation::ca_layer::CALayerHostObject>(layer)
-        .contents_scale = screen_scale;
+        .contents_scale = content_scale;
     crate::frameworks::core_animation::ca_layer::set_use_implicit_animations(env, layer, false);
 
     // A view's backing layer is not retained by the view.
@@ -453,25 +559,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (Class)layerClass {
-    // Game engines that ship their own GL view classes (Gameloft's EAGLView,
-    // Cocos2d's CCEAGLView, etc.) override +layerClass to return CAEAGLLayer.
-    // Mirror that here so their backing layer is a real CAEAGLLayer: the EAGL
-    // fast-path presentation and find_fullscreen_eagl_layer() both depend on
-    // the layer being an EAGL layer, otherwise frames go through the RAM
-    // readback slow path (or never reach the screen at all - see the
-    // Asphalt 8 black-screen report).
-    env.objc.get_known_class("CAEAGLLayer", &mut env.mem)
+    // UIView uses CALayer; OpenGL view subclasses return CAEAGLLayer.
+    // https://developer.apple.com/documentation/uikit/uiview/layerclass
+    env.objc.get_known_class("CALayer", &mut env.mem)
 }
 
 // MARK: - Class-level animation block API
 //
-// touchHLE does not currently animate the visual side of these UIView
-// animation blocks (positions/opacity/transforms snap immediately to their
-// final value). However, a correct implementation **must** still call the
+// Flip transitions and transform changes are rendered by Core Animation.
+// Other property changes still snap to their final values. Animation blocks must also call the
 // configured `setAnimationDidStopSelector:` on the configured
 // `setAnimationDelegate:` once the would-be animation finishes, otherwise
 // games that drive their state machine off animation completion callbacks
-// (very common — e.g. fade-in/fade-out transitions, splash → menu hand-offs)
+// (very common â€” e.g. fade-in/fade-out transitions, splash â†’ menu hand-offs)
 // hang forever waiting for the callback. We therefore record the parameters
 // of each block and schedule a one-shot NSTimer at `commitAnimations` that
 // fires the callback after `delay + duration` seconds.
@@ -487,8 +587,12 @@ pub const CLASSES: ClassExports = objc_classes! {
             block.animation_id,
             block.delegate
         );
+        for layer in block.transforms.keys() { release(env, *layer); }
         if block.delegate != nil { release(env, block.delegate); }
         if block.animation_id != nil { release(env, block.animation_id); }
+        if let Some(transition) = block.transition {
+            crate::frameworks::core_animation::view_transition::discard(env, transition);
+        }
     }
     if animationID != nil { let _: id = msg![env; animationID retain]; }
     env.framework_state.uikit.ui_view.animation_block = AnimationBlockState {
@@ -530,8 +634,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (())commitAnimations {
-    let block = std::mem::take(&mut env.framework_state.uikit.ui_view.animation_block);
+    let mut block = std::mem::take(&mut env.framework_state.uikit.ui_view.animation_block);
     if !block.in_block { return; }
+
+    commit_transform_animations(env, &mut block);
+
+    if let Some(transition) = block.transition.take() {
+        crate::frameworks::core_animation::view_transition::start(
+            env, transition, block.duration, block.delay, block.curve,
+        );
+    }
 
     // Fire `setAnimationWillStartSelector:` synchronously. This is good enough
     // for the apps that touchHLE supports; iOS would normally fire it at the
@@ -606,6 +718,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (())_touchHLE_animationDidStopFireMethod:(id)which_timer {
+    crate::frameworks::core_animation::view_transition::expire(env);
     let dict: id = msg![env; which_timer userInfo];
     let key_delegate: id = get_static_str(env, "_touchHLE_uiview_anim_delegate");
     let key_sel: id = get_static_str(env, "_touchHLE_uiview_anim_sel");
@@ -642,23 +755,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _: () = msg_send_no_type_checking(env, (delegate, sel, animation_id, finished, context));
 }
 
-// Visual properties of animation blocks that touchHLE does not animate.
-// These are intentionally no-ops, but they must remain present so that the
-// app's calls don't fall through to the dynamic dispatcher's "unimplemented
-// selector" path.
-+ (())setAnimationCurve:(NSInteger)_curve { }
+// Legacy animation configuration. Flip transitions use the selected curve;
+// other property interpolation, repeat options and start dates remain unimplemented.
++ (())setAnimationCurve:(NSInteger)curve {
+    env.framework_state.uikit.ui_view.animation_block.curve = curve;
+}
 + (())setAnimationBeginsFromCurrentState:(bool)_from { }
 + (())setAnimationRepeatAutoreverses:(bool)_autoreverses { }
 + (())setAnimationRepeatCount:(f32)_count { }
 + (())setAnimationsEnabled:(f32)_enabled { }
-+ (())setAnimationTransition:(NSInteger)_transition forView:(id)_view cache:(bool)_cache { }
++ (())setAnimationTransition:(NSInteger)transition forView:(id)view cache:(bool)cache {
+    if !env.framework_state.uikit.ui_view.animation_block.in_block { return; }
+    if let Some(old) = env.framework_state.uikit.ui_view.animation_block.transition.take() {
+        crate::frameworks::core_animation::view_transition::discard(env, old);
+    }
+    () = msg![env; view layoutIfNeeded];
+    let layer: id = msg![env; view layer];
+    let pending = crate::frameworks::core_animation::view_transition::prepare(env, layer, transition, cache);
+    env.framework_state.uikit.ui_view.animation_block.transition = pending;
+}
 + (())setAnimationStartDate:(id)_date { }
 + (())setAnimationPosition:(CGPoint)_position { }
 + (bool)areAnimationsEnabled { true }
 
 // MARK: - Block-based animation API (iOS 4+)
 //
-// touchHLE doesn't actually animate property changes — assignments inside
+// touchHLE doesn't actually animate property changes â€” assignments inside
 // the `animations` block snap to their final value immediately. The
 // important contract that *must* be honoured is:
 //
@@ -666,7 +788,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 //      semantics, so the app's mutations to view properties take effect.
 //   2. Schedule a one-shot timer that fires `completion(YES)` after
 //      `delay + duration` seconds (or immediately, if both are zero, on
-//      the next run-loop tick — we approximate this with a 0-second
+//      the next run-loop tick â€” we approximate this with a 0-second
 //      NSTimer).
 //
 // This matches Apple's documentation for
@@ -765,7 +887,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // `+transitionFromView:toView:duration:options:completion:` ship in
 // iOS 4 too. Real iOS swaps the view hierarchy with a flip / cross-
 // fade transition; touchHLE has no animator, so we do the swap
-// instantaneously and still fire the completion block — that keeps
+// instantaneously and still fire the completion block â€” that keeps
 // games whose state machine waits on the completion (e.g. Bubble
 // Witch's level transition) from deadlocking.
 
@@ -1023,7 +1145,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 //
 // In Apple's framework UIAccessibility is declared as an `NSObject`
 // category, so every `NSObject` answers these selectors. In practice
-// only views set them — Unity in particular calls
+// only views set them â€” Unity in particular calls
 // `setIsAccessibilityElement:` / `setAccessibilityTraits:` on its
 // `UnityView` at start-up. We back the state on `UIViewHostObject`
 // and follow Apple's documented "retain (copy)" / "assign" semantics:
@@ -1129,7 +1251,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setTranslatesAutoresizingMaskIntoConstraints:(bool)_translates { }
 - (bool)translatesAutoresizingMaskIntoConstraints { true }
-- (())setNeedsLayout { }
+- (())setNeedsLayout {
+    env.objc.borrow_mut::<UIViewHostObject>(this).needs_layout = true;
+}
 - (())addConstraint:(id)_constraint { }
 - (())addConstraints:(id)_constraints { }
 - (())removeConstraint:(id)_constraint { }
@@ -1156,7 +1280,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setLayerContentsRedrawPolicy:(NSInteger)_policy { }
 - (NSInteger)layerContentsRedrawPolicy { 0 }
 
-// `UIAccessibilityContainer` informal protocol — `UIView` returns
+// `UIAccessibilityContainer` informal protocol â€” `UIView` returns
 // these no-op defaults in real iOS when nothing has been customised.
 - (id)accessibilityElements { nil }
 - (())setAccessibilityElements:(id)_elements {
@@ -1170,130 +1294,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     crate::frameworks::foundation::NSInteger::MAX
 }
 
-- (())layoutSubviews {
-    // Apple docs: "The default implementation uses any constraints you have
-    // set to determine the size and position of any subviews." For legacy
-    // autoresizing mask-based layout (iOS ≤ 5 era), the default implementation
-    // adjusts subviews based on their autoresizingMask relative to changes
-    // in the receiver's bounds.
-    //
-    // Autoresizing mask bits:
-    //   UIViewAutoresizingFlexibleLeftMargin   = 1 << 0
-    //   UIViewAutoresizingFlexibleWidth        = 1 << 1
-    //   UIViewAutoresizingFlexibleRightMargin  = 1 << 2
-    //   UIViewAutoresizingFlexibleTopMargin    = 1 << 3
-    //   UIViewAutoresizingFlexibleHeight       = 1 << 4
-    //   UIViewAutoresizingFlexibleBottomMargin = 1 << 5
-    //
-    // We only apply autoresizing if `autoresizesSubviews` is YES (default).
-    let autoresizes: bool = msg![env; this autoresizesSubviews];
-    if !autoresizes {
-        return;
-    }
+// Autoresizing masks are applied when bounds change, before subclass layout.
+// Auto Layout constraints are not implemented yet.
+- (())layoutSubviews { }
 
-    let bounds: CGRect = msg![env; this bounds];
-    let subviews = env.objc.borrow::<UIViewHostObject>(this).subviews.clone();
-
-    for subview in subviews {
-        let mask: NSUInteger = msg![env; subview autoresizingMask];
-        if mask == 0 {
-            continue;
-        }
-
-        let frame: CGRect = msg![env; subview frame];
-        let parent_w = bounds.size.width;
-        let parent_h = bounds.size.height;
-
-        // Determine how to distribute extra space horizontally.
-        let flex_left = (mask & (1 << 0)) != 0;
-        let flex_width = (mask & (1 << 1)) != 0;
-        let flex_right = (mask & (1 << 2)) != 0;
-
-        let mut new_x = frame.origin.x;
-        let mut new_w = frame.size.width;
-
-        let right_margin = parent_w - (frame.origin.x + frame.size.width);
-        let h_flex_count =
-            flex_left as i32 + flex_width as i32 + flex_right as i32;
-        if h_flex_count > 0 {
-            // For flexible width, expand to fill; for flexible margins, center.
-            if flex_width && !flex_left && !flex_right {
-                new_w = parent_w - frame.origin.x - right_margin;
-            } else if flex_width && flex_left && flex_right {
-                // All three flexible: distribute proportionally based on
-                // original ratios. Simplified: just stretch width to fill.
-                let total = frame.origin.x + frame.size.width + right_margin;
-                if total > 0.0 {
-                    let ratio_x = frame.origin.x / total;
-                    let ratio_w = frame.size.width / total;
-                    new_x = parent_w * ratio_x;
-                    new_w = parent_w * ratio_w;
-                }
-            } else if flex_left && flex_right && !flex_width {
-                // Flexible margins, fixed width: center.
-                new_x = (parent_w - frame.size.width) / 2.0;
-            } else if flex_width && flex_left {
-                new_x = parent_w - new_w - right_margin;
-                new_w = parent_w - new_x - right_margin;
-            } else if flex_width && flex_right {
-                new_w = parent_w - frame.origin.x - right_margin;
-            } else if flex_left && !flex_width {
-                new_x = parent_w - frame.size.width - right_margin;
-            }
-            // flex_right only: x and width stay the same
-        }
-
-        // Determine how to distribute extra space vertically.
-        let flex_top = (mask & (1 << 3)) != 0;
-        let flex_height = (mask & (1 << 4)) != 0;
-        let flex_bottom = (mask & (1 << 5)) != 0;
-
-        let mut new_y = frame.origin.y;
-        let mut new_h = frame.size.height;
-
-        let bottom_margin = parent_h - (frame.origin.y + frame.size.height);
-        let v_flex_count =
-            flex_top as i32 + flex_height as i32 + flex_bottom as i32;
-        if v_flex_count > 0 {
-            if flex_height && !flex_top && !flex_bottom {
-                new_h = parent_h - frame.origin.y - bottom_margin;
-            } else if flex_height && flex_top && flex_bottom {
-                let total = frame.origin.y + frame.size.height + bottom_margin;
-                if total > 0.0 {
-                    let ratio_y = frame.origin.y / total;
-                    let ratio_h = frame.size.height / total;
-                    new_y = parent_h * ratio_y;
-                    new_h = parent_h * ratio_h;
-                }
-            } else if flex_top && flex_bottom && !flex_height {
-                new_y = (parent_h - frame.size.height) / 2.0;
-            } else if flex_height && flex_top {
-                new_y = parent_h - new_h - bottom_margin;
-                new_h = parent_h - new_y - bottom_margin;
-            } else if flex_height && flex_bottom {
-                new_h = parent_h - frame.origin.y - bottom_margin;
-            } else if flex_top && !flex_height {
-                new_y = parent_h - frame.size.height - bottom_margin;
-            }
-        }
-
-        let new_frame = CGRect {
-            origin: CGPoint { x: new_x, y: new_y },
-            size: CGSize { width: new_w.max(0.0), height: new_h.max(0.0) },
-        };
-
-        if new_frame != frame {
-            () = msg![env; subview setFrame:new_frame];
-        }
-    }
-}
-
-// Per Apple docs: "Use this method to force the view to update its layout
-// immediately. [...] This method acts on the root view of the receiver's
-// subtree, laying out the entire subtree starting from that root."
-// In our simplified implementation, we just call layoutSubviews.
+// https://developer.apple.com/documentation/uikit/uiview/setneedslayout()
+// https://developer.apple.com/documentation/uikit/uiview/layoutifneeded()
 - (())layoutIfNeeded {
-    () = msg![env; this layoutSubviews];
+    layout_view_if_needed(env, this);
 }
 
 // MARK: - Gesture recognizers
@@ -1465,6 +1473,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         let this_layer = this_obj.layer;
         () = msg![env; this_layer addSublayer:subview_layer];
     }
+    () = msg![env; this setNeedsLayout];
+    () = msg![env; view setNeedsLayout];
 }
 
 - (())insertSubview:(id)view atIndex:(NSInteger)index {
@@ -1489,6 +1499,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     subviews.insert(clamped_index, view);
 
     () = msg![env; this_layer insertSublayer:subview_layer atIndex:(clamped_index as u32)];
+    () = msg![env; this setNeedsLayout];
+    () = msg![env; view setNeedsLayout];
 }
 
 - (())insertSubview:(id)view belowSubview:(id)sibling {
@@ -1518,6 +1530,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         () = msg![env; this_layer addSublayer:subview_layer];
     }
+    () = msg![env; this setNeedsLayout];
+    () = msg![env; view setNeedsLayout];
 }
 
 - (())insertSubview:(id)view aboveSubview:(id)sibling {
@@ -1544,6 +1558,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         let _: () = msg![env; this_layer addSublayer:subview_layer];
     }
+    () = msg![env; this setNeedsLayout];
+    () = msg![env; view setNeedsLayout];
 }
 
 - (())bringSubviewToFront:(id)subview {
@@ -1606,6 +1622,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if let Some(idx) = subviews.iter().position(|&subview| subview == this) {
         let subview = subviews.remove(idx);
         assert!(subview == this);
+        () = msg![env; superview setNeedsLayout];
         release(env, this);
     }
 }
@@ -1629,7 +1646,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     // UIAccessibility informal protocol: properties are documented as
-    // "copy" / "retain" — release them on teardown to match
+    // "copy" / "retain" â€” release them on teardown to match
     // <https://developer.apple.com/documentation/objectivec/nsobject/uiaccessibility>.
     release(env, accessibility_label);
     release(env, accessibility_hint);
@@ -1818,6 +1835,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     let old_bounds: CGRect = msg![env; layer bounds];
     () = msg![env; layer setBounds:bounds];
+    if old_bounds != bounds {
+        () = msg![env; this setNeedsLayout];
+    }
     resize_subviews_with_old_size(env, this, old_bounds.size);
 }
 - (CGPoint)center {
@@ -1876,6 +1896,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     let old_bounds: CGRect = msg![env; layer bounds];
     () = msg![env; layer setFrame:frame];
+    let new_bounds: CGRect = msg![env; layer bounds];
+    if old_bounds.size != new_bounds.size {
+        () = msg![env; this setNeedsLayout];
+    }
     resize_subviews_with_old_size(env, this, old_bounds.size);
 }
 - (CGAffineTransform)transform {

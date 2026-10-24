@@ -141,6 +141,16 @@ impl GLESContext for LoggingGLESContext {
 }
 
 impl<'a> GLES for LoggingGLES<'a> {
+    fn is_es2(&self) -> bool {
+        self.inner.is_es2()
+    }
+    fn is_es3(&self) -> bool {
+        self.inner.is_es3()
+    }
+    fn is_translator(&self) -> bool {
+        self.inner.is_translator()
+    }
+
     fn is_native_es1(&self) -> bool {
         self.inner.is_native_es1()
     }
@@ -1835,4 +1845,38 @@ pub fn create_gles1_ctx_no_parent_stack(
         "Couldn't create OpenGL ES 1.1 context. Tried: {}",
         failures.join("; ")
     ))
+}
+
+#[cfg(test)]
+mod logging_profile_tests {
+    use super::{LoggingGLES, GLES};
+    struct ShaderBackend {
+        translator: bool,
+    }
+    impl GLES for ShaderBackend {
+        fn is_es2(&self) -> bool {
+            true
+        }
+        fn is_es3(&self) -> bool {
+            !self.translator
+        }
+        fn is_translator(&self) -> bool {
+            self.translator
+        }
+    }
+    #[test]
+    fn logging_preserves_presenter_backend_selection() {
+        for translator in [false, true] {
+            let inner = ShaderBackend { translator };
+            let expected = inner.diagnostic_profile();
+            let wrapped = LoggingGLES {
+                inner: Box::new(inner),
+                verbose: false,
+            };
+            assert!(wrapped.is_es2());
+            assert_eq!(wrapped.is_es3(), !translator);
+            assert_eq!(wrapped.is_translator(), translator);
+            assert_eq!(wrapped.diagnostic_profile(), expected);
+        }
+    }
 }

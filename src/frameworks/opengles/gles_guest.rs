@@ -3051,6 +3051,40 @@ fn glTexImage2D(
             let size = image_size_estimate(pixel_count, format, type_);
             mem.ptr_at(pixels.cast::<u8>(), size).cast::<GLvoid>()
         };
+        {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 200 && !guest_pixels.is_null() {
+                let pixel_count: GuestUSize =
+                    width.checked_mul(height).unwrap().try_into().unwrap();
+                let size = image_size_estimate(pixel_count, format, type_);
+                if size > 0 {
+                    let buf = mem.bytes_at(guest_pixels.cast::<u8>(), size);
+                    let step = (buf.len() / 4096).max(1);
+                    let mut seen = 0usize;
+                    let mut nonzero = 0usize;
+                    let mut i = 0usize;
+                    while i < buf.len() {
+                        if buf[i] != 0 {
+                            nonzero += 1;
+                        }
+                        seen += 1;
+                        i += step;
+                    }
+                    let mid = buf.len() / 2;
+                    let mid_bytes = &buf[mid..buf.len().min(mid + 8)];
+                    let mid_hex = mid_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                    let head = buf
+                        .iter()
+                        .take(8)
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>();
+                    log!(
+                        "TEX-DIAG #{n} {width}x{height} fmt={format:#x} type={type_:#x} nonzero={nonzero}/{seen} head={head} mid={mid_hex}"
+                    );
+                }
+            }
+        }
         gles.TexImage2D(
             target,
             level,
@@ -5980,22 +6014,39 @@ fn glVertexAttrib4f(
         gles.VertexAttrib4f(index, x, y, z, w)
     });
 }
+// Vector attribute setters consume every component from guest memory.
+// https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glVertexAttrib.xml
+unsafe fn dispatch_vertex_attrib_fv(
+    gles: &mut dyn GLES,
+    mem: &Mem,
+    index: GLuint,
+    values: ConstPtr<GLfloat>,
+    components: usize,
+) {
+    let mut vector = [0.0; 4];
+    for (i, slot) in vector.iter_mut().take(components).enumerate() {
+        *slot = mem.read(values + i as u32);
+    }
+    match components {
+        2 => gles.VertexAttrib2fv(index, vector.as_ptr()),
+        3 => gles.VertexAttrib3fv(index, vector.as_ptr()),
+        4 => gles.VertexAttrib4fv(index, vector.as_ptr()),
+        _ => unreachable!(),
+    }
+}
 fn glVertexAttrib2fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib2fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        dispatch_vertex_attrib_fv(gles, mem, index, values, 2);
     });
 }
 fn glVertexAttrib3fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib3fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        dispatch_vertex_attrib_fv(gles, mem, index, values, 3);
     });
 }
 fn glVertexAttrib4fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib4fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        dispatch_vertex_attrib_fv(gles, mem, index, values, 4);
     });
 }
 fn glUniform1i(env: &mut Environment, location: GLint, v0: GLint) {
@@ -8974,5 +9025,52 @@ mod uniform_array_reconciliation_tests {
         let fixes = vec![("light".to_string(), 4u32)];
         let patched = rewrite_uniform_array_sizes(fragment, &fd, &fixes);
         assert!(patched.contains("light[4]"), "{patched}");
+    }
+}
+
+#[cfg(test)]
+mod vertex_attrib_vector_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Capture {
+        values: Vec<f32>,
+        index: u32,
+    }
+    impl GLES for Capture {
+        unsafe fn VertexAttrib2fv(&mut self, index: GLuint, values: *const GLfloat) {
+            self.index = index;
+            self.values = std::slice::from_raw_parts(values, 2).to_vec();
+        }
+        unsafe fn VertexAttrib3fv(&mut self, index: GLuint, values: *const GLfloat) {
+            self.index = index;
+            self.values = std::slice::from_raw_parts(values, 3).to_vec();
+        }
+        unsafe fn VertexAttrib4fv(&mut self, index: GLuint, values: *const GLfloat) {
+            self.index = index;
+            self.values = std::slice::from_raw_parts(values, 4).to_vec();
+        }
+    }
+    #[test]
+    fn vector_attribute_setters_pass_all_guest_components_to_driver() {
+        let mut mem = Mem::new();
+        let expected = [0.25_f32, 0.5, 0.75, 1.0];
+        let ptr = mem.alloc(16).cast::<GLfloat>();
+        for (i, value) in expected.iter().enumerate() {
+            mem.write(ptr + i as u32, *value);
+        }
+        let mut driver = Capture::default();
+        for components in 2..=4 {
+            unsafe {
+                dispatch_vertex_attrib_fv(
+                    &mut driver,
+                    &mem,
+                    7,
+                    ptr.cast::<GLfloat>().cast_const(),
+                    components,
+                );
+            }
+            assert_eq!(driver.index, 7);
+            assert_eq!(driver.values, expected[..components]);
+        }
     }
 }

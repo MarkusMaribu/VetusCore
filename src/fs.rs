@@ -1741,8 +1741,11 @@ impl Fs {
                         }
                     }
                     FsNode::Directory { .. } => {
-                        if write {
-                            OpenAction::Reject
+                        if write || append || truncate {
+                            // An existing directory is never a new-file target.
+                            // Falling through to O_CREAT below attempts a host
+                            // file open on the directory and panics (EISDIR).
+                            return Err(());
                         } else {
                             OpenAction::OpenDir
                         }
@@ -2083,6 +2086,56 @@ impl Fs {
 mod tests {
     use super::*;
 
+    /// Darwin open(2) rejects a directory opened for writing, even with
+    /// O_CREAT. Cut the Rope probes its existing Crystal theme directory
+    /// this way. Keep the directory and its contents intact on failure.
+    /// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/open.2.html
+    #[test]
+    fn creating_a_file_over_a_directory_returns_an_error() {
+        let host = std::env::temp_dir().join(format!(
+            "vetus-directory-open-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&host).unwrap();
+        fs::create_dir(host.join("theme")).unwrap();
+        fs::write(host.join("theme/keep.txt"), b"saved theme").unwrap();
+        let mut guest = Fs {
+            root: FsNode::from_host_dir(&host, true),
+            working_directory: GuestPathBuf::from("/".to_string()),
+            home_directory: GuestPathBuf::from("/".to_string()),
+            cow_dir: None,
+        };
+        for append in [false, true] {
+            let mut options = GuestOpenOptions::new();
+            options.create();
+            if append {
+                options.append();
+            } else {
+                options.write().truncate();
+            }
+            assert!(guest
+                .open_with_options(GuestPath::new("/theme"), options)
+                .is_err());
+            assert_eq!(
+                fs::read(host.join("theme/keep.txt")).unwrap(),
+                b"saved theme"
+            );
+        }
+        let mut options = GuestOpenOptions::new();
+        options.read();
+        assert!(matches!(
+            guest.open_with_options(GuestPath::new("/theme"), options),
+            Ok(GuestFile::Directory)
+        ));
+        fs::remove_file(host.join("theme/keep.txt")).unwrap();
+        fs::remove_dir(host.join("theme")).unwrap();
+        fs::remove_dir(host).unwrap();
+    }
+
     fn case_test_fs() -> Fs {
         let bundle = FsNode::dir().with_child(
             "Data",
@@ -2098,10 +2151,8 @@ mod tests {
                     "Mobile",
                     FsNode::dir().with_child(
                         "Applications",
-                        FsNode::dir().with_child(
-                            "UUID",
-                            FsNode::dir().with_child("Granny.app", bundle),
-                        ),
+                        FsNode::dir()
+                            .with_child("UUID", FsNode::dir().with_child("Granny.app", bundle)),
                     ),
                 ),
             ),

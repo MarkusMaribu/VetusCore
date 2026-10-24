@@ -68,12 +68,15 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
 ///
 /// Returns the time a recomposite is due, if any.
 pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<Instant> {
+    super::view_transition::expire(env);
     // Compositing requires a window/render target. In headless mode there is
     // none, so there is nothing to composite; skip rather than touching the
     // absent window further down.
     if env.window.is_none() {
         return None;
     }
+
+    crate::frameworks::uikit::ui_view::layout_windows_if_needed(env);
 
     let mut animation_state = animation::State::default();
     let window_count = env.framework_state.uikit.ui_view.ui_window.windows.len();
@@ -92,6 +95,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
     // Advance any UIImageView frame animations before compositing.
     crate::frameworks::uikit::ui_view::ui_image_view::update_animations(env);
+    super::view_transition::display_outgoing(env);
 
     let fullscreen_eagl_layer = find_fullscreen_eagl_layer(env);
     if fullscreen_eagl_layer != nil {
@@ -385,11 +389,11 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             .core_animation
             .composition
             .texture_framebuffer = Some((
-                texture,
-                cached_texture_framebuffer.unwrap().1,
-                fb_width,
-                fb_height,
-            ));
+            texture,
+            cached_texture_framebuffer.unwrap().1,
+            fb_width,
+            fb_height,
+        ));
     }
 
     // Set up various other GL objects that will be reused on every frame.
@@ -507,7 +511,18 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 2.0 / screen_bounds.size.width,
                 -2.0 / screen_bounds.size.height,
             ))
-            .multiply(&Matrix::translate_3d(-1.0, 1.0, 0.0)),
+            .multiply(&Matrix::translate_3d(-1.0, 1.0, 0.0))
+            .multiply(&Matrix::from_columns([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [
+                    0.0,
+                    0.0,
+                    1.0 / (screen_bounds.size.width.max(screen_bounds.size.height) * 4.0),
+                    0.0,
+                ],
+                [0.0, 0.0, 0.0, 1.0],
+            ])),
         );
         gles.MatrixMode(gles11::MODELVIEW);
         gles.LoadIdentity();
@@ -628,7 +643,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
 /// Call `displayIfNeeded` on all relevant layers in the tree, so their bitmaps
 /// are up to date before compositing.
-fn display_layers(env: &mut Environment, root_layer: id) {
+pub(super) fn display_layers(env: &mut Environment, root_layer: id) {
     // Tell layers to redraw themselves if needed.
 
     fn traverse(objc: &ObjC, layer: id, layers_needing_display: &mut Vec<id>) {
@@ -659,6 +674,26 @@ unsafe fn composite_layer_recursive(
     layer: id,
     cumulative_transform: Matrix<4>,
     opacity: CGFloat,
+) {
+    let (source, transform) =
+        super::view_transition::presentation(env, layer).unwrap_or((layer, Matrix::identity()));
+    composite_layer_transformed(
+        env,
+        animation_state,
+        source,
+        cumulative_transform,
+        opacity,
+        transform,
+    );
+}
+
+unsafe fn composite_layer_transformed(
+    env: &mut Environment,
+    animation_state: &mut animation::State,
+    layer: id,
+    cumulative_transform: Matrix<4>,
+    opacity: CGFloat,
+    local_transform: Matrix<4>,
 ) {
     // TODO: this can't handle zPosition among other things, but it is not
     //       supported yet :)
@@ -698,9 +733,9 @@ unsafe fn composite_layer_recursive(
         let CALayerHostObject { bounds, .. } = host_obj;
 
         // Update the transform to match this layer's co-ordinate space.
-        let cumulative_transform =
-            <Matrix<4> as From<_>>::from(host_obj.superlayer_to_layer_transform())
-                .multiply(&cumulative_transform);
+        let cumulative_transform = local_transform
+            .multiply(&host_obj.local_to_superlayer_transform_3d())
+            .multiply(&cumulative_transform);
 
         // Reposition and scale the unit quad (see ARRAY_BUFFER binding)
         // so it will have the right size in this layer's co-ordinate space.

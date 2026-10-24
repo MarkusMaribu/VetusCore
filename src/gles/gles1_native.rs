@@ -107,6 +107,52 @@ fn fix_texture_min_filter_enabled() -> bool {
     })
 }
 
+thread_local! {
+    /// Last `GL_UNPACK_ALIGNMENT` the guest set. ANGLE's ES 1.1 front-end
+    /// rejects `glGetIntegerv(GL_UNPACK_ALIGNMENT)` with `GL_INVALID_ENUM`,
+    /// so the value has to be remembered here. The default is 4.
+    static UNPACK_ALIGNMENT: std::cell::Cell<GLint> = const { std::cell::Cell::new(4) };
+}
+
+fn tracked_unpack_alignment() -> GLint {
+    UNPACK_ALIGNMENT.with(|cell| cell.get())
+}
+
+fn remember_unpack_alignment(param: GLint) {
+    UNPACK_ALIGNMENT.with(|cell| cell.set(param));
+}
+
+pub(crate) fn is_power_of_two_size(width: GLsizei, height: GLsizei) -> bool {
+    width > 0 && height > 0 && width & (width - 1) == 0 && height & (height - 1) == 0
+}
+
+/// ANGLE's ES 1.1 front-end returns `GL_INVALID_ENUM` from `glTexImage2D`
+/// for a non-power-of-two level-0 image while the texture's min filter is
+/// still a mipmap mode (the default `GL_NEAREST_MIPMAP_LINEAR`). The image
+/// is not stored. Sampling that texture is opaque white on that driver, so
+/// the filter has to be pinned before the upload, not after.
+pub(crate) fn must_pin_base_filter_before_npot_upload(
+    level: GLint,
+    width: GLsizei,
+    height: GLsizei,
+) -> bool {
+    level == 0 && !is_power_of_two_size(width, height)
+}
+
+unsafe fn begin_tight_unpack() -> GLint {
+    let old = tracked_unpack_alignment();
+    if old != 1 {
+        gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
+    }
+    old
+}
+
+unsafe fn end_tight_unpack(old: GLint) {
+    if old != 1 {
+        gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old);
+    }
+}
+
 impl GLESContext for GLES1NativeContext {
     fn description() -> &'static str {
         "Native OpenGL ES 1.1"
@@ -792,6 +838,9 @@ impl GLES for GLES1Native<'_> {
 
     // Textures
     unsafe fn PixelStorei(&mut self, pname: GLenum, param: GLint) {
+        if pname == gles11::UNPACK_ALIGNMENT {
+            remember_unpack_alignment(param);
+        }
         gles11::PixelStorei(pname, param)
     }
     unsafe fn ReadPixels(
@@ -876,11 +925,7 @@ impl GLES for GLES1Native<'_> {
         // divisible by 4 — common in 2D games) then get their rows shifted,
         // which renders as scrambled / magenta ("pink") texture garbage.
         // Upload with tightly-packed rows, then restore the host state.
-        let mut old_alignment: GLint = 4;
-        gles11::GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut old_alignment);
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
-        }
+        let old_alignment = begin_tight_unpack();
         self.tex_image_2d_inner(
             target,
             level,
@@ -892,9 +937,7 @@ impl GLES for GLES1Native<'_> {
             type_,
             pixels,
         );
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
-        }
+        end_tight_unpack(old_alignment);
         // A guest-set mipmapped `TEXTURE_MIN_FILTER` on a non-power-of-two
         // level-0 texture makes the texture incomplete on strict drivers:
         // sampled texels come back undefined (pink/black garbage) instead of
@@ -902,9 +945,8 @@ impl GLES for GLES1Native<'_> {
         // Degrade the mipmap filter to its base filtering mode (preserving
         // the guest's nearest/linear intent). Only for non-power-of-two
         // dimensions; power-of-two textures support mipmaps everywhere.
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
+        if fix_texture_min_filter_enabled()
+            && must_pin_base_filter_before_npot_upload(level, width, height)
         {
             self.fix_mipmap_min_filter(target);
         }
@@ -930,17 +972,11 @@ impl GLES for GLES1Native<'_> {
         pixels: *const GLvoid,
     ) {
         // Same `UNPACK_ALIGNMENT` row-stride hazard as `TexImage2D`.
-        let mut old_alignment: GLint = 4;
-        gles11::GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut old_alignment);
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
-        }
+        let old_alignment = begin_tight_unpack();
         gles11::TexSubImage2D(
             target, level, xoffset, yoffset, width, height, format, type_, pixels,
         );
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
-        }
+        end_tight_unpack(old_alignment);
     }
 
     unsafe fn CompressedTexImage2D(
@@ -955,20 +991,16 @@ impl GLES for GLES1Native<'_> {
         data: *const GLvoid,
     ) {
         // Same `UNPACK_ALIGNMENT` row-stride hazard as `TexImage2D`.
-        let mut old_alignment: GLint = 4;
-        gles11::GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut old_alignment);
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
-        }
+        // NPOT compressed uploads are rejected for the same reason as
+        // TexImage2D unless the min filter is already a base mode.
+        self.pin_npot_sampling_before_upload(target, level, width, height);
+        let old_alignment = begin_tight_unpack();
         self.compressed_tex_image_2d_inner(
             target, level, internalformat, width, height, border, image_size, data,
         );
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
-        }
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
+        end_tight_unpack(old_alignment);
+        if fix_texture_min_filter_enabled()
+            && must_pin_base_filter_before_npot_upload(level, width, height)
         {
             self.fix_mipmap_min_filter(target);
         }
@@ -999,17 +1031,11 @@ impl GLES for GLES1Native<'_> {
             );
             return;
         }
-        let mut old_alignment: GLint = 4;
-        gles11::GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut old_alignment);
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
-        }
+        let old_alignment = begin_tight_unpack();
         gles11::CompressedTexSubImage2D(
             target, level, xoffset, yoffset, width, height, format, image_size, data,
         );
-        if old_alignment != 1 {
-            gles11::PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
-        }
+        end_tight_unpack(old_alignment);
     }
 
     unsafe fn CopyTexImage2D(
@@ -1726,30 +1752,12 @@ impl GLES1Native<'_> {
         if format == gles11::BGRA_EXT {
             internalformat = gles11::BGRA_EXT as GLint
         }
-        // Strict ES 1.1 drivers (ANGLE's GLES1 front-end, Adreno's native ES
-        // 1.1) reject non-power-of-two uploads unless the texture samples
-        // with CLAMP_TO_EDGE and a non-mipmap filter: the upload fails with
-        // GL_INVALID_ENUM and every draw sampling the texture shows garbage
-        // / black. Guest UI surfaces are typically NPOT (320x480 video
-        // planes, 640x1136 compositor framebuffers), and guests routinely
-        // leave GL_REPEAT as the wrap mode. Force CLAMP_TO_EDGE on the
-        // current binding for NPOT uploads; wrap is per-texture-object
-        // state, so other textures are unaffected.
-        if level == 0
-            && fix_texture_min_filter_enabled()
-            && !(width > 0 && width & (width - 1) == 0 && height > 0 && height & (height - 1) == 0)
-        {
-            gles11::TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_S,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-            gles11::TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_T,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-        }
+        // ANGLE's ES 1.1 front-end rejects the upload itself (GL_INVALID_ENUM)
+        // unless the texture already has CLAMP_TO_EDGE and a non-mipmap min
+        // filter. Changing the filter afterwards leaves no image stored, and
+        // sampling is opaque white on that driver (black on others). Pin both
+        // before the upload. Wrap is per-texture-object state.
+        self.pin_npot_sampling_before_upload(target, level, width, height);
         gles11::TexImage2D(
             target,
             level,
@@ -1760,22 +1768,79 @@ impl GLES1Native<'_> {
             format,
             type_,
             pixels,
-        )
+        );
+        {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 6 {
+                let err = gles11::GetError();
+                log!(
+                    "GLES1Native: TexImage2D #{n} driver error {err:#x} ({width}x{height} fmt={format:#x})"
+                );
+            }
+        }
+    }
+    unsafe fn pin_npot_sampling_before_upload(
+        &mut self,
+        target: GLenum,
+        level: GLint,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        if !(fix_texture_min_filter_enabled()
+            && must_pin_base_filter_before_npot_upload(level, width, height))
+        {
+            return;
+        }
+        let p_target = if (0x8515..=0x851A).contains(&target) {
+            0x8513
+        } else {
+            target
+        };
+        let mut min_filter: GLint = 0;
+        // Per-texture state. glGetIntegerv(GL_TEXTURE_MIN_FILTER) is illegal
+        // and returns GL_INVALID_ENUM on ANGLE's ES 1.1 front-end.
+        gles11::GetTexParameteriv(p_target, gles11::TEXTURE_MIN_FILTER, &mut min_filter);
+        if min_filter == 0 {
+            // The query failed and raised GL_INVALID_ENUM. Drop it so the
+            // guest does not treat the following upload as failed.
+            let _ = gles11::GetError();
+        }
+        let pinned = match min_filter {
+            0x2700 | 0x2702 => gles11::NEAREST as GLint,
+            // 0 means the query failed and left the initializer. Pin LINEAR
+            // so the upload is accepted anyway.
+            0 | 0x2701 | 0x2703 => gles11::LINEAR as GLint,
+            other => other,
+        };
+        if pinned != min_filter {
+            gles11::TexParameteri(p_target, gles11::TEXTURE_MIN_FILTER, pinned);
+        }
+        gles11::TexParameteri(
+            p_target,
+            gles11::TEXTURE_WRAP_S,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+        gles11::TexParameteri(
+            p_target,
+            gles11::TEXTURE_WRAP_T,
+            gles11::CLAMP_TO_EDGE as _,
+        );
     }
     unsafe fn fix_mipmap_min_filter(&mut self, target: GLenum) {
+        let p_target = if (0x8515..=0x851A).contains(&target) {
+            0x8513
+        } else {
+            target
+        };
         let mut min_filter: GLint = 0;
-        gles11::GetIntegerv(gles11::TEXTURE_MIN_FILTER, &mut min_filter);
+        gles11::GetTexParameteriv(p_target, gles11::TEXTURE_MIN_FILTER, &mut min_filter);
         // 0x2700 NEAREST_MIPMAP_NEAREST, 0x2701 LINEAR_MIPMAP_NEAREST,
         // 0x2702 NEAREST_MIPMAP_LINEAR, 0x2703 LINEAR_MIPMAP_LINEAR
         let replacement: GLint = match min_filter {
             0x2700 | 0x2702 => gles11::NEAREST as GLint,
             0x2701 | 0x2703 => gles11::LINEAR as GLint,
             _ => return,
-        };
-        let p_target = if (0x8515..=0x851A).contains(&target) {
-            0x8513
-        } else {
-            target
         };
         gles11::TexParameteri(p_target, gles11::TEXTURE_MIN_FILTER, replacement as _);
         log_dbg!(
@@ -2009,5 +2074,22 @@ impl<'gl_ctx> GLES1Native<'gl_ctx> {
                 fn_name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_power_of_two_size, must_pin_base_filter_before_npot_upload};
+
+    #[test]
+    fn npot_level0_uploads_are_pinned_before_the_driver_call() {
+        // Cut the Rope's menu surfaces are 320x480. ANGLE rejects that
+        // TexImage2D while the min filter is still the default mipmap mode,
+        // and the missing image samples as opaque white.
+        assert!(must_pin_base_filter_before_npot_upload(0, 320, 480));
+        assert!(!is_power_of_two_size(320, 480));
+        assert!(!must_pin_base_filter_before_npot_upload(0, 512, 512));
+        assert!(!must_pin_base_filter_before_npot_upload(1, 320, 480));
+        assert!(is_power_of_two_size(256, 256));
     }
 }

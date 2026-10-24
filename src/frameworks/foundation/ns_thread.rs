@@ -447,7 +447,23 @@ pub fn _touchHLE_NSThreadInvocationHelper(env: &mut Environment, ns_thread_obj: 
         .borrow_mut::<NSThreadHostObject>(ns_thread_obj)
         .executing = true;
 
+    {
+        let (target, selector) = {
+            let host = env.objc.borrow::<NSThreadHostObject>(ns_thread_obj);
+            (host.target, host.selector)
+        };
+        if let (Some(selector), true) = (selector, target != nil) {
+            let target_class: Class = msg![env; target class];
+            log!(
+                "NSThread-DIAG: worker starting -[{} {}]",
+                env.objc.get_class_name(target_class),
+                selector.as_str(&env.mem)
+            );
+        }
+    }
+
     let _: () = msg![env; ns_thread_obj main];
+    log!("NSThread-DIAG: worker returned from main");
 
     {
         let host = env.objc.borrow_mut::<NSThreadHostObject>(ns_thread_obj);
@@ -493,6 +509,10 @@ pub fn detach_new_thread_inner(
     object: id,
     tolerate_type_mismatch: bool,
 ) {
+    log!(
+        "THREAD-DIAG: detach_new_thread_inner sel={}",
+        selector.as_str(&env.mem)
+    );
     let new: id = msg_class![env; NSThread alloc];
     let new: id = msg![env; new initWithTarget:target selector:selector object:object];
     {

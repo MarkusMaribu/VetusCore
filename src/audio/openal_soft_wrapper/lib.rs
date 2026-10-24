@@ -91,6 +91,10 @@ extern "C" {
     pub fn alcProcessContext(context: *mut ALCcontext);
     pub fn alcSuspendContext(context: *mut ALCcontext);
 
+    // ALC_SOFT_pause_device (provided by the bundled OpenAL Soft).
+    pub fn alcDevicePauseSOFT(device: *mut ALCdevice);
+    pub fn alcDeviceResumeSOFT(device: *mut ALCdevice);
+
     pub fn alcMakeContextCurrent(context: *mut ALCcontext) -> ALCboolean;
     pub fn alcGetCurrentContext() -> *mut ALCcontext;
     pub fn alcGetContextsDevice(context: *mut ALCcontext) -> *mut ALCdevice;

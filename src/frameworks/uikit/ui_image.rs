@@ -227,12 +227,22 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
     let Ok(bytes) = bytes else {
+        log!("Warning: UIImage initWithContentsOfFile: could not read {:?}", path_str);
         env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
         return this;
     };
-    let Ok(image) = Image::from_bytes(&bytes) else {
-        env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
-        return this;
+    let image = match Image::from_bytes(&bytes) {
+        Ok(image) => image,
+        Err(reason) => {
+            log!(
+                "Warning: UIImage initWithContentsOfFile: could not decode {:?} ({} bytes): {}",
+                path_str,
+                bytes.len(),
+                reason
+            );
+            env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
+            return this;
+        }
     };
 
     // Infer the scale factor from the Retina filename suffix so that
@@ -247,6 +257,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         1.0
     };
+    {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 200 {
+            let (w, h) = image.dimensions();
+            log!("UIImage-DIAG #{n} loaded {:?} {}x{}", path_str, w, h);
+        }
+    }
     let cg = cg_image::from_image(env, image);
     let host = env.objc.borrow_mut::<UIImageHostObject>(this);
     host.cg_image = cg;

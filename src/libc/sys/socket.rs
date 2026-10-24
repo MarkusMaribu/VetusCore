@@ -27,8 +27,8 @@ use crate::libc::errno::{
     ENOPROTOOPT, ENOTCONN, ENOTSUP, ENOTTY, EPROTONOSUPPORT, ESOCKTNOSUPPORT, ETIMEDOUT,
 };
 use crate::libc::posix_io::{
-    close, find_or_create_socket, is_nonblocking, is_socket, set_nonblocking, FileDescriptor,
-    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRNORM,
+    close, evaluate_poll_fd, find_or_create_socket, is_nonblocking, is_socket, set_nonblocking,
+    FileDescriptor, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLPRI, POLLRDNORM, POLLWRNORM,
 };
 use crate::libc::time::timeval;
 use crate::mem::{
@@ -988,10 +988,15 @@ fn select(
             count += process_set(env, &mut read_set, n_fds, |env, fd, bits, bit_index| {
                 log_dbg!("select: bit set in read_set at fd: {}", fd);
                 if !is_socket(env, fd) {
-                    log!("select: read_set contains non-socket fd {}; ignoring", fd);
-                    *bits &= !(1 << bit_index);
-                    invalid_fd = true;
-                    return false;
+                    // select supports files and pipes as well as sockets.
+                    // EOF/error is ready when the requested I/O cannot block.
+                    let events = evaluate_poll_fd(env, fd, POLLIN);
+                    invalid_fd |= events & POLLNVAL != 0;
+                    let ready = events & (POLLIN | POLLHUP | POLLERR) != 0;
+                    if !ready {
+                        *bits &= !(1 << bit_index);
+                    }
+                    return ready;
                 }
                 // Clean bit in the set for the current socket
                 *bits &= !(1 << bit_index);
@@ -1182,10 +1187,15 @@ fn select(
             count += process_set(env, &mut write_set, n_fds, |env, fd, bits, bit_index| {
                 log_dbg!("select: bit set in write_set at fd: {}", fd);
                 if !is_socket(env, fd) {
-                    log!("select: write_set contains non-socket fd {}; ignoring", fd);
-                    *bits &= !(1 << bit_index);
-                    invalid_fd = true;
-                    return false;
+                    // select supports files and pipes as well as sockets.
+                    // EOF/error is ready when the requested I/O cannot block.
+                    let events = evaluate_poll_fd(env, fd, POLLOUT);
+                    invalid_fd |= events & POLLNVAL != 0;
+                    let ready = events & (POLLOUT | POLLERR) != 0;
+                    if !ready {
+                        *bits &= !(1 << bit_index);
+                    }
+                    return ready;
                 }
                 // Clean bit in the current socket set
                 *bits &= !(1 << bit_index);
@@ -1242,10 +1252,15 @@ fn select(
             count += process_set(env, &mut error_set, n_fds, |env, fd, bits, bit_index| {
                 log_dbg!("select: bit set in error_set at fd: {}", fd);
                 if !is_socket(env, fd) {
-                    log!("select: error_set contains non-socket fd {}; ignoring", fd);
-                    *bits &= !(1 << bit_index);
-                    invalid_fd = true;
-                    return false;
+                    // select supports files and pipes as well as sockets.
+                    // EOF/error is ready when the requested I/O cannot block.
+                    let events = evaluate_poll_fd(env, fd, POLLPRI);
+                    invalid_fd |= events & POLLNVAL != 0;
+                    let ready = events & POLLPRI != 0;
+                    if !ready {
+                        *bits &= !(1 << bit_index);
+                    }
+                    return ready;
                 }
                 // Clean bit in the current socket set
                 *bits &= !(1 << bit_index);
@@ -1323,6 +1338,17 @@ fn select(
         }
     }
     if invalid_fd {
+        // Darwin leaves all descriptor sets unchanged on error.
+        // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/select.2.html
+        if let Some(orig) = read_orig {
+            env.mem.write(read_fds, orig);
+        }
+        if let Some(orig) = write_orig {
+            env.mem.write(write_fds, orig);
+        }
+        if let Some(orig) = error_orig {
+            env.mem.write(error_fds, orig);
+        }
         set_errno(env, EBADF);
         return -1;
     }

@@ -54,12 +54,8 @@ pub(crate) struct CALayerHostObject {
     pub(super) z_position: CGFloat, // <-- ДОБАВЛЕНО СВОЙСТВО Z-POSITION
     pub(super) anchor_point: CGPoint,
     pub(super) affine_transform: CGAffineTransform,
-    /// Full 3D transform set via `-[CALayer setTransform:]`. touchHLE's
-    /// renderer is 2D-only, so we extract the 2x3 affine submatrix from
-    /// the assigned `CATransform3D` and store it in `affine_transform`
-    /// (used by the existing `frame`/`bounds` machinery). The full 4x4
-    /// matrix is kept here so `-[CALayer transform]` can roundtrip the
-    /// value the app assigned.
+    /// Full transform used for GPU composition; affine geometry queries use
+    /// the corresponding 2D submatrix.
     pub(super) transform_3d: CATransform3D,
     /// `CALayer.sublayerTransform` — a transform applied to the layer's
     /// sublayers when they are rendered. Defaults to the identity matrix.
@@ -133,6 +129,147 @@ pub(crate) struct CALayerHostObject {
 }
 impl HostObject for CALayerHostObject {}
 
+pub(super) struct TransitionTree {
+    pub(super) root: id,
+    pub(super) sources: Vec<(id, id)>,
+}
+
+fn copy_transition_properties(env: &mut Environment, layer: id, cache: bool) -> CALayerHostObject {
+    let mut host = env.objc.borrow::<CALayerHostObject>(layer).clone();
+    host.sublayers.clear();
+    host.delegate = nil;
+    host.superlayer = nil;
+    host.drawable_properties = nil;
+    host.animations.clear();
+    host.anonymous_animations.clear();
+    host.needs_display = false;
+    host.gles_texture = None;
+    host.gles_texture_size = None;
+    host.gles_texture_is_up_to_date = false;
+    host.background_pattern_gles_texture = None;
+    retain(env, host.contents);
+    retain(env, host.mask);
+    retain(env, host.background_pattern_cg_image);
+    if let Some(context) = host.cg_context {
+        if cache && host.contents == nil {
+            host.contents =
+                crate::frameworks::core_graphics::cg_bitmap_context::CGBitmapContextCreateImage(
+                    env, context,
+                );
+            host.cg_context = None;
+        } else {
+            crate::frameworks::core_graphics::cg_context::CGContextRetain(env, context);
+        }
+    }
+    host
+}
+
+/// Keep the entire outgoing topology, including children removed from nested
+/// containers. Uncached snapshots refresh properties from their live sources.
+pub(super) fn copy_transition_tree(
+    env: &mut Environment,
+    layer: id,
+    cache: bool,
+) -> TransitionTree {
+    fn copy(env: &mut Environment, layer: id, cache: bool, sources: &mut Vec<(id, id)>) -> id {
+        let children = env
+            .objc
+            .borrow::<CALayerHostObject>(layer)
+            .sublayers
+            .clone();
+        let mut host = copy_transition_properties(env, layer, cache);
+        for child in children {
+            host.sublayers.push(copy(env, child, cache, sources));
+        }
+        let class = env.objc.get_known_class("CALayer", &mut env.mem);
+        let snapshot = env.objc.alloc_object(class, Box::new(host), &mut env.mem);
+        if !cache {
+            retain(env, layer);
+            sources.push((snapshot, layer));
+        }
+        snapshot
+    }
+    let mut sources = Vec::new();
+    let root = copy(env, layer, cache, &mut sources);
+    TransitionTree { root, sources }
+}
+
+pub(super) fn refresh_transition_tree(env: &mut Environment, sources: &[(id, id)]) {
+    for &(snapshot, source) in sources {
+        () = msg![env; source displayIfNeeded];
+        let mut fresh = copy_transition_properties(env, source, false);
+        let old = env.objc.borrow_mut::<CALayerHostObject>(snapshot);
+        fresh.sublayers = std::mem::take(&mut old.sublayers);
+        fresh.gles_texture = old.gles_texture.take();
+        fresh.gles_texture_size = old.gles_texture_size;
+        if old.background_pattern_cg_image == fresh.background_pattern_cg_image {
+            fresh.background_pattern_gles_texture = old.background_pattern_gles_texture.take();
+        } else if let (Some(texture), Some(window)) = (
+            old.background_pattern_gles_texture.take(),
+            env.window.as_mut(),
+        ) {
+            unsafe {
+                window
+                    .make_internal_gl_ctx_current()
+                    .DeleteTextures(1, &texture);
+            }
+        }
+        let old = std::mem::replace(env.objc.borrow_mut::<CALayerHostObject>(snapshot), fresh);
+        release(env, old.contents);
+        release(env, old.mask);
+        release(env, old.background_pattern_cg_image);
+        if let Some(context) = old.cg_context {
+            CGContextRelease(env, context);
+        }
+    }
+}
+
+pub(super) fn retain_transition_delegates(env: &mut Environment, layer: id) -> Vec<id> {
+    let host = env.objc.borrow::<CALayerHostObject>(layer);
+    let delegate = host.delegate;
+    let children = host.sublayers.clone();
+    let mut retained = Vec::new();
+    if delegate != nil {
+        retain(env, delegate);
+        retained.push(delegate);
+    }
+    for child in children {
+        retained.extend(retain_transition_delegates(env, child));
+    }
+    retained
+}
+
+fn release_transition_node(env: &mut Environment, layer: id) {
+    let host = env.objc.borrow_mut::<CALayerHostObject>(layer);
+    let children = std::mem::take(&mut host.sublayers);
+    let pattern = std::mem::replace(&mut host.background_pattern_cg_image, nil);
+    let textures: Vec<_> = [
+        host.gles_texture.take(),
+        host.background_pattern_gles_texture.take(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if let Some(window) = env.window.as_mut() {
+        let mut gles = window.make_internal_gl_ctx_current();
+        unsafe {
+            gles.DeleteTextures(textures.len() as _, textures.as_ptr());
+        }
+    }
+    release(env, pattern);
+    for child in children {
+        release_transition_node(env, child);
+    }
+    release(env, layer);
+}
+
+pub(super) fn release_transition_tree(env: &mut Environment, tree: TransitionTree) {
+    release_transition_node(env, tree.root);
+    for (_, source) in tree.sources {
+        release(env, source);
+    }
+}
+
 impl CALayerHostObject {
     pub(super) fn delegate_for_debug(&self) -> id {
         self.delegate
@@ -149,6 +286,21 @@ impl CALayerHostObject {
     pub(crate) fn set_frame_metal(&mut self, frame: CGRect) {
         self.bounds = frame;
     }
+    pub(super) fn local_to_superlayer_transform_3d(&self) -> crate::matrix::Matrix<4> {
+        CATransform3D::make_translation(
+            -self.bounds.origin.x - self.bounds.size.width * self.anchor_point.x,
+            -self.bounds.origin.y - self.bounds.size.height * self.anchor_point.y,
+            0.0,
+        )
+        .concat(self.transform_3d)
+        .concat(CATransform3D::make_translation(
+            self.position.x,
+            self.position.y,
+            self.z_position,
+        ))
+        .into()
+    }
+
     pub(super) fn superlayer_to_layer_transform(&self) -> CGAffineTransform {
         CGAffineTransform::make_translation(-self.bounds.origin.x, -self.bounds.origin.y)
             .concat(CGAffineTransform::make_translation(
@@ -662,24 +814,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGAffineTransform)affineTransform { env.objc.borrow::<CALayerHostObject>(this).affine_transform }
 - (())setAffineTransform:(CGAffineTransform)affine_transform {
-    let host_obj = env.objc.borrow_mut::<CALayerHostObject>(this);
-    host_obj.affine_transform = affine_transform;
-    // Keep transform_3d in sync so a subsequent -transform read returns
-    // the equivalent CATransform3D, matching iOS behaviour.
-    host_obj.transform_3d = affine_transform_to_catransform3d(affine_transform);
+    let transform = affine_transform_to_catransform3d(affine_transform);
+    set_layer_transform(env, this, transform);
 }
 
-// `-[CALayer transform]` is a CATransform3D (4x4 matrix). touchHLE's
-// renderer is 2D, so a CATransform3D assigned here is collapsed to its 2x3
-// affine submatrix for the existing frame/bounds pipeline; the full 4x4
-// is kept for roundtrip reads. iMilk (HyperHLE appdb report #70) was the
-// motivating case — without these the app crashed with "CALayer does not
-// respond to setTransform:".
 - (CATransform3D)transform { env.objc.borrow::<CALayerHostObject>(this).transform_3d }
 - (())setTransform:(CATransform3D)transform {
-    let host_obj = env.objc.borrow_mut::<CALayerHostObject>(this);
-    host_obj.transform_3d = transform;
-    host_obj.affine_transform = catransform3d_to_affine(transform);
+    set_layer_transform(env, this, transform);
 }
 
 // `-[CALayer sublayerTransform]` / `-setSublayerTransform:` — the
@@ -1158,17 +1299,24 @@ fn snap_near_integer(v: CGFloat) -> CGFloat {
     }
 }
 
-fn affine_transform_to_catransform3d(t: CGAffineTransform) -> CATransform3D {
-    CATransform3D::from_affine(t)
+fn set_layer_transform(env: &mut Environment, layer: id, transform: CATransform3D) {
+    let host = env.objc.borrow_mut::<CALayerHostObject>(layer);
+    let old = std::mem::replace(&mut host.transform_3d, transform);
+    host.affine_transform = transform.to_affine();
+    let implicit = host.use_implicit_animations;
+    if crate::frameworks::uikit::ui_view::record_layer_transform_change(env, layer, old, transform)
+    {
+        return;
+    }
+    if implicit && old != transform {
+        let from: id = msg_class![env; NSValue valueWithCATransform3D:old];
+        let to: id = msg_class![env; NSValue valueWithCATransform3D:transform];
+        add_default_implied_basic_animation(env, layer, "transform", from, to);
+    }
 }
 
-/// Collapse a `CATransform3D` to its 2x3 affine submatrix, the way the
-/// system's `CATransform3DGetAffineTransform` does. The 3D-only entries
-/// (m13/m14/m23/m24/m31..m34/m43/m44) are dropped — touchHLE's renderer
-/// is 2D so layers with non-trivial 3D content just get their projected
-/// 2D shadow.
-fn catransform3d_to_affine(t: CATransform3D) -> CGAffineTransform {
-    t.to_affine()
+fn affine_transform_to_catransform3d(t: CGAffineTransform) -> CATransform3D {
+    CATransform3D::from_affine(t)
 }
 
 /// Recursive CPU-side renderer used by `-[CALayer renderInContext:]`.

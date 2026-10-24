@@ -82,6 +82,13 @@ fn main() {
         let package_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = package_root.join("../../..");
 
+        println!(
+            "cargo:rerun-if-changed={}",
+            workspace_root
+                .join("vendor/openal-soft/alc/backends/opensl.cpp")
+                .display()
+        );
+
         let mut build = cmake::Config::new(workspace_root.join("vendor/openal-soft"));
 
         // Prevent any out dir re-use for Android. For some reason, this causes

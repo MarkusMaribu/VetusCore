@@ -1101,6 +1101,7 @@ fn path_for_resource_helper(
     // path останется директорией ресурсов (напр. .../ZumaHD.app), что является
     // легальным путем.
     let name_str = ns_string::to_rust_string(env, name);
+    let qualified = directory != nil || name_str.contains('/');
     if name_str.is_empty() {
         // Empty-name compatibility shim for SexyAppBase-derived games such as
         // Plants vs. Zombies 1.x / Bejeweled 2 / Zuma's Revenge. Those games
@@ -1196,6 +1197,13 @@ fn path_for_resource_helper(
         if let Some(full) = found {
             return ns_string::from_rust_string(env, full);
         }
+    }
+
+    // A qualified resource must stay in the requested directory. A basename
+    // match elsewhere can turn a failed probe into the wrong configuration.
+    // https://developer.apple.com/library/archive/documentation/CoreFoundation/Conceptual/CFBundles/AccessingaBundlesContents/AccessingaBundlesContents.html
+    if qualified {
+        return nil;
     }
 
     // Last-resort fallback: scan the whole bundle tree for a file whose

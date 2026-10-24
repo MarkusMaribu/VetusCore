@@ -242,7 +242,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Scale
 
 - (CGFloat)scale {
-    env.window().screen_scale() as CGFloat
+    env.window.as_ref().map_or(1.0, |window| window.screen_scale() as CGFloat)
 }
 
 - (CGFloat)nativeScale {

@@ -1101,6 +1101,11 @@ impl Egl {
         }
         self.window = window;
         self.window_surface = surface;
+        // Creating a surface does not bind it to an existing context. The
+        // internal context may still be current on our startup pbuffer, so
+        // its cached is_current() result must not skip the next eglMakeCurrent.
+        // https://registry.khronos.org/EGL/sdk/docs/man/html/eglMakeCurrent.xhtml
+        CURRENT_CONTEXT.with(|current| current.set(0));
         Ok(())
     }
 

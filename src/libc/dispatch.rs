@@ -5,8 +5,9 @@
  */
 //! Grand Central Dispatch (GCD) — `dispatch/dispatch.h`
 //!
-//! touchHLE is single-threaded from the guest's perspective, so most
-//! concurrency primitives can be dramatically simplified:
+//! Guest threads are cooperatively scheduled on one host thread. Most queue
+//! work currently runs inline, but queue identity remains local to each guest
+//! thread, including across nested callbacks and scheduler switches:
 //!   - `dispatch_once` just calls the block once and marks the token.
 //!   - `dispatch_async` / `dispatch_sync` call the block immediately.
 //!   - Queues are opaque handles — we don't actually schedule work.
@@ -125,10 +126,9 @@ pub struct State {
     /// pointer bits. See
     /// <https://developer.apple.com/documentation/dispatch/1452828-dispatch_queue_set_specific>.
     queue_specifics: HashMap<(u32, u32), u32>,
-    /// Stack of queue handles currently executing a block, so that
-    /// `dispatch_get_specific` can resolve against the running queue. The
-    /// main queue is assumed when the stack is empty.
-    pub(super) current_queue_stack: Vec<u32>,
+    /// Nested queue execution belongs to each guest thread. A callback can
+    /// yield to another thread while its own queue remains on the stack.
+    current_queue_stacks: HashMap<crate::ThreadId, Vec<u32>>,
     /// Active dispatch sources keyed by their opaque guest handles.
     pub(super) sources: HashMap<u32, dispatch_source::DispatchSource>,
     /// Next aligned opaque source handle.
@@ -137,6 +137,26 @@ pub struct State {
 
 pub(super) fn get_state(env: &mut Environment) -> &mut State {
     &mut env.libc_state.dispatch
+}
+
+pub(super) fn with_current_queue(
+    env: &mut Environment,
+    queue: dispatch_queue_t,
+    invoke: impl FnOnce(&mut Environment),
+) {
+    let thread = env.current_thread;
+    get_state(env)
+        .current_queue_stacks
+        .entry(thread)
+        .or_default()
+        .push(queue.to_bits());
+    invoke(env);
+    let state = get_state(env);
+    let stack = state.current_queue_stacks.get_mut(&thread).unwrap();
+    stack.pop().unwrap();
+    if stack.is_empty() {
+        state.current_queue_stacks.remove(&thread);
+    }
 }
 
 // MARK: - dispatch_once
@@ -271,9 +291,17 @@ fn dispatch_queue_get_label(env: &mut Environment, _queue: dispatch_queue_t) -> 
     empty.cast_void().cast_const()
 }
 
-fn dispatch_get_current_queue(_env: &mut Environment) -> dispatch_queue_t {
-    // We always run on the "main" queue.
-    MutVoidPtr::from_bits(MAIN_QUEUE_PTR)
+fn dispatch_get_current_queue(env: &mut Environment) -> dispatch_queue_t {
+    // Outside submitted work, iOS returns the main queue on the main
+    // thread and the default concurrent queue on an ordinary pthread.
+    // https://developer.apple.com/documentation/dispatch/dispatch_get_current_queue()?language=objc
+    let thread = env.current_thread;
+    let queue = get_state(env)
+        .current_queue_stacks
+        .get(&thread)
+        .and_then(|stack| stack.last().copied())
+        .unwrap_or(if thread == 0 { MAIN_QUEUE_PTR } else { GLOBAL_QUEUE_PTR });
+    MutVoidPtr::from_bits(queue)
 }
 
 fn dispatch_queue_retain(_env: &mut Environment, queue: dispatch_queue_t) -> dispatch_queue_t {
@@ -299,40 +327,40 @@ fn dispatch_release(env: &mut Environment, obj: MutVoidPtr) {
 fn dispatch_async(env: &mut Environment, queue: dispatch_queue_t, block: dispatch_block_t) {
     log_dbg!("dispatch_async: calling block immediately (single-threaded)");
     if !block.is_null() {
-        get_state(env).current_queue_stack.push(queue.to_bits());
-        call_void_block(env, block);
-        get_state(env).current_queue_stack.pop();
+        with_current_queue(env, queue, |env| call_void_block(env, block));
     }
 }
 
 fn dispatch_sync(env: &mut Environment, queue: dispatch_queue_t, block: dispatch_block_t) {
     log_dbg!("dispatch_sync: calling block immediately");
     if !block.is_null() {
-        get_state(env).current_queue_stack.push(queue.to_bits());
-        call_void_block(env, block);
-        get_state(env).current_queue_stack.pop();
+        with_current_queue(env, queue, |env| call_void_block(env, block));
     }
 }
 
 fn dispatch_async_f(
     env: &mut Environment,
-    _queue: dispatch_queue_t,
+    queue: dispatch_queue_t,
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
     if work != GuestFunction::null_ptr() {
-        let _: () = work.call_from_host(env, (context,));
+        with_current_queue(env, queue, |env| {
+            let _: () = work.call_from_host(env, (context,));
+        });
     }
 }
 
 fn dispatch_sync_f(
     env: &mut Environment,
-    _queue: dispatch_queue_t,
+    queue: dispatch_queue_t,
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
     if work != GuestFunction::null_ptr() {
-        let _: () = work.call_from_host(env, (context,));
+        with_current_queue(env, queue, |env| {
+            let _: () = work.call_from_host(env, (context,));
+        });
     }
 }
 
@@ -832,18 +860,12 @@ fn dispatch_queue_get_specific(
 /// `void *dispatch_get_specific(const void *key)`
 ///
 /// Returns the value associated with `key` on the queue currently executing
-/// the caller. We track the running queue via `current_queue_stack`
-/// (pushed/popped around `dispatch_sync`/`dispatch_async` block execution);
-/// when nothing is running we resolve against the main queue, matching the
-/// behaviour callers rely on for "am I on queue X?" re-entrancy checks.
+/// the caller, using the same thread-local execution stack as
+/// `dispatch_get_current_queue`.
 /// <https://developer.apple.com/documentation/dispatch/1453099-dispatch_get_specific>
 fn dispatch_get_specific(env: &mut Environment, key: ConstVoidPtr) -> MutVoidPtr {
+    let current = dispatch_get_current_queue(env).to_bits();
     let state = get_state(env);
-    let current = state
-        .current_queue_stack
-        .last()
-        .copied()
-        .unwrap_or(MAIN_QUEUE_PTR);
     match state.queue_specifics.get(&(current, key.to_bits())) {
         Some(&bits) => MutVoidPtr::from_bits(bits),
         None => MutVoidPtr::null(),
