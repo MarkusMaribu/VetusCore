@@ -1052,45 +1052,36 @@ pub const CLASSES: ClassExports = objc_classes! {
     // renderbuffer, and that is what gets keyed in the map. Some engines
     // (cocos2d 2.x, e.g. Geometry Dash) leave a different binding current
     // around presentRenderbuffer:, which makes the driver-reported id miss
-    // the map — on iOS the renderbuffer attached to the drawable is still
-    // presented, so fall back to the single registered binding instead of
-    // silently dropping the frame (the silent drop manifests as a permanent
-    // black screen).
-    let drawable = match bindings.get(&renderbuffer) {
-        Some(&drawable) => drawable,
-        None => {
-            if bindings.len() == 1 {
-                let (&rb, &drawable) = bindings.iter().next().unwrap();
-                {
-                    static MISMATCH_LOGGED: std::sync::Once = std::sync::Once::new();
-                    MISMATCH_LOGGED.call_once(|| {
-                        log!(
-                            "[EAGLContext presentRenderbuffer:] renderbuffer binding \
-                             mismatch: driver reports {:#x}, drawable is bound to \
-                             {:#x}; presenting the bound drawable anyway. \
-                             [this log will only be shown once]",
-                            renderbuffer,
-                            rb
-                        );
-                    });
-                }
-                drawable
-            } else {
-                log!(
-                    "Warning: can't present a renderbuffer {:#x} not bound to a \
-                     drawable ({} bound renderbuffer(s): {:?}) - frame skipped.",
-                    renderbuffer,
-                    bindings.len(),
-                    bindings.keys().copied().collect::<Vec<_>>(),
-                );
-                drop(bindings);
-                if let Some(frame_due) = frame_due {
-                    pace_frame(env, frame_due);
-                }
-                return false;
-            }
+    // the map. Preserve the existing single-drawable fallback, keeping its
+    // color renderbuffer paired with the selected layer through presentation.
+    let Some((selected_renderbuffer, drawable)) = resolve_present_drawable(&bindings, renderbuffer) else {
+        log!(
+            "Warning: can't present a renderbuffer {:#x} not bound to a \
+             drawable ({} bound renderbuffer(s): {:?}) - frame skipped.",
+            renderbuffer,
+            bindings.len(),
+            bindings.keys().copied().collect::<Vec<_>>(),
+        );
+        drop(bindings);
+        if let Some(frame_due) = frame_due {
+            pace_frame(env, frame_due);
         }
+        return false;
     };
+    if selected_renderbuffer != renderbuffer {
+        static MISMATCH_LOGGED: std::sync::Once = std::sync::Once::new();
+        MISMATCH_LOGGED.call_once(|| {
+            log!(
+                "[EAGLContext presentRenderbuffer:] renderbuffer binding \
+                 mismatch: driver reports {:#x}, drawable is bound to \
+                 {:#x}; presenting the bound drawable anyway. \
+                 [this log will only be shown once]",
+                renderbuffer,
+                selected_renderbuffer
+            );
+        });
+    }
+    let renderbuffer = selected_renderbuffer;
     drop(bindings);
     if fullscreen_layer != drawable && attach_orphaned_eagl_view_to_root(env, drawable) {
         fullscreen_layer = find_fullscreen_eagl_layer(env);
@@ -1548,6 +1539,27 @@ unsafe fn get_ints<const N: usize>(gles: &mut dyn GLES, pname: GLenum) -> [GLint
     gles.GetIntegerv(pname, res.as_mut_ptr());
     res
 }
+/// Keep the drawable and its color storage paired through the existing
+/// single-drawable fallback. Reading the reported (possibly depth) buffer
+/// after selecting another drawable can replay stale pixels indefinitely.
+/// Apple's presentation contract requires storage allocated from the drawable:
+/// <https://developer.apple.com/documentation/opengles/eaglcontext/presentrenderbuffer(_:)>.
+fn resolve_present_drawable(
+    bindings: &HashMap<GLuint, id>,
+    reported_renderbuffer: GLuint,
+) -> Option<(GLuint, id)> {
+    if let Some(&drawable) = bindings.get(&reported_renderbuffer) {
+        Some((reported_renderbuffer, drawable))
+    } else if bindings.len() == 1 {
+        bindings.iter().next().map(|(&buffer, &drawable)| (buffer, drawable))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod readback_tests;
+
 // Safety: caller's responsibility to only use this for scalars.
 unsafe fn get_int(gles: &mut dyn GLES, pname: GLenum) -> GLint {
     get_ints::<1>(gles, pname)[0]
@@ -1572,7 +1584,13 @@ unsafe fn get_floats<const N: usize>(gles: &mut dyn GLES, pname: GLenum) -> [GLf
     gles.GetFloatv(pname, res.as_mut_ptr());
     res
 }
-unsafe fn get_renderbuffer_size(gles: &mut dyn GLES) -> (GLsizei, GLsizei) {
+unsafe fn get_renderbuffer_size(gles: &mut dyn GLES, renderbuffer: GLuint) -> (GLsizei, GLsizei) {
+    // Presentation may select a different buffer from the one the app left
+    // bound. Query the selected color storage in both presentation routes.
+    let old_renderbuffer = get_int(gles, gles11::RENDERBUFFER_BINDING_OES) as GLuint;
+    if old_renderbuffer != renderbuffer {
+        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, renderbuffer);
+    }
     let mut width: GLint = 0;
     let mut height: GLint = 0;
     gles.GetRenderbufferParameterivOES(
@@ -1585,20 +1603,23 @@ unsafe fn get_renderbuffer_size(gles: &mut dyn GLES) -> (GLsizei, GLsizei) {
         gles11::RENDERBUFFER_HEIGHT_OES,
         &mut height,
     );
+    if old_renderbuffer != renderbuffer {
+        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, old_renderbuffer);
+    }
     (width, height)
 }
 
-/// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
-/// (which should be provided by the app) to a provided [Vec], trying to avoid
+/// Copies the pixels in the specified renderbuffer to a provided [Vec],
+/// preserving the caller's renderbuffer binding and trying to avoid
 /// noticeably modifying OpenGL ES state while doing so.
 ///
 /// This uses `glReadPixels()`, with all the associated performance risks. Any
-/// existing content in the [Vec] will bereplaced. The format is RGBA8.
+/// existing content in the [Vec] will be replaced. The format is RGBA8.
 /// The returned values are the [Vec], the width and height.
 ///
 /// The provided context must be current.
 unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel_buffer: Vec<u8>) -> (Vec<u8>, u32, u32) {
-    let (width, height) = get_renderbuffer_size(gles);
+    let (width, height) = get_renderbuffer_size(gles, renderbuffer);
     let width_u32: u32 = width.try_into().unwrap();
     let height_u32: u32 = height.try_into().unwrap();
 
@@ -1693,9 +1714,8 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
 /// pipeline available).
 ///
 /// This is intentionally simpler than the fixed-function version: we save the
-/// minimum amount of ES 2.0 state, draw the textured quad with a small
-/// dedicated shader program, and restore. The app's matrices, vertex pointers
-/// etc. are not part of ES 2.0 state and thus need no save/restore.
+/// ES 2.0 state touched by the textured quad and restore it afterwards,
+/// including each attribute's format, pointer and source buffer association.
 unsafe fn present_renderbuffer_es2(
     gles: &mut dyn GLES,
     renderbuffer: GLuint,
@@ -1744,13 +1764,7 @@ unsafe fn present_renderbuffer_es2(
     // Resolve the renderbuffer supplied by `-presentRenderbuffer:` into a
     // texture with cached ES 2.0 objects. Passing this explicit object avoids
     // trusting a guest's later renderbuffer binding.
-    let (width, height) = {
-        let mut w: GLint = 0;
-        let mut h: GLint = 0;
-        gles.GetRenderbufferParameteriv(gles2::RENDERBUFFER, gles2::RENDERBUFFER_WIDTH, &mut w);
-        gles.GetRenderbufferParameteriv(gles2::RENDERBUFFER, gles2::RENDERBUFFER_HEIGHT, &mut h);
-        (w, h)
-    };
+    let (width, height) = get_renderbuffer_size(gles, renderbuffer);
 
     let present_objects = ensure_present_objects(gles);
     if width > 0 && height > 0 {
@@ -1945,15 +1959,10 @@ unsafe fn present_renderbuffer_es2(
         return;
     };
 
-    // The presenter only changes the two attributes it owns. Querying all 16
-    // slots on every frame is unnecessary driver traffic.
+    // High slots can still be used by the app, so preserve their complete
+    // vertex stream state rather than only restoring the enable bits.
     let attribute_slots = [program.a_pos as GLuint, program.a_uv as GLuint];
-    let mut attrib_was_enabled = [0u8; 2];
-    for (slot, &attribute) in attrib_was_enabled.iter_mut().zip(attribute_slots.iter()) {
-        let mut v: GLint = 0;
-        gles.GetVertexAttribiv(attribute, gles2::VERTEX_ATTRIB_ARRAY_ENABLED, &mut v);
-        *slot = v as u8;
-    }
+    let saved_attribs = crate::gles::util::SavedVertexAttribArrays::save(gles, attribute_slots);
 
     gles.UseProgram(program.program);
     gles.Uniform1i(program.u_tex, 0);
@@ -2025,14 +2034,7 @@ unsafe fn present_renderbuffer_es2(
         let _ = pressed;
     }
 
-    // Restore vertex attribute enabled state so the app's next draw works.
-    for (&attribute, &was) in attribute_slots.iter().zip(attrib_was_enabled.iter()) {
-        if was != 0 {
-            gles.EnableVertexAttribArray(attribute);
-        } else {
-            gles.DisableVertexAttribArray(attribute);
-        }
-    }
+    saved_attribs.restore(gles);
 
     // Restore state we touched
     gles.UseProgram(if old_program > 0 {
@@ -2407,8 +2409,7 @@ unsafe fn ensure_present_program(gles: &mut dyn GLES) -> Option<PresentProgram> 
     let prog = gles.CreateProgram();
     gles.AttachShader(prog, vs);
     gles.AttachShader(prog, fs);
-    // Bind to high attribute slots so we never collide with the app's
-    // attribute layout (which typically starts at 0).
+    // Use high attribute slots; their guest state is preserved by the caller.
     gles.BindAttribLocation(prog, 6, b"aPos\0".as_ptr() as *const _);
     gles.BindAttribLocation(prog, 7, b"aUV\0".as_ptr() as *const _);
     gles.LinkProgram(prog);
@@ -2753,7 +2754,7 @@ unsafe fn present_renderbuffer(
     // draw to the default framebuffer via a textured quad, which can be
     // rotated, scaled or letterboxed as appropriate.
 
-    let (width, height) = get_renderbuffer_size(gles);
+    let (width, height) = get_renderbuffer_size(gles, renderbuffer);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

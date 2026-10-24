@@ -524,3 +524,7 @@ Other options:
     --no-rotation-fix
         Explicitly use the legacy iPad/non-portrait rotation heuristic, even if
         the fix was enabled by an app-specific options file.
+
+    --disable-links
+        Deny URL launches and embedded web page requests. The embedded host
+        enables this policy for all apps; network access does not enable links.

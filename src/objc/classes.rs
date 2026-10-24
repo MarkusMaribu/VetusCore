@@ -429,12 +429,12 @@ fn substitute_classes(
         return None;
     };
     // Substitute classes that seem to be from various third-party advertising
-    // or social network SDKs.
+    // or analytics SDKs. Bundled social UI classes must retain their methods:
+    // replacing their allocation with nil prevents login dialogs from opening.
     if !(
         name.starts_with("AdMob")
         || name.starts_with("AltAds")
         || name.starts_with("Mobclix")
-        || name.starts_with("FB") // Facebook
         || name.starts_with("Flurry")
         || name.starts_with("OpenFeint")
         || name.starts_with("Tapjoy")

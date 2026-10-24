@@ -144,6 +144,16 @@ pub struct AudioComponentInstanceHostObject {
     /// being used to capture microphone audio. Filled by
     /// `AudioUnitRender` with real host-mic samples when available.
     pub mic_input_enabled: bool,
+    /// Recording and playback are independent RemoteIO elements. The input
+    /// notification must never replace the output render callback.
+    pub mic_callback: Option<AURenderCallbackStruct>,
+    pub mic_stream_format: Option<AudioStreamBasicDescription>,
+    pub mic_capture_ref: bool,
+    pub mic_host_cursor: f64,
+    pub mic_sample_time: f64,
+    pub mic_running_handler: bool,
+    /// Storage returned by AudioUnitRender when the caller supplies NULL data.
+    pub mic_buffers: Vec<(MutVoidPtr, u32)>,
 
     /// Описание компонента (type, subtype, manufacturer), с которым был
     /// создан инстанс (из `AudioComponentFindNext` или узла AUGraph).
@@ -198,6 +208,13 @@ impl Default for AudioComponentInstanceHostObject {
             is_3d_mixer: false,
             mixer_buses: HashMap::new(),
             mic_input_enabled: false,
+            mic_callback: None,
+            mic_stream_format: None,
+            mic_capture_ref: false,
+            mic_host_cursor: 0.0,
+            mic_sample_time: 0.0,
+            mic_running_handler: false,
+            mic_buffers: Vec::new(),
             component_desc: None,
             audio_channel_layouts: HashMap::new(),
             should_allocate_buffers: HashMap::new(),
@@ -364,6 +381,7 @@ fn AudioComponentInstanceDispose(
         return paramErr;
     }
 
+    super::audio_unit::release_mic_capture(env, in_instance);
     let state = State::get(&mut env.framework_state);
     state.audio_component_instances.remove(&in_instance);
     state

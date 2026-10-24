@@ -453,17 +453,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    // UITouch objects are owned by the system on real iOS: apps only ever
-    // hold weak, unowned references to them and UIKit keeps them alive for
-    // the app's lifetime. Some 3D games (Gameloft's Scarface, Asphalt etc.)
-    // keep messaging a UITouch pointer many frames after the touch ended.
-    // If we actually deallocate here, those late messages hit a dead object
-    // ("SUPER HACK! Faking borrow for missing object" spam) and return
-    // garbage, which makes the games ignore input. So -dealloc is a no-op:
-    // the refcount machinery still works (releases below zero are no-ops
-    // once the entry's refcount is gone), and each touch leaks a few dozen
-    // bytes for the app's lifetime — negligible.
-    log_dbg!("[(UITouch) dealloc suppressed: touches live for the app's lifetime, like on real iOS]");
+    // UIKit releases a touch at the end of its sequence. Keeping it forever
+    // also keeps its hit view and window alive after an overlay is closed.
+    // https://developer.apple.com/documentation/uikit/using-responders-and-the-responder-chain-to-handle-events
+    let (view, window) = touch_ivars(env, this, |v| {
+        (std::mem::replace(&mut v.view, nil), std::mem::replace(&mut v.window, nil))
+    });
+    release(env, view);
+    release(env, window);
+    env.objc.dealloc_object(this, &mut env.mem)
 }
 
 - (CGPoint)locationInView:(id)that_view {
@@ -841,6 +839,7 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let touches: id = msg_class![env;
         NSMutableSet
         allocWithZone:(MutVoidPtr::null())];
+    autorelease(env, touches);
 
     for (finger_id, coords) in map {
         // A Down for a finger that is still tracked means an earlier Up or
@@ -889,6 +888,7 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
     let all_touches_set: id = msg_class![env; NSMutableSet
         allocWithZone:(MutVoidPtr::null())];
+    autorelease(env, all_touches_set);
     let existing_touches: Vec<id> = env
         .framework_state
         .uikit
@@ -1100,6 +1100,7 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
                 NSMutableSet
                 allocWithZone:(MutVoidPtr::null())];
             e.insert(s);
+            autorelease(env, s);
         }
         let v_set: id = *view_touches.get(&view).unwrap();
         let _: () = msg![env; v_set addObject:touch];
@@ -1177,6 +1178,7 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
                 NSMutableSet
                 allocWithZone:(MutVoidPtr::null())];
             e.insert(s);
+            autorelease(env, s);
         }
         let v_set: id = *view_touches.get(&view).unwrap();
         let _: () = msg![env; v_set addObject:touch];
@@ -1184,6 +1186,7 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
     let all_touches_set: id = msg_class![env; NSMutableSet
         allocWithZone:(MutVoidPtr::null())];
+    autorelease(env, all_touches_set);
     let existing: Vec<id> = env
         .framework_state
         .uikit
@@ -1291,9 +1294,11 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let touches: id = msg_class![env;
         NSMutableSet
         allocWithZone:(MutVoidPtr::null())];
+    autorelease(env, touches);
     let all_touches_set: id = msg_class![env;
         NSMutableSet
         allocWithZone:(MutVoidPtr::null())];
+    autorelease(env, all_touches_set);
     let existing: Vec<id> = env
         .framework_state
         .uikit
@@ -1355,6 +1360,7 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
                 NSMutableSet
                 allocWithZone:(MutVoidPtr::null())];
             e.insert(s);
+            autorelease(env, s);
         }
         let v_set: id = *view_touches.get(&view).unwrap();
         let _: () = msg![env; v_set addObject:touch];
@@ -1404,4 +1410,53 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     // ULTRAHLE_MINIONJUMP_DRAIN_POST_END
 
     release(env, pool);
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use crate::frameworks::core_graphics::CGSize;
+
+    // UIKit releases a touch when its sequence ends; that releases its strong
+    // references to the hit view and window, including a window closed on Up.
+    // https://developer.apple.com/documentation/uikit/using-responders-and-the-responder-chain-to-handle-events
+    // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_touch.rs
+    #[test]
+    fn completed_touch_releases_its_view_window_and_delivery_sets() {
+        let mut env = crate::environment::touch_test_environment();
+        let env = &mut env;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let frame = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize { width: 100.0, height: 100.0 },
+        };
+        let window: id = msg_class![env; UIWindow alloc];
+        let window: id = msg![env; window initWithFrame:frame];
+        let view: id = msg_class![env; UIButton alloc];
+        let view: id = msg![env; view initWithFrame:frame];
+        () = msg![env; window addSubview:view];
+        () = msg![env; window setHidden:false];
+
+        let finger = FingerId::Mouse;
+        let points = || HashMap::from([(finger, (25.0, 25.0))]);
+        handle_event(env, Event::TouchesDown(points()));
+        let touch = env.framework_state.uikit.ui_touch.current_touches[&finger];
+        // One dispatcher reference and one UIControl tracking reference.
+        assert_eq!(env.objc.get_refcount(touch).get(), 2, "Down delivery leaked a set");
+        handle_event(env, Event::TouchesMove(HashMap::from([(finger, (30.0, 30.0))])));
+        assert_eq!(env.objc.get_refcount(touch).get(), 2, "Move delivery leaked a set");
+
+        // Model the EA overlay releasing its hierarchy while its closing touch
+        // is still in flight. The touch must keep both objects valid until Up.
+        () = msg![env; view removeFromSuperview];
+        release(env, view);
+        release(env, window);
+        assert!(env.framework_state.uikit.ui_view.ui_window.windows.contains(&window));
+        handle_event(env, Event::TouchesUp(points()));
+        assert!(env.framework_state.uikit.ui_touch.current_touches.is_empty());
+        assert!(!env.framework_state.uikit.ui_view.ui_window.windows.contains(&window),
+            "The completed touch kept the closed overlay window alive");
+        release(env, pool);
+    }
+
 }

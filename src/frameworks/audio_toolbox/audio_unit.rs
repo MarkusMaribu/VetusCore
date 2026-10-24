@@ -234,6 +234,7 @@ fn AudioUnitInitialize(env: &mut Environment, in_unit: AudioUnit) -> OSStatus {
 }
 
 fn AudioUnitUninitialize(env: &mut Environment, in_unit: AudioUnit) -> OSStatus {
+    release_mic_capture(env, in_unit);
     let run_loop = CFRunLoopGetMain(env);
     match ns_run_loop::remove_audio_unit(env, run_loop, in_unit) {
         Ok(_) => 0,
@@ -504,7 +505,7 @@ fn AudioUnitSetProperty(
                 let cb = env
                     .mem
                     .read::<AURenderCallbackStruct, false>(in_data.cast());
-                host_object.render_callback = Some(cb);
+                host_object.mic_callback = (cb.input_proc.addr_with_thumb_bit() != 0).then_some(cb);
                 let proc_copy = cb.input_proc;
                 let ref_con_copy = cb.input_proc_ref_con;
                 log_dbg!(
@@ -549,7 +550,11 @@ fn AudioUnitSetProperty(
                         host_object.global_stream_format = stream_format;
                     }
                     kAudioUnitScope_Output => {
-                        host_object.output_stream_format = Some(stream_format);
+                        if in_element == 1 {
+                            host_object.mic_stream_format = Some(stream_format);
+                        } else {
+                            host_object.output_stream_format = Some(stream_format);
+                        }
                     }
                     kAudioUnitScope_Input => {
                         host_object.input_stream_format = Some(stream_format);
@@ -611,14 +616,6 @@ fn AudioUnitSetProperty(
                         .get_mut(&in_unit)
                     {
                         obj.mic_input_enabled = enabled != 0;
-                    }
-                    // Start/stop the host mic stream so read_mic_chunk()
-                    // actually delivers PCM (games enable input only when the
-                    // user starts recording, so this maps 1:1).
-                    if enabled != 0 {
-                        crate::android_media::start_mic();
-                    } else {
-                        crate::android_media::stop_mic();
                     }
                 }
             }
@@ -712,6 +709,10 @@ fn AudioUnitSetProperty(
     }
     if let Some((dest_input, source)) = make_connection {
         connect_audio_units(env, in_unit, dest_input, source);
+    }
+
+    if in_id == kAudioOutputUnitProperty_EnableIO {
+        sync_mic_capture(env, in_unit);
     }
 
     // Audio Unit Services notifies property listeners synchronously after a
@@ -987,8 +988,8 @@ fn AudioUnitGetProperty(
                     .and_then(|b| b.stream_format)
                     .or(host_object.input_stream_format)
                     .unwrap_or(host_object.global_stream_format),
-                kAudioUnitScope_Output => host_object
-                    .output_stream_format
+                kAudioUnitScope_Output if in_element == 1 => mic_stream_format(host_object),
+                kAudioUnitScope_Output => host_object.output_stream_format
                     .unwrap_or(host_object.global_stream_format),
                 _ => host_object.global_stream_format,
             };
@@ -1383,9 +1384,11 @@ pub fn setup_audio_unit_for_render(env: &mut Environment, ci: AudioUnit) {
     if !was_started {
         notify_audio_unit_is_running(env, ci);
     }
+    sync_mic_capture(env, ci);
 }
 
 fn AudioOutputUnitStop(env: &mut Environment, ci: AudioUnit) -> OSStatus {
+    release_mic_capture(env, ci);
     au_graph::stop_graph_for_output(env, ci);
     set_upstream_units_running(env, ci, false);
     let was_started = audio_components::State::get(&mut env.framework_state)
@@ -1518,131 +1521,176 @@ fn AudioUnitRender(
     in_number_frames: u32,
     io_data: MutVoidPtr,
 ) -> OSStatus {
-    // RemoteIO input: when the guest enabled the input element (scope=Input,
-    // element=1) the io_data AudioBufferList is meant to be filled with fresh
-    // microphone samples. Fill it from the host mic (silence when the host
-    // has none), then fall through to the normal playback render path.
-    fill_mic_input(env, in_unit, in_bus_number, in_number_frames, io_data);
-
-    render_audio_unit(env, in_unit);
+    if in_bus_number == 1 {
+        fill_mic_input(env, in_unit, in_bus_number, in_number_frames, io_data);
+    } else {
+        render_audio_unit(env, in_unit);
+    }
     0
 }
 
-/// Fill the caller-provided `AudioBufferList` at `io_data` with microphone
-/// PCM, converted to the unit's input stream format. `mic_input_enabled` is
-/// tracked per instance from kAudioOutputUnitProperty_EnableIO writes.
-fn fill_mic_input(
-    env: &mut Environment,
-    audio_unit: AudioUnit,
-    bus_number: u32,
-    frames: u32,
-    io_data: MutVoidPtr,
-) {
-    if io_data.is_null() || frames == 0 {
-        return;
-    }
-    let mic_enabled = {
-        let at = &mut env.framework_state.audio_toolbox;
-        at.audio_components
-            .audio_component_instances
-            .get(&audio_unit)
-            .map(|obj| obj.mic_input_enabled)
-            .unwrap_or(false)
-    };
-    if !mic_enabled || bus_number != 1 {
-        return;
-    }
-    let stream_format = {
-        let at = &mut env.framework_state.audio_toolbox;
-        at.audio_components
-            .audio_component_instances
-            .get(&audio_unit)
-            .and_then(|obj| obj.input_stream_format)
-            .unwrap_or_else(|| {
-                at.audio_components
-                    .audio_component_instances
-                    .get(&audio_unit)
-                    .map(|obj| obj.global_stream_format)
-                    .unwrap()
-            })
-    };
+fn mic_stream_format(obj: &audio_components::AudioComponentInstanceHostObject) -> AudioStreamBasicDescription {
+    obj.mic_stream_format.unwrap_or(AudioStreamBasicDescription {
+        sample_rate: f64::from(crate::audio::mic::MIC_SAMPLE_RATE),
+        format_id: kAudioFormatLinearPCM,
+        format_flags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+        bytes_per_packet: 2, frames_per_packet: 1, bytes_per_frame: 2,
+        channels_per_frame: 1, bits_per_channel: 16, _reserved: 0,
+    })
+}
 
-    // Pull a chunk of 16-bit mono host PCM and resample it to the unit's
-    // sample rate (naive linear interpolation is plenty for voice).
-    let host_rate = crate::android_media::MIC_SAMPLE_RATE as f64;
-    let dst_rate = if stream_format.sample_rate > 0.0 {
-        stream_format.sample_rate
-    } else {
-        host_rate
-    };
-    let want = ((frames as f64) * host_rate / dst_rate).ceil() as usize;
-    let src: Vec<i16> = if crate::android_media::has_microphone() {
-        let chunk = crate::android_media::read_mic_chunk();
-        if chunk.is_empty() {
-            vec![0i16; want]
-        } else if want <= chunk.len() {
-            chunk[..want].to_vec()
+fn sync_mic_capture(env: &mut Environment, unit: AudioUnit) {
+    let Some(obj) = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances.get(&unit) else { return; };
+    let needed = obj.started && obj.mic_input_enabled;
+    if needed == obj.mic_capture_ref { return; }
+    if !needed { release_mic_capture(env, unit); return; }
+    crate::audio::mic::start();
+    let cursor = crate::audio::mic::total_samples() as f64;
+    let obj = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances.get_mut(&unit).unwrap();
+    obj.mic_capture_ref = true;
+    obj.mic_host_cursor = cursor;
+    obj.mic_sample_time = 0.0;
+}
+
+pub(super) fn release_mic_capture(env: &mut Environment, unit: AudioUnit) {
+    let Some(obj) = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances.get_mut(&unit) else { return; };
+    if std::mem::replace(&mut obj.mic_capture_ref, false) {
+        crate::audio::mic::stop();
+    }
+    for (buffer, _) in obj.mic_buffers.drain(..) { env.mem.free(buffer); }
+}
+
+/// RemoteIO's input notification is independent of its playback callback and
+/// playback queue. Input uses bus 1, NULL ioData, and the recording format on
+/// output scope / element 1. It only reports audio already captured.
+/// https://developer.apple.com/library/archive/documentation/MusicAudio/Conceptual/AudioUnitHostingGuide_iOS/UsingSpecificAudioUnits/UsingSpecificAudioUnits.html
+fn pump_mic_input(env: &mut Environment, unit: AudioUnit) {
+    for _ in 0..8 {
+        let (callback, frames, cursor, sample_time, needed) = {
+            let state = audio_components::State::get(&mut env.framework_state);
+            let Some(obj) = state.audio_component_instances.get_mut(&unit) else { return; };
+            if !obj.started || !obj.mic_capture_ref || obj.mic_running_handler { return; }
+            let Some(callback) = obj.mic_callback else { return; };
+            let format = mic_stream_format(obj);
+            let rate = audio_unit_render_sample_rate(&format, 44_100.0);
+            let frames = (rate * 0.02).round().max(1.0) as u32;
+            let frames = frames.min(obj.maximum_frames_per_slice.max(1));
+            let needed = f64::from(frames) * f64::from(crate::audio::mic::MIC_SAMPLE_RATE) / rate;
+            if obj.mic_host_cursor + needed > crate::audio::mic::total_samples() as f64 { return; }
+            obj.mic_running_handler = true;
+            (callback, frames, obj.mic_host_cursor, obj.mic_sample_time, needed)
+        };
+        let timestamp = alloc_render_timestamp(env, sample_time);
+        let flags = env.mem.alloc_and_write(0u32);
+        let proc = callback.input_proc;
+        let _: OSStatus = proc.call_from_host(env, (
+            callback.input_proc_ref_con, flags, timestamp.cast_const(), 1u32,
+            frames, MutVoidPtr::null(),
+        ));
+        env.mem.free(timestamp);
+        env.mem.free(flags.cast_void());
+        if let Some(obj) = audio_components::State::get(&mut env.framework_state)
+            .audio_component_instances.get_mut(&unit) {
+            obj.mic_running_handler = false;
+            if obj.mic_capture_ref && obj.mic_host_cursor == cursor {
+                obj.mic_host_cursor = cursor + needed;
+                obj.mic_sample_time = sample_time + f64::from(frames);
+            }
+        }
+    }
+}
+
+/// Convert a contiguous window, preserving the fractional host cursor across
+/// calls. Duplicating a short chunk or discarding its tail loses speech.
+fn mic_pcm(format: &AudioStreamBasicDescription, frames: u32, fraction: f64, samples: &[i16]) -> Vec<u8> {
+    use super::audio_converter::{convert_pcm, pcm_shape_from_asbd, PcmShape};
+    let mut interleaved = *format;
+    if format.format_flags & kAudioFormatFlagIsNonInterleaved != 0 {
+        interleaved = interleaved_format_for_planar_pcm(interleaved);
+    }
+    let Some(shape) = pcm_shape_from_asbd(&interleaved) else { return Vec::new(); };
+    let rate = audio_unit_render_sample_rate(format, 44_100.0);
+    let ratio = f64::from(crate::audio::mic::MIC_SAMPLE_RATE) / rate;
+    let mut mono = Vec::with_capacity(frames as usize * 2);
+    for frame in 0..frames {
+        let position = fraction + f64::from(frame) * ratio;
+        let index = position.floor() as usize;
+        let a = f64::from(*samples.get(index).unwrap_or(&0));
+        let b = f64::from(*samples.get(index + 1).unwrap_or_else(|| samples.get(index).unwrap_or(&0)));
+        mono.extend_from_slice(&((a + (b - a) * position.fract()).round() as i16).to_le_bytes());
+    }
+    let source = PcmShape { sample_rate: rate, channels: 1, bits: 16,
+        is_float: false, is_big_endian: false, bytes_per_frame: 2 };
+    let mut shape = shape;
+    shape.sample_rate = rate;
+    convert_pcm(&mono, &source, &shape)
+}
+
+fn write_mic_buffers(mem: &mut crate::mem::Mem, format: &AudioStreamBasicDescription, frames: u32,
+                     pcm: &[u8], io_data: MutVoidPtr) {
+    let count: u32 = mem.read(io_data.cast());
+    let buffers: MutPtr<AudioBuffer> = (io_data.cast::<u8>() + 4).cast();
+    let planar = format.format_flags & kAudioFormatFlagIsNonInterleaved != 0;
+    let channels = format.channels_per_frame.max(1) as usize;
+    let bytes = (format.bits_per_channel / 8) as usize;
+    if bytes == 0 { return; }
+    for i in 0..count.min(8) {
+        let pointer = buffers + i;
+        let mut buffer: AudioBuffer = mem.read(pointer);
+        if buffer.data.is_null() { continue; }
+        let requested = frames as usize * bytes * buffer.number_channels as usize;
+        let size = (buffer.data_byte_size as usize).min(requested);
+        let dst = mem.bytes_at_mut(buffer.data.cast(), size as u32);
+        dst.fill(0);
+        if planar {
+            for (frame, output) in dst.chunks_exact_mut(bytes).enumerate() {
+                let start = (frame * channels + i as usize) * bytes;
+                if let Some(source) = pcm.get(start..start + bytes) { output.copy_from_slice(source); }
+            }
         } else {
-            // Repeat the tail of the chunk (host delivers in ~20-40ms bursts;
-            // stretching by repetition keeps the pitch right).
-            let mut v = Vec::with_capacity(want);
-            while v.len() < want {
-                let take = want - v.len();
-                v.extend_from_slice(&chunk[..take.min(chunk.len())]);
-            }
-            v
+            let size = size.min(pcm.len());
+            dst[..size].copy_from_slice(&pcm[..size]);
         }
-    } else {
-        vec![0i16; want]
-    };
-
-    // Convert to the requested sample format.
-    let is_float = stream_format.format_flags & crate::frameworks::core_audio_types::kAudioFormatFlagIsFloat
-        != 0;
-    let bytes_per_out = (stream_format.bits_per_channel / 8) as usize;
-    let channels = stream_format.channels_per_frame.max(1) as usize;
-    let mut out: Vec<u8> = Vec::with_capacity(frames as usize * channels * bytes_per_out);
-    for &s in &src {
-        let src_s = s as f32 / 32768.0;
-        for _ in 0..channels {
-            if is_float {
-                match bytes_per_out {
-                    4 => out.extend_from_slice(&src_s.to_le_bytes()),
-                    8 => out.extend_from_slice(&((src_s as f64).to_le_bytes())),
-                    _ => out.extend_from_slice(&s.to_le_bytes()),
-                }
-            } else {
-                match bytes_per_out {
-                    1 => out.push(((s >> 8) as u8).wrapping_add(0x80)),
-                    2 => out.extend_from_slice(&s.to_le_bytes()),
-                    4 => out.extend_from_slice(&((s as i32) << 16).to_le_bytes()),
-                    _ => out.extend_from_slice(&s.to_le_bytes()),
-                }
-            }
-        }
+        buffer.data_byte_size = size as u32;
+        mem.write(pointer, buffer);
     }
+}
 
-    // Read the AudioBufferList header and fill every buffer.
-    let list = io_data.cast::<AudioBufferList<1>>();
-    let number_buffers: u32 = env.mem.read(list.cast());
-    // buffers[0] follows the u32 count (sizeof(u32) = 4 bytes).
-    let buf_ptr: MutPtr<AudioBuffer> = (list.cast::<u8>() + 4u32).cast();
-    for i in 0..number_buffers.min(2) as u64 {
-        let b: AudioBuffer = env.mem.read(buf_ptr + (i * 12) as u32);
-        if b.data.is_null() || b.data_byte_size == 0 {
-            continue;
+fn fill_mic_input(env: &mut Environment, unit: AudioUnit, bus: u32, frames: u32, io_data: MutVoidPtr) {
+    if io_data.is_null() || frames == 0 || bus != 1 { return; }
+    let Some(obj) = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances.get(&unit) else { return; };
+    if !obj.mic_input_enabled { return; }
+    let format = mic_stream_format(obj);
+    let cursor = obj.mic_host_cursor;
+    let ratio = f64::from(crate::audio::mic::MIC_SAMPLE_RATE) / audio_unit_render_sample_rate(&format, 44_100.0);
+    let samples = crate::audio::mic::take_samples(cursor as u64, (cursor.fract() + f64::from(frames) * ratio).ceil() as usize + 1);
+    let pcm = mic_pcm(&format, frames, cursor.fract(), &samples);
+    if pcm.iter().any(|&s| s != 0) { log_once!("RemoteIO delivered nonzero microphone samples to the guest."); }
+    let count: u32 = env.mem.read(io_data.cast());
+    let buffers: MutPtr<AudioBuffer> = (io_data.cast::<u8>() + 4).cast();
+    for i in 0..count.min(8) {
+        let pointer = buffers + i;
+        let mut buffer: AudioBuffer = env.mem.read(pointer);
+        if !buffer.data.is_null() { continue; }
+        let obj = audio_components::State::get(&mut env.framework_state)
+            .audio_component_instances.get_mut(&unit).unwrap();
+        if obj.should_allocate_buffers.get(&(kAudioUnitScope_Output, 1)) == Some(&0) { continue; }
+        let size = frames * (format.bits_per_channel / 8) * buffer.number_channels;
+        while obj.mic_buffers.len() <= i as usize { obj.mic_buffers.push((MutVoidPtr::null(), 0)); }
+        let owned = &mut obj.mic_buffers[i as usize];
+        if owned.1 < size {
+            if !owned.0.is_null() { env.mem.free(owned.0); }
+            *owned = (env.mem.alloc(size), size);
         }
-        let n = (b.data_byte_size as usize).min(out.len());
-        let slice = env.mem.bytes_at_mut(b.data.cast(), n as u32);
-        slice.copy_from_slice(&out[..n]);
-        // Zero the remainder rather than leaving stale guest memory.
-        if n < b.data_byte_size as usize {
-            let rest = env
-                .mem
-                .bytes_at_mut(b.data.cast::<u8>() + n as u32, (b.data_byte_size as usize - n) as u32);
-            rest.fill(0);
-        }
+        buffer.data = owned.0;
+        buffer.data_byte_size = size;
+        env.mem.write(pointer, buffer);
     }
+    write_mic_buffers(&mut env.mem, &format, frames, &pcm, io_data);
 }
 
 fn AudioUnitProcess(
@@ -2208,6 +2256,8 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         return;
     }
 
+    pump_mic_input(env, audio_unit);
+
     // Прокачиваем все input-шины (3D Mixer / AUGraph): каждой шине свой
     // OpenAL-источник.
     render_audio_unit_buses(env, audio_unit);
@@ -2764,5 +2814,36 @@ mod tests {
     #[test]
     fn planar_pcm_rejects_mismatched_plane_lengths() {
         assert_eq!(interleave_planar_pcm(&[&[1, 2], &[3]], 1), None);
+    }
+
+    #[test]
+    fn microphone_resamples_exact_frames_and_fills_both_output_planes() {
+        use super::{mic_pcm, write_mic_buffers, AudioBuffer, AudioBufferList};
+        let mut format = planar_f32_stereo_format();
+        format.sample_rate = 22_050.0;
+        let pcm = mic_pcm(&format, 2, 0.0, &[-16384, 0, 16384, 0]);
+        assert_eq!(pcm.len(), 2 * 2 * 4);
+        let mut mem = crate::mem::Mem::new();
+        mem.set_null_segment_size(0x1000);
+        let left = mem.alloc(16);
+        let right = mem.alloc(16);
+        mem.bytes_at_mut(left.cast(), 16).fill(0xa5);
+        mem.bytes_at_mut(right.cast(), 16).fill(0xa5);
+        let list = mem.alloc_and_write(AudioBufferList::<2> {
+            number_buffers: 2,
+            buffers: [
+                AudioBuffer { number_channels: 1, data_byte_size: 16, data: left },
+                AudioBuffer { number_channels: 1, data_byte_size: 16, data: right },
+            ],
+        });
+        write_mic_buffers(&mut mem, &format, 2, &pcm, list.cast_void());
+        for buffer in [left, right] {
+            let bytes = mem.bytes_at(buffer.cast(), 16);
+            assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), -0.5);
+            assert_eq!(f32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0.5);
+            assert_eq!(&bytes[8..], &[0xa5; 8]);
+        }
+        let sizes: Vec<_> = mem.read(list).buffers.iter().map(|b| b.data_byte_size).collect();
+        assert_eq!(sizes, [8, 8]);
     }
 }

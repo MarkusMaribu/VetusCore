@@ -1117,6 +1117,14 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
             Event::TextInput(text_event) => {
                 let responder = env.framework_state.uikit.ui_responder.first_responder;
                 if !responder.is_null() {
+                    if let TextInputEvent::EditingText(text) = text_event {
+                        ui_responder::handle_host_edit(env, responder, text);
+                        continue;
+                    }
+                    if matches!(text_event, TextInputEvent::DismissKeyboard) {
+                        let _: bool = msg![env; responder resignFirstResponder];
+                        continue;
+                    }
                     let class = msg![env; responder class];
                     let ui_text_field_class = env.objc.get_known_class("UITextField", &mut env.mem);
                     if env.objc.class_is_subclass_of(class, ui_text_field_class) {
@@ -1130,6 +1138,7 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
                             TextInputEvent::Return => {
                                 ui_view::ui_control::ui_text_field::handle_return(env, responder)
                             }
+                            _ => unreachable!(),
                         }
                     } else {
                         let ui_text_view_class = env.objc.get_known_class("UITextView", &mut env.mem);
@@ -1144,6 +1153,7 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
                                 TextInputEvent::Return => {
                                     ui_view::ui_scroll_view::ui_text_view::handle_return(env, responder)
                                 }
+                                _ => unreachable!(),
                             }
                         } else {
                             let ui_search_bar_class =
@@ -1159,6 +1169,7 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
                                     TextInputEvent::Return => {
                                         ui_search_bar::handle_return(env, responder)
                                     }
+                                    _ => unreachable!(),
                                 }
                             } else if ui_responder::is_text_input_responder(env, responder) {
                                 ui_responder::handle_text_input_event(env, responder, text_event);

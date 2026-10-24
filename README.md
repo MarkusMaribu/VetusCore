@@ -1,9 +1,9 @@
-# HyperHLE-Reborn
+# VetusCore
 
 <p align="center"><img src="./Picsart_26-10-20_10-43-04-335.jpg" alt="Senses" width="700"></p>
-**HyperHLE-Reborn** is a community-maintained fork of [HyperHLE](https://github.com/HyperHLE/HyperHLE), itself based on [touchHLE](https://github.com/touchHLE/touchHLE). The user-facing name of this project is **HyperHLE**.
+**VetusCore** is the emulator core used by Alpine Launcher's Vetus app. It is a fork of [HyperHLE-Reborn](https://github.com/KlugKlugTG/HyperHLE-Reborn), which carries forward [HyperHLE](https://github.com/HyperHLE/HyperHLE) and [touchHLE](https://github.com/touchHLE/touchHLE). This fork adds an embedded Android host interface and compatibility fixes. The upstream project names, source notices, and contributor history are retained to acknowledge their work.
 
-HyperHLE is a high-level emulator for early iPhone OS apps. It reimplements selected iOS frameworks on the host, allowing compatible apps to run without booting iOS. This fork focuses on Android/mobile usability, fullscreen and orientation handling, graphics compatibility, and app-specific fixes. It is not an official Apple product.
+VetusCore is a high-level emulator for early iPhone OS apps. It reimplements selected iOS frameworks on the host, allowing compatible apps to run without booting iOS. This fork focuses on Android/mobile usability, fullscreen and orientation handling, graphics compatibility, and app-specific fixes. It is independently maintained and is not an official Apple, touchHLE, HyperHLE, or HyperHLE-Reborn product.
 
 The repository does not distribute commercial apps or iOS firmware. Put an app bundle (`.app`) or IPA (`.ipa`) that you are entitled to use in `touchHLE_apps/`; it will appear in the app picker.
 
@@ -13,9 +13,9 @@ The repository does not distribute commercial apps or iOS firmware. Put an app b
 - Virtual iPhone and iPad device profiles.
 - Android touch input and fullscreen/orientation handling.
 - Ongoing GLES, EAGL, Core Animation, audio, and iOS framework compatibility work.
-- Download build artifacts from the [HyperHLE GitHub Actions workflow](https://github.com/KlugKlugTG/HyperHLE-Reborn/actions/workflows/HyperHLE_release.yml).
+- Build the embedded Android core with the [Vetus embedded workflow](https://github.com/MarkusMaribu/VetusCore/actions/workflows/vetus_embedded.yml). The [upstream HyperHLE workflow](https://github.com/KlugKlugTG/HyperHLE-Reborn/actions/workflows/HyperHLE_release.yml) provides upstream builds.
 
-## Newly tested and working games
+## Upstream compatibility reports
 
 The titles below have been tested with HyperHLE-Reborn and are known to run. Compatibility may still vary with the app version, virtual device profile, host GPU/driver, and settings; this list does not guarantee that every feature or a full playthrough works.
 
@@ -57,4 +57,6 @@ Join the [HyperHLE Discord server](https://discord.gg/ZpEkAV47H9) to discuss the
 
 ## Credits and license
 
-HyperHLE-Reborn carries forward work from HyperHLE and touchHLE contributors and uses open-source libraries. It is licensed under the [Mozilla Public License 2.0](LICENSE); see the individual projects for their respective notices and licenses.
+VetusCore carries forward work from HyperHLE-Reborn, HyperHLE, touchHLE, and their contributors. Its emulator source and modifications remain under the [Mozilla Public License 2.0](LICENSE). Copyright remains with the respective contributors; the fork does not transfer ownership of upstream work.
+
+See [NOTICE](NOTICE) for attribution and the source location, and [LICENSING.md](LICENSING.md) for third-party licenses and binary distribution requirements. Bundled libraries, fonts, platform code with separate notices, and development tools retain their respective licenses.

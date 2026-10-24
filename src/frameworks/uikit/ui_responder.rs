@@ -10,6 +10,7 @@ use crate::objc::{id, msg, nil, objc_classes, ClassExports};
 #[derive(Default)]
 pub struct State {
     pub first_responder: id,
+    pub host_text: String,
 }
 
 // Cocos2d's iOS EAGLView is itself a UIKeyInput responder. Its guest methods
@@ -48,6 +49,36 @@ pub fn handle_text_input_event(
             let _: () = msg![env; responder insertText:newline];
             crate::objc::release(env, newline);
         }
+        crate::window::TextInputEvent::EditingText(text) => handle_host_edit(env, responder, text),
+        crate::window::TextInputEvent::DismissKeyboard => { let _: bool = msg![env; responder resignFirstResponder]; }
+    }
+}
+
+/// A host IME can replace a selection or an auto-corrected word in one edit.
+pub fn handle_host_edit(env: &mut crate::Environment, responder: id, text: String) {
+    let class = env.objc.get_known_class("UITextField", &mut env.mem);
+    if msg![env; responder isKindOfClass:class] {
+        super::ui_view::ui_control::ui_text_field::handle_edit(env, responder, text);
+        return;
+    }
+    // UIKeyInput exposes insertion/deletion at the current insertion point.
+    // Keep a known prefix and rebuild only the tail, including autocorrection.
+    let previous = std::mem::replace(&mut env.framework_state.uikit.ui_responder.host_text, text.clone());
+    let prefix = previous.chars().zip(text.chars()).take_while(|(a,b)| a == b).count();
+    let view_class = env.objc.get_known_class("UITextView", &mut env.mem);
+    let search_class = env.objc.get_known_class("UISearchBar", &mut env.mem);
+    let is_view: bool = msg![env; responder isKindOfClass:view_class];
+    let is_search: bool = msg![env; responder isKindOfClass:search_class];
+    for _ in prefix..previous.chars().count() {
+        if is_view { super::ui_view::ui_scroll_view::ui_text_view::handle_backspace(env, responder); }
+        else if is_search { super::ui_search_bar::handle_backspace(env, responder); }
+        else { let _: () = msg![env; responder deleteBackward]; }
+    }
+    let tail: String = text.chars().skip(prefix).collect();
+    if !tail.is_empty() {
+        if is_view { super::ui_view::ui_scroll_view::ui_text_view::handle_text(env, responder, tail); }
+        else if is_search { super::ui_search_bar::handle_text(env, responder, tail); }
+        else { handle_text_input_event(env, responder, crate::window::TextInputEvent::Text(tail)); }
     }
 }
 

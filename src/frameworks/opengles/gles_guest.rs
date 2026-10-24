@@ -997,18 +997,6 @@ fn glIsBuffer(env: &mut Environment, buffer: GLuint) -> GLboolean {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.IsBuffer(buffer) })
 }
 fn glGenBuffers(env: &mut Environment, n: GLsizei, buffers: MutPtr<GLuint>) {
-    if env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread)
-        .is_none()
-    {
-        for i in 0..n {
-            env.mem
-                .write(buffers + (i as GuestUSize), (i + 1) as GLuint);
-        }
-        return;
-    }
     with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let buffers = mem.ptr_at_mut(buffers, n_usize);
@@ -2693,18 +2681,6 @@ fn glReadPixels(
     })
 }
 fn glGenTextures(env: &mut Environment, n: GLsizei, textures: MutPtr<GLuint>) {
-    if env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread)
-        .is_none()
-    {
-        for i in 0..n {
-            env.mem
-                .write(textures + (i as GuestUSize), (i + 1) as GLuint);
-        }
-        return;
-    }
     with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let textures = mem.ptr_at_mut(textures, n_usize);
@@ -3495,18 +3471,6 @@ fn glMultiTexCoord4x(
 }
 
 fn glGenFramebuffersOES(env: &mut Environment, n: GLsizei, framebuffers: MutPtr<GLuint>) {
-    if env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread)
-        .is_none()
-    {
-        for i in 0..n {
-            env.mem
-                .write(framebuffers + (i as GuestUSize), (i + 1) as GLuint);
-        }
-        return;
-    }
     with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let framebuffers = mem.ptr_at_mut(framebuffers, n_usize);
@@ -3514,18 +3478,6 @@ fn glGenFramebuffersOES(env: &mut Environment, n: GLsizei, framebuffers: MutPtr<
     })
 }
 fn glGenRenderbuffersOES(env: &mut Environment, n: GLsizei, renderbuffers: MutPtr<GLuint>) {
-    if env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread)
-        .is_none()
-    {
-        for i in 0..n {
-            env.mem
-                .write(renderbuffers + (i as GuestUSize), (i + 1) as GLuint);
-        }
-        return;
-    }
     with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let renderbuffers = mem.ptr_at_mut(renderbuffers, n_usize);

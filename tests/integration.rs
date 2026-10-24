@@ -525,5 +525,24 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         "TestApp",
         &extra_compile_args,
         &["--allow-network-access"],
-    )
+    )?;
+    // Exercise the host's URL policy with a real guest delegate and run loop.
+    let binary_path = target_dir().join(format!("touchHLE{}", env::consts::EXE_SUFFIX));
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut cmd = Command::new("/usr/bin/sandbox-exec");
+        cmd.args(["-p", "(version 1)(allow default)(deny network*)"]);
+        cmd.arg(binary_path);
+        cmd
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut cmd = Command::new(binary_path);
+    cmd.env("ALSOFT_DRIVERS", "null")
+        .arg(tests_dir.join("TestApp.app"))
+        .args(["--headless", "--disable-links", "--args", "--blocked-links-tests"]);
+    let (output, timed_out) = run_guest_with_deadline(&mut cmd, Duration::from_secs(15))?;
+    std::io::stderr().write_all(&output.stderr)?;
+    assert!(!timed_out, "blocked-link callbacks did not complete");
+    assert!(output.status.success(), "blocked-link policy failed: {:?}", output.status);
+    Ok(())
 }

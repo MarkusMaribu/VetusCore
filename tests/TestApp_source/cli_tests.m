@@ -75,6 +75,8 @@ int test_NSHashTable_copy_is_independent(void);
 int test_NSHashTable_copy_owns_members(void);
 int test_NSHashTable_copy_empty(void);
 int test_NSData_base64_data(void);
+int test_CGFont_bbox_struct_return_preserves_font(void);
+int test_UIWebView_frame_and_navigation_veto(void);
 int test_UIView_layout_deferred_and_coalesced(void);
 int test_UIView_layout_dirty_descendants(void);
 int test_UIView_layout_reentry_and_reinvalidation(void);
@@ -83,6 +85,31 @@ int test_UIView_flip_keeps_removed_layers_alive(void);
 int test_UIView_block_interpolates_layer_transform(void);
 int test_UIView_EAGL_retina_is_opt_in(void);
 int test_UIView_flip_preserves_nested_removed_layers(void);
+int test_sqlite_cursor_bindings_and_metadata(void);
+int test_sqlite_pragma_schema_enumeration_terminates(void);
+int test_sqlite_statement_owns_connection_until_finalize(void);
+int test_sqlite_utf16_names_bindings_and_values(void);
+
+// Bundled Objective-C methods must execute regardless of their class prefix.
+// https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ObjCRuntimeGuide/Articles/ocrtHowMessagingWorks.html
+@interface FBGuestClassProbe : NSObject
++ (int)classValue;
+- (int)instanceValue;
+@end
+
+@implementation FBGuestClassProbe
++ (int)classValue { return 37; }
+- (int)instanceValue { return 73; }
+@end
+
+int test_bundled_social_sdk_class_methods(void) {
+  if ([FBGuestClassProbe classValue] != 37) return -1;
+  FBGuestClassProbe *probe = [[FBGuestClassProbe alloc] init];
+  if (probe == nil) return -2;
+  int result = [probe instanceValue] == 73 ? 0 : -3;
+  [probe release];
+  return result;
+}
 
 static int perform_selector_on_main_thread_calls;
 
@@ -632,9 +659,11 @@ int test_dispatch_after_f_default_mode(void) {
 int test_dispatch_after_common_mode(void) {
   return check_dispatch_after_source(NO, YES);
 }
+extern int test_audio_queue_timeline(void);
 extern int test_runloop_audio_queue(void);
 extern int test_runloop_audio_queue_null(void);
 extern int test_runloop_audio_unit_independent(void);
+extern int test_remote_io_recording_callback(void);
 
 int test_runloop_timer_waits_until_deadline(void) {
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
@@ -7542,6 +7571,29 @@ int test_select_pipe_readiness(void) {
     return result;
 }
 
+// GL calls with no current EAGL context silently fail without writing outputs.
+// Apple's context lifecycle contract is also used by upstream touchHLE's
+// with_ctx_and_mem guard:
+// https://developer.apple.com/documentation/opengles/eaglcontext
+// https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/opengles/gles_guest.rs
+extern void glGenBuffers(int, unsigned int *);
+extern void glGenTextures(int, unsigned int *);
+extern void glGenFramebuffersOES(int, unsigned int *);
+extern void glGenRenderbuffersOES(int, unsigned int *);
+
+static int test_GL_generation_without_context(void) {
+    void (*generate[])(int, unsigned int *) = {
+        glGenBuffers, glGenTextures, glGenFramebuffersOES, glGenRenderbuffersOES
+    };
+    for (unsigned int i = 0; i < sizeof(generate) / sizeof(generate[0]); ++i) {
+        unsigned int names[] = {0, 0xdeadbeef};
+        generate[i](2, names);
+        if (names[0] != 0 || names[1] != 0xdeadbeef) return -(int)(i + 1);
+        generate[i](0, NULL);
+    }
+    return 0;
+}
+
 #define FUNC_DEF(func)                                                         \
   { &func, #func }
 struct {
@@ -7677,6 +7729,8 @@ struct {
     FUNC_DEF(test_dispatch_after_default_mode),
     FUNC_DEF(test_dispatch_current_queue_worker),
     FUNC_DEF(test_dispatch_current_queue_nested),
+    FUNC_DEF(test_CGFont_bbox_struct_return_preserves_font),
+    FUNC_DEF(test_UIWebView_frame_and_navigation_veto),
     FUNC_DEF(test_UIView_layout_deferred_and_coalesced),
     FUNC_DEF(test_UIView_layout_dirty_descendants),
     FUNC_DEF(test_UIView_layout_reentry_and_reinvalidation),
@@ -7685,11 +7739,18 @@ struct {
     FUNC_DEF(test_UIView_block_interpolates_layer_transform),
     FUNC_DEF(test_UIView_EAGL_retina_is_opt_in),
     FUNC_DEF(test_UIView_flip_preserves_nested_removed_layers),
+    FUNC_DEF(test_sqlite_cursor_bindings_and_metadata),
+    FUNC_DEF(test_sqlite_pragma_schema_enumeration_terminates),
+    FUNC_DEF(test_sqlite_statement_owns_connection_until_finalize),
+    FUNC_DEF(test_sqlite_utf16_names_bindings_and_values),
     FUNC_DEF(test_dispatch_after_f_default_mode),
     FUNC_DEF(test_dispatch_after_common_mode),
+    FUNC_DEF(test_audio_queue_timeline),
+    FUNC_DEF(test_GL_generation_without_context),
     FUNC_DEF(test_runloop_audio_queue),
     FUNC_DEF(test_runloop_audio_queue_null),
     FUNC_DEF(test_runloop_audio_unit_independent),
+    FUNC_DEF(test_remote_io_recording_callback),
     FUNC_DEF(test_runloop_timer_waits_until_deadline),
     FUNC_DEF(test_runloop_nil_date_polls),
     FUNC_DEF(test_runloop_common_is_not_a_run_mode),
@@ -7701,6 +7762,7 @@ struct {
     FUNC_DEF(test_NSData_base64_data),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     FUNC_DEF(test_NSBundle_qualified_resource_stays_in_requested_directory),
+    FUNC_DEF(test_bundled_social_sdk_class_methods),
 };
 // clang-format on
 

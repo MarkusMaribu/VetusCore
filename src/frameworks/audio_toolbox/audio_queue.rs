@@ -135,6 +135,13 @@ struct AudioQueueHostObject {
     /// OpenAL format and frequency of the buffers queued on `al_source`.
     /// OpenAL refuses to queue a buffer with a different format behind them.
     al_queued_format: Option<(ALenum, ALsizei)>,
+    /// Queue-rate frames consumed from buffers already removed from OpenAL.
+    sample_time: f64,
+    al_buffer_frames: HashMap<ALuint, f64>,
+    timeline_generation: u64,
+    timelines: HashMap<AudioQueueTimelineRef, u64>,
+    output_starved: bool,
+    has_started: bool,
 }
 
 /// Track whether the audio queue is meant to be running, in order to handle
@@ -155,6 +162,13 @@ pub struct OpaqueAudioQueue {
 unsafe impl SafeRead for OpaqueAudioQueue {}
 
 pub type AudioQueueRef = MutPtr<OpaqueAudioQueue>;
+
+#[repr(C, packed)]
+struct OpaqueAudioQueueTimeline {
+    _filler: u8,
+}
+unsafe impl SafeRead for OpaqueAudioQueueTimeline {}
+type AudioQueueTimelineRef = MutPtr<OpaqueAudioQueueTimeline>;
 
 #[repr(C, packed)]
 pub struct AudioQueueBuffer {
@@ -217,15 +231,15 @@ pub struct AudioQueueLevelMeterState {
     pub mPeakPower: f32,
 }
 unsafe impl SafeRead for AudioQueueLevelMeterState {}
-/// `kAudioQueueDeviceProperty_SampleRate` ('devr') from Apple's
+/// `kAudioQueueDeviceProperty_SampleRate` ('aqsr') from Apple's
 /// `AudioQueue.h`: the hardware sample rate the queue plays at. We always
 /// play at the format's native rate, so this reports the queue's format
 /// sample rate.
-const kAudioQueueProperty_DeviceSampleRate: AudioQueuePropertyID = fourcc(b"devr");
-/// `kAudioQueueDeviceProperty_NumberChannels` ('dev#') from Apple's
+const kAudioQueueProperty_DeviceSampleRate: AudioQueuePropertyID = fourcc(b"aqsr");
+/// `kAudioQueueDeviceProperty_NumberChannels` ('aqdc') from Apple's
 /// `AudioQueue.h`: the number of channels the device mixes. Reports the
 /// queue format's channel count.
-const kAudioQueueProperty_DeviceNumberChannels: AudioQueuePropertyID = fourcc(b"dev#");
+const kAudioQueueProperty_DeviceNumberChannels: AudioQueuePropertyID = fourcc(b"aqdc");
 /// `kAudioQueueProperty_HardwareCodecPolicy` from Apple's `AudioQueue.h`.
 /// Controls whether the queue uses hardware or software codecs. touchHLE only
 /// ships software codecs (the host has no audio hardware codec), so this is
@@ -257,6 +271,125 @@ const kAudioQueueErr_InvalidOfflineMode: OSStatus = -66626;
 /// Floor for `AudioQueueLevelMeterState` values (Apple clamps meters at
 /// -160 dB).
 const MIN_LEVEL_METER_DB: f32 = -160.0;
+
+// AudioQueue.h defines the sample clock relative to queue start, in the
+// queue's sample rate, and makes discontinuity observations per timeline:
+// https://developer.apple.com/documentation/audiotoolbox/audioqueuegetcurrenttime(_:_:_:_:)
+// https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.6.sdk/System/Library/Frameworks/AudioToolbox.framework/Versions/A/Headers/AudioQueue.h
+// Upstream touchHLE has no timeline implementation to reuse.
+fn AudioQueueCreateTimeline(
+    env: &mut Environment,
+    in_aq: AudioQueueRef,
+    out_timeline: MutPtr<AudioQueueTimelineRef>,
+) -> OSStatus {
+    if out_timeline.is_null() {
+        return crate::frameworks::carbon_core::paramErr;
+    }
+    let Some(queue) = State::get(&mut env.framework_state)
+        .audio_queues
+        .get_mut(&in_aq)
+    else {
+        return crate::frameworks::carbon_core::paramErr;
+    };
+    let timeline = env
+        .mem
+        .alloc_and_write(OpaqueAudioQueueTimeline { _filler: 0 });
+    queue.timelines.insert(timeline, queue.timeline_generation);
+    env.mem.write(out_timeline, timeline);
+    0
+}
+
+fn AudioQueueDisposeTimeline(
+    env: &mut Environment,
+    in_aq: AudioQueueRef,
+    in_timeline: AudioQueueTimelineRef,
+) -> OSStatus {
+    let Some(queue) = State::get(&mut env.framework_state)
+        .audio_queues
+        .get_mut(&in_aq)
+    else {
+        return crate::frameworks::carbon_core::paramErr;
+    };
+    if queue.timelines.remove(&in_timeline).is_none() {
+        return crate::frameworks::carbon_core::paramErr;
+    }
+    env.mem.free(in_timeline.cast());
+    0
+}
+
+fn note_output_underrun(queue: &mut AudioQueueHostObject, source_state: ALint) {
+    if source_state == al::AL_PLAYING {
+        queue.output_starved = false;
+    }
+    if source_state == al::AL_STOPPED
+        && queue.is_running == AudioQueueIsRunning::Running
+        && queue.has_started
+        && !queue.output_starved
+    {
+        queue.timeline_generation = queue.timeline_generation.wrapping_add(1);
+        queue.output_starved = true;
+    }
+}
+
+fn AudioQueueGetCurrentTime(
+    env: &mut Environment,
+    in_aq: AudioQueueRef,
+    in_timeline: AudioQueueTimelineRef,
+    out_timestamp: MutPtr<crate::frameworks::core_audio_types::AudioTimeStamp>,
+    out_discontinuity: MutPtr<u8>,
+) -> OSStatus {
+    let (state, context) =
+        State::get_with_context(&mut env.framework_state, &mut env.openal_manager);
+    let Some(queue) = state.audio_queues.get_mut(&in_aq) else {
+        return crate::frameworks::carbon_core::paramErr;
+    };
+    if !in_timeline.is_null() && !queue.timelines.contains_key(&in_timeline) {
+        return crate::frameworks::carbon_core::paramErr;
+    }
+    if !queue.has_started {
+        return -66678; // kAudioQueueErr_InvalidRunState
+    }
+    let mut sample_time = queue.sample_time;
+    if let Some(source) = queue.al_source {
+        let mut source_state = 0;
+        let mut seconds = 0.0;
+        unsafe {
+            context.GetSourcei(source, al::AL_SOURCE_STATE, &mut source_state);
+            context.GetSourcef(source, 0x1024 /* AL_SEC_OFFSET */, &mut seconds);
+            assert_eq!(context.GetError(), 0);
+        }
+        note_output_underrun(queue, source_state);
+        // OpenAL resets the offset to zero when the source drains. Its
+        // processed buffers still count until our delivery loop removes them.
+        sample_time += if source_state == al::AL_STOPPED {
+            queue.al_buffer_frames.values().sum::<f64>()
+        } else {
+            f64::from(seconds) * queue.format.sample_rate
+        };
+    } else if queue.is_input && queue.is_running != AudioQueueIsRunning::Stopped {
+        sample_time += (mic::total_samples() as f64 - queue.input_host_cursor).max(0.0)
+            * queue.format.sample_rate
+            / f64::from(mic::MIC_SAMPLE_RATE);
+    }
+    if let Some(generation) = queue.timelines.get_mut(&in_timeline) {
+        if !out_discontinuity.is_null() {
+            env.mem.write(
+                out_discontinuity,
+                u8::from(*generation != queue.timeline_generation),
+            );
+        }
+        *generation = queue.timeline_generation;
+    }
+    if !out_timestamp.is_null() {
+        let timestamp = alloc_render_timestamp(env, sample_time);
+        let value = env
+            .mem
+            .read(timestamp.cast::<crate::frameworks::core_audio_types::AudioTimeStamp>());
+        env.mem.write(out_timestamp, value);
+        env.mem.free(timestamp);
+    }
+    0
+}
 
 pub fn AudioQueueNewOutput(
     env: &mut Environment,
@@ -350,6 +483,12 @@ pub fn AudioQueueNewOutput(
         offline_pcm_channels: 0,
         frame_decoder: None,
         al_queued_format: None,
+        sample_time: 0.0,
+        al_buffer_frames: HashMap::new(),
+        timeline_generation: 0,
+        timelines: HashMap::new(),
+        output_starved: false,
+        has_started: false,
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -1269,6 +1408,8 @@ fn AudioQueueOfflineRender(
     let channels = host_object.offline_pcm_channels.max(1);
     let available = host_object.offline_pcm.len() / channels as usize;
     let rendered = frames.min(available);
+    host_object.sample_time +=
+        rendered as f64 * host_object.format.sample_rate / out_format.sample_rate;
     let samples: Vec<i16> = host_object
         .offline_pcm
         .drain(..rendered * channels as usize)
@@ -1662,10 +1803,7 @@ fn decode_queue_buffer(
             pcm.extend_from_slice(frame_pcm);
         }
     }
-    let (rate, channels) = spec.unwrap_or((
-        format.sample_rate as u32,
-        format.channels_per_frame,
-    ));
+    let (rate, channels) = spec.unwrap_or((format.sample_rate as u32, format.channels_per_frame));
     let al_format = if channels == 2 {
         al::AL_FORMAT_STEREO16
     } else {
@@ -2208,6 +2346,23 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
             host_object.al_unused_buffers.push(next_al_buffer);
             break;
         }
+        // OpenAL offsets are expressed in the decoded buffer's rate. The
+        // public AudioQueue clock is always in the queue's original rate.
+        let channels = if matches!(al_format, al::AL_FORMAT_STEREO8 | al::AL_FORMAT_STEREO16) {
+            2
+        } else {
+            1
+        };
+        let sample_bytes = if matches!(al_format, al::AL_FORMAT_MONO8 | al::AL_FORMAT_STEREO8) {
+            1
+        } else {
+            2
+        };
+        let frames = data.len() / (channels * sample_bytes);
+        host_object.al_buffer_frames.insert(
+            next_al_buffer,
+            frames as f64 * host_object.format.sample_rate / f64::from(al_frequency.max(1)),
+        );
         host_object.al_queued_format = Some(target);
     }
 }
@@ -2349,20 +2504,14 @@ fn input_bytes_per_packet(format: &AudioStreamBasicDescription) -> u32 {
 }
 
 /// Capacity of an input buffer in whole packets (the queue's currency).
-fn input_packet_capacity(
-    buffer: &AudioQueueBuffer,
-    format: &AudioStreamBasicDescription,
-) -> u32 {
+fn input_packet_capacity(buffer: &AudioQueueBuffer, format: &AudioStreamBasicDescription) -> u32 {
     // Trailing partial packets are unusable.
     buffer.audio_data_bytes_capacity / input_bytes_per_packet(format)
 }
 
 /// Converts mono 16-bit host-microphone samples at [mic::MIC_SAMPLE_RATE]
 /// into interleaved 16-bit PCM in the queue's channel count and sample rate.
-fn convert_mic_to_pcm(
-    format: &AudioStreamBasicDescription,
-    host_samples: &[i16],
-) -> Vec<u8> {
+fn convert_mic_to_pcm(format: &AudioStreamBasicDescription, host_samples: &[i16]) -> Vec<u8> {
     let src_shape = PcmShape {
         sample_rate: f64::from(mic::MIC_SAMPLE_RATE),
         channels: 1,
@@ -2569,6 +2718,7 @@ fn handle_input_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
                 cursor += needed;
             }
         }
+        host_object.sample_time += (cursor - host_object.input_host_cursor) / host_per_frame;
         host_object.input_host_cursor = cursor;
 
         (
@@ -2657,11 +2807,21 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
     }
 
     host_object.is_running_handler = true;
+    let mut source_state = 0;
+    unsafe {
+        context.GetSourcei(al_source, al::AL_SOURCE_STATE, &mut source_state);
+        assert_eq!(context.GetError(), 0);
+    }
+    note_output_underrun(host_object, source_state);
 
     let mut buffers_to_reuse = Vec::new();
 
     unqueue_buffers(al_source, &context, |al_buffer| {
         host_object.al_unused_buffers.push(al_buffer);
+        host_object.sample_time += host_object
+            .al_buffer_frames
+            .remove(&al_buffer)
+            .unwrap_or(0.0);
         // OpenAL is reporting one buffer as processed, so the queue should
         // be non-empty. If the host and OpenAL views ever desync (e.g.
         // through an unexpected reset), just stop pulling from the empty
@@ -2850,6 +3010,7 @@ pub fn AudioQueueStart(
     {
         if host_object.offline_render_format.is_some() {
             host_object.is_running = AudioQueueIsRunning::Running;
+            host_object.has_started = true;
             notify_aq_is_running(env, in_aq);
             return 0;
         }
@@ -2882,6 +3043,8 @@ pub fn AudioQueueStart(
             return kAudioQueueErr_InvalidProperty;
         };
         host_object.is_running = AudioQueueIsRunning::Running;
+        host_object.has_started = true;
+        host_object.output_starved = false;
         unsafe { context.SourcePlay(al_source) };
         assert!(unsafe { context.GetError() } == 0);
     } else {
@@ -2907,6 +3070,12 @@ pub fn AudioQueuePause(env: &mut Environment, in_aq: AudioQueueRef) -> OSStatus 
         return 0;
     };
 
+    if host_object.is_input && host_object.is_running != AudioQueueIsRunning::Stopped {
+        let host_cursor = mic::total_samples() as f64;
+        host_object.sample_time += (host_cursor - host_object.input_host_cursor).max(0.0)
+            * host_object.format.sample_rate / f64::from(mic::MIC_SAMPLE_RATE);
+        host_object.input_host_cursor = host_cursor;
+    }
     host_object.is_running = AudioQueueIsRunning::Stopped;
 
     if let Some(al_source) = host_object.al_source {
@@ -2961,6 +3130,7 @@ fn start_input_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) -> Optio
     // Pause + Start also lands here (AudioQueuePause keeps the capture
     // reference), so only acquire the stream once per Stop..Start cycle.
     host_object.is_running = AudioQueueIsRunning::Running;
+    host_object.has_started = true;
     // Recording starts "now": skip anything captured before this moment.
     host_object.input_host_cursor =
         mic::total_samples() as f64 + f64::from(host_object.input_delay);
@@ -3052,6 +3222,11 @@ fn AudioQueueReset(env: &mut Environment, in_aq: AudioQueueRef) -> OSStatus {
     }
 
     host_object.buffer_queue.clear();
+    host_object.al_buffer_frames.clear();
+    host_object.sample_time = 0.0;
+    host_object.has_started = false;
+    host_object.output_starved = false;
+    host_object.timeline_generation = host_object.timeline_generation.wrapping_add(1);
     host_object.offline_pcm.clear();
     // Whatever's enqueued next needn't follow on from what came before.
     host_object.frame_decoder = None;
@@ -3135,6 +3310,9 @@ pub fn AudioQueueDispose(
         mic::stop();
     }
 
+    for timeline in host_object.timelines.keys() {
+        env.mem.free(timeline.cast());
+    }
     env.mem.free(in_aq.cast());
 
     for buffer_ptr in host_object.buffers {
@@ -3248,6 +3426,12 @@ pub fn AudioQueueNewInput(
         offline_pcm_channels: 0,
         frame_decoder: None,
         al_queued_format: None,
+        sample_time: 0.0,
+        al_buffer_frames: HashMap::new(),
+        timeline_generation: 0,
+        timelines: HashMap::new(),
+        output_starved: false,
+        has_started: false,
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -3263,6 +3447,9 @@ pub fn AudioQueueNewInput(
 }
 
 pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(AudioQueueCreateTimeline(_, _)),
+    export_c_func!(AudioQueueDisposeTimeline(_, _)),
+    export_c_func!(AudioQueueGetCurrentTime(_, _, _, _)),
     export_c_func!(AudioQueueNewOutput(_, _, _, _, _, _, _)),
     export_c_func!(AudioQueueGetParameter(_, _, _)),
     export_c_func!(AudioQueueSetParameter(_, _, _)),

@@ -79,6 +79,7 @@ pub mod alc_defines {
     /// `ALC_CAPTURE_SAMPLES`: number of capture samples available on the
     /// capture device, queried with `alcGetIntegerv`.
     pub const ALC_CAPTURE_SAMPLES: ALCenum = 0x312;
+    pub const ALC_CAPTURE_DEFAULT_DEVICE_SPECIFIER: ALCenum = 0x311;
 }
 
 extern "C" {

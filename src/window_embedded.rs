@@ -265,16 +265,18 @@ impl Window {
         self.event_queue.push_back(Event::AppDidBecomeActive);
     }
 
-    /// `at_swap` is true when called right before a frame is presented, so
-    /// the back buffer holds the finished frame and the last frame can be read
-    /// back before the surface goes away.
+    /// `at_swap` distinguishes a presentation boundary from the event poll.
     ///
     /// A pause is not applied at once: the app first runs on for a moment so
     /// it can handle `applicationWillResignActive:` and
     /// `applicationDidEnterBackground:` (see [Background]). Those events are
     /// only queued from the event poll, which runs between frames, so the
-    /// swap path just keeps rendering until the poll has delivered them.
+    /// swap path keeps rendering off screen until the poll delivers them.
     fn service_host(&mut self, at_swap: bool) {
+        // Detach a retired Android surface before the background grace period.
+        // Lifecycle callbacks may keep drawing for up to a second; they must
+        // use the pbuffer rather than a TextureView that is leaving the UI.
+        self.sync_surface();
         let parking = !self.blocked
             && !crate::embed::should_quit()
             && !crate::embed::is_runnable();
@@ -297,9 +299,6 @@ impl Window {
                 return;
             }
             self.background = Background::Notified;
-            if at_swap {
-                self.capture_frame();
-            }
         } else {
             self.pause_seen = None;
             if !self.blocked && !crate::embed::should_quit() && crate::embed::is_runnable() {
@@ -308,7 +307,6 @@ impl Window {
                 self.resume_lifecycle();
             }
         }
-        self.sync_surface();
         if crate::embed::should_quit() {
             return;
         }
@@ -340,14 +338,16 @@ impl Window {
     fn sync_surface(&mut self) {
         #[cfg(target_os = "android")]
         {
-            let next = crate::embed::native_window();
+            let (next, generation) = crate::embed::native_window_snapshot();
             if next == self.bound_window {
                 if next != 0 {
                     self.drawable = self.egl.drawable_size().unwrap_or(self.drawable);
                 }
+                crate::embed::acknowledge_native_window(generation);
                 return;
             }
             if self.bound_window != 0 {
+                self.capture_frame();
                 self.egl.destroy_window_surface();
                 unsafe { ANativeWindow_release(self.bound_window as *mut _) };
             }
@@ -359,6 +359,7 @@ impl Window {
                 self.drawable = self.egl.drawable_size().unwrap_or(self.drawable);
                 crate::embed::set_host_screen(self.drawable.0, self.drawable.1);
             }
+            crate::embed::acknowledge_native_window(generation);
         }
     }
 
@@ -426,6 +427,12 @@ impl Window {
                 }
                 InputKind::Text(text) => {
                     self.event_queue.push_back(Event::TextInput(TextInputEvent::Text(text)));
+                }
+                InputKind::EditingText(text) => {
+                    self.event_queue.push_back(Event::TextInput(TextInputEvent::EditingText(text)));
+                }
+                InputKind::DismissKeyboard => {
+                    self.event_queue.push_back(Event::TextInput(TextInputEvent::DismissKeyboard));
                 }
                 InputKind::Backspace => {
                     self.event_queue
@@ -573,6 +580,9 @@ impl Window {
     }
 
     pub fn swap_window(&mut self) {
+        // After the first app/compositor frame, later orientation requests
+        // must not draw the launch image over the running application.
+        self.splash_image = None;
         self.service_host(true);
         #[cfg(target_os = "android")]
         self.egl.swap();
@@ -853,8 +863,14 @@ fn flip_rows(width: u32, height: u32, rgba: &mut [u8]) {
     }
 }
 
-pub fn open_url(_env: &mut Environment, url: &str) -> Result<(), String> {
-    if crate::embed::open_url(url) {
+pub fn open_url(env: &mut Environment, url: &str) -> Result<(), String> {
+    if env.window.is_none() {
+        return Err("No host window for URL notification".to_string());
+    }
+    // ART's Java stack checks require the real host thread stack, rather than
+    // a guest coroutine stack (see Environment::on_parent_stack_in_coroutine).
+    let opened = env.on_parent_stack_in_coroutine(|_, _| crate::embed::open_url(url));
+    if opened {
         Ok(())
     } else {
         Err(format!("Could not open {url}"))
@@ -955,6 +971,7 @@ type GlReadPixels = unsafe extern "C" fn(i32, i32, i32, i32, u32, u32, *mut u8);
 
 #[cfg(target_os = "android")]
 struct EglFns {
+    get_error: unsafe extern "C" fn() -> i32,
     choose_config: unsafe extern "C" fn(
         *mut std::ffi::c_void,
         *const i32,
@@ -1097,7 +1114,11 @@ impl Egl {
             (self.fns.create_window)(self.display, self.config, window, std::ptr::null())
         };
         if surface.is_null() {
-            return Err("eglCreateWindowSurface failed".to_string());
+            return Err(format!(
+                "eglCreateWindowSurface failed: EGL error {:#x}, native window {:?}",
+                unsafe { (self.fns.get_error)() },
+                window
+            ));
         }
         self.window = window;
         self.window_surface = surface;
@@ -1194,6 +1215,7 @@ fn load_egl(use_angle: bool) -> Result<(EglFns, bool, *mut std::ffi::c_void), St
 fn egl_fns(lib: *mut std::ffi::c_void) -> Result<EglFns, String> {
     unsafe {
         Ok(EglFns {
+            get_error: std::mem::transmute(load_required(lib, b"eglGetError\0")?),
             choose_config: std::mem::transmute(load_required(lib, b"eglChooseConfig\0")?),
             create_context: std::mem::transmute(load_required(lib, b"eglCreateContext\0")?),
             create_pbuffer: std::mem::transmute(load_required(lib, b"eglCreatePbufferSurface\0")?),

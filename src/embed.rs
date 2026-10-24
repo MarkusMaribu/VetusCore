@@ -21,7 +21,7 @@ use std::time::Duration;
 pub struct HostFns {
     pub orientation: fn(i32),
     pub status_bar_hidden: fn(bool),
-    pub keyboard: fn(bool),
+    pub keyboard: fn(bool, &str),
     pub idle_timer: fn(bool),
     pub open_url: fn(&str) -> bool,
     pub alert: fn(&str, &str, &[&str]) -> i32,
@@ -30,6 +30,7 @@ pub struct HostFns {
 
 fn noop_i32(_: i32) {}
 fn noop_bool(_: bool) {}
+fn noop_keyboard(_: bool, _: &str) {}
 fn noop_url(_: &str) -> bool {
     false
 }
@@ -43,7 +44,7 @@ fn noop_crash(message: &str) {
 const NOOP_HOST: HostFns = HostFns {
     orientation: noop_i32,
     status_bar_hidden: noop_bool,
-    keyboard: noop_bool,
+    keyboard: noop_keyboard,
     idle_timer: noop_bool,
     open_url: noop_url,
     alert: noop_alert,
@@ -68,7 +69,20 @@ pub fn notify_status_bar(hidden: bool) {
 }
 
 pub fn notify_keyboard(show: bool) {
-    (host().lock().unwrap().keyboard)(show);
+    let snapshot = keyboard_snapshot().lock().unwrap().clone();
+    (host().lock().unwrap().keyboard)(show, &snapshot);
+}
+
+fn keyboard_snapshot() -> &'static Mutex<String> {
+    static SNAPSHOT: OnceLock<Mutex<String>> = OnceLock::new();
+    SNAPSHOT.get_or_init(|| Mutex::new("{}".to_string()))
+}
+
+pub fn set_keyboard_snapshot(text: &str, password: bool, multiline: bool) {
+    *keyboard_snapshot().lock().unwrap() = format!(
+        "{{\"text\":{},\"password\":{password},\"multiline\":{multiline}}}",
+        json_escape(text),
+    );
 }
 
 pub fn notify_idle_timer(enabled: bool) {
@@ -164,6 +178,8 @@ pub struct InputEvent {
 pub enum InputKind {
     Touch { action: i32, id: i64, x: f32, y: f32 },
     Text(String),
+    EditingText(String),
+    DismissKeyboard,
     Backspace,
     Return,
 }
@@ -210,8 +226,31 @@ pub fn gyro() -> Option<(f32, f32, f32)> {
 
 struct RunState {
     paused: bool,
-    window: usize,
+    surface: SurfaceState,
     quit: bool,
+}
+
+#[derive(Default)]
+struct SurfaceState {
+    window: usize,
+    generation: u64,
+    released: u64,
+}
+
+impl SurfaceState {
+    fn replace(&mut self, window: usize) -> u64 {
+        // Duplicate pauses must share a fence: the emulator may already be
+        // parked after acknowledging the first clear.
+        if self.window != window {
+            self.window = window;
+            self.generation += 1;
+        }
+        self.generation
+    }
+
+    fn acknowledge(&mut self, generation: u64) {
+        self.released = self.released.max(generation);
+    }
 }
 
 fn run_state() -> &'static (Mutex<RunState>, Condvar) {
@@ -220,7 +259,7 @@ fn run_state() -> &'static (Mutex<RunState>, Condvar) {
         (
             Mutex::new(RunState {
                 paused: true,
-                window: 0,
+                surface: SurfaceState::default(),
                 quit: false,
             }),
             Condvar::new(),
@@ -241,13 +280,35 @@ pub fn is_paused() -> bool {
     run_state().0.lock().unwrap().paused
 }
 
-pub fn set_native_window(window: usize) {
-    run_state().0.lock().unwrap().window = window;
+pub fn set_native_window(window: usize) -> u64 {
+    let generation = run_state().0.lock().unwrap().surface.replace(window);
     wake();
+    generation
 }
 
 pub fn native_window() -> usize {
-    run_state().0.lock().unwrap().window
+    native_window_snapshot().0
+}
+
+pub fn native_window_snapshot() -> (usize, u64) {
+    let state = run_state().0.lock().unwrap();
+    (state.surface.window, state.surface.generation)
+}
+
+/// The render thread has destroyed any EGL surface older than this snapshot.
+pub fn acknowledge_native_window(generation: u64) {
+    run_state().0.lock().unwrap().surface.acknowledge(generation);
+    wake();
+}
+
+/// Called off the Android UI thread before releasing a retired SurfaceTexture.
+/// https://developer.android.com/reference/android/view/TextureView.SurfaceTextureListener
+pub fn wait_for_surface_release(generation: u64) {
+    let (lock, cv) = run_state();
+    let mut state = lock.lock().unwrap();
+    while !state.quit && state.surface.released < generation {
+        state = cv.wait(state).unwrap();
+    }
 }
 
 pub fn should_quit() -> bool {
@@ -258,14 +319,14 @@ pub fn should_quit() -> bool {
 pub fn wait_until_runnable() {
     let (lock, cv) = run_state();
     let mut state = lock.lock().unwrap();
-    while !state.quit && (state.paused || state.window == 0) {
+    while !state.quit && (state.paused || state.surface.window == 0) {
         state = cv.wait(state).unwrap();
     }
 }
 
 pub fn is_runnable() -> bool {
     let state = run_state().0.lock().unwrap();
-    state.quit || (!state.paused && state.window != 0)
+    state.quit || (!state.paused && state.surface.window != 0)
 }
 
 struct Frame {
@@ -377,6 +438,15 @@ pub fn join_session(timeout: Duration) -> bool {
 /// Resident memory limit in bytes for this process; 0 disables the guard.
 static MEMORY_LIMIT_BYTES: AtomicU64 = AtomicU64::new(0);
 static MEMORY_LIMIT_HIT: AtomicBool = AtomicBool::new(false);
+static CAMERA_ALLOWED: AtomicBool = AtomicBool::new(false);
+static MICROPHONE_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+pub fn camera_allowed() -> bool { CAMERA_ALLOWED.load(Ordering::Relaxed) }
+pub fn microphone_allowed() -> bool { MICROPHONE_ALLOWED.load(Ordering::Relaxed) }
+
+fn media_permissions(json: &str) -> (bool, bool) {
+    (json_bool(json, "cameraAccess"), json_bool(json, "microphoneAccess"))
+}
 const MEMORY_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Resident set size of this process in bytes, if the host can tell us.
@@ -441,6 +511,9 @@ pub fn watch_memory(env: &mut crate::Environment) {
 }
 
 fn apply_screen_from_json(json: &str) {
+    let (camera, microphone) = media_permissions(json);
+    CAMERA_ALLOWED.store(camera, Ordering::Relaxed);
+    MICROPHONE_ALLOWED.store(microphone, Ordering::Relaxed);
     MEMORY_LIMIT_HIT.store(false, Ordering::Relaxed);
     MEMORY_LIMIT_BYTES.store(
         u64::from(json_u32(json, "memoryLimitMb").unwrap_or(0)) * 1024 * 1024,
@@ -474,6 +547,8 @@ fn session_args(ipa: &Path, json: &str) -> Vec<String> {
     if let Some(extra) = json_string(json, "extraArgs") {
         args.extend(extra.split_whitespace().map(|part| part.to_string()));
     }
+    // Alpine does not expose links or social account sign-in. Apply after extraArgs.
+    args.push("--disable-links".to_string());
     args
 }
 
@@ -656,6 +731,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn surface_release_waits_for_render_thread_and_survives_reopen() {
+        let mut surface = SurfaceState::default();
+        surface.replace(10);
+        let close = surface.replace(0);
+        assert!(surface.released < close);
+        assert_eq!(surface.replace(0), close);
+        // Reopening before the renderer sees the clear must not lose the
+        // retirement fence for the old texture.
+        let reopen = surface.replace(20);
+        assert!(surface.released < close);
+        surface.acknowledge(reopen);
+        assert!(surface.released >= close);
+        assert_eq!(surface.window, 20);
+        // A late acknowledgement cannot revoke a completed release.
+        surface.acknowledge(close);
+        assert_eq!(surface.released, reopen);
+    }
+
+    #[test]
+    fn texture_owner_is_not_released_until_the_renderer_acknowledges() {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        set_native_window(10);
+        let close = set_native_window(0);
+        assert_eq!(set_native_window(0), close);
+        let (started_tx, started_rx) = channel();
+        let (released_tx, released_rx) = channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            wait_for_surface_release(close);
+            released_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert_eq!(
+            released_rx.recv_timeout(Duration::from_millis(20)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        let reopen = set_native_window(20);
+        assert_eq!(
+            released_rx.recv_timeout(Duration::from_millis(20)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        acknowledge_native_window(reopen);
+        released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        waiter.join().unwrap();
+        let close = set_native_window(0);
+        acknowledge_native_window(close);
+    }
+
+    #[test]
     fn bmp_header_round_trips_dimensions() {
         let bmp = rgba_to_bmp(2, 1, &[1, 2, 3, 255, 4, 5, 6, 255]);
         assert_eq!(&bmp[0..2], b"BM");
@@ -673,5 +797,14 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--scale-hack=2"));
         assert!(args.iter().any(|arg| arg == "--screen-size=1080x1920"));
         assert!(!args.iter().any(|arg| arg == "--gles-native"));
+        assert_eq!(args.last().map(String::as_str), Some("--disable-links"));
+    }
+
+    #[test]
+    fn media_permissions_default_deny_and_are_independent() {
+        assert_eq!(media_permissions("{}"), (false, false));
+        assert_eq!(media_permissions("{\"cameraAccess\":true}"), (true, false));
+        assert_eq!(media_permissions("{\"microphoneAccess\":true}"), (false, true));
+        assert_eq!(media_permissions("{\"cameraAccess\":false,\"microphoneAccess\":false}"), (false, false));
     }
 }

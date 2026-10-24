@@ -217,6 +217,8 @@ pub struct Options {
     /// Apps that are ES 2.0-only will fail to create a context with this set.
     pub force_gles1_context: bool,
     pub network_access: bool,
+    /// Host policy: reject URL launches and UIWebView requests.
+    pub disable_links: bool,
     pub popup_errors: bool,
     pub dumping_options: DumpingOptions,
     pub dumping_file: PathBuf,
@@ -341,6 +343,7 @@ impl Default for Options {
                 })
                 .unwrap_or(false),
             network_access: false,
+            disable_links: false,
             popup_errors: true,
             dumping_options: Default::default(),
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
@@ -653,6 +656,8 @@ impl Options {
             // GLES-native backend selection and EAGL both read this env var
             // (the GLES backend layer has no `Options` access).
             std::env::set_var("TOUCHHLE_FORCE_GLES1_CONTEXT", "1");
+        } else if arg == "--disable-links" {
+            self.disable_links = true;
         } else if arg == "--allow-network-access" {
             self.network_access = true;
         } else if arg == "--no-network-access" {

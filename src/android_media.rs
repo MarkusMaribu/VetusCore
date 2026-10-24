@@ -536,7 +536,16 @@ mod imp {
 
     #[cfg(all(target_os = "android", feature = "embedded"))]
     pub fn has_microphone() -> bool {
-        false
+        if !crate::embed::microphone_allowed() { return false; }
+        // This host uses the shared OpenAL capture fallback, rather than the
+        // standalone SDL application's Java bridge. Enumerate without opening
+        // the microphone, just as AudioSession's availability query does.
+        // https://www.openal.org/documentation/openal-1.1-specification.pdf §6.3.7
+        unsafe {
+            let name = crate::audio::openal::alcGetString(std::ptr::null_mut(),
+                crate::audio::openal::ALC_CAPTURE_DEFAULT_DEVICE_SPECIFIER);
+            !name.is_null() && *name != 0
+        }
     }
     #[cfg(all(target_os = "android", feature = "embedded"))]
     pub fn start_mic() -> bool {
@@ -550,7 +559,19 @@ mod imp {
     }
 }
 
-pub use imp::{has_camera, populate_jni_cache, take_photo};
+pub use imp::populate_jni_cache;
+
+pub fn has_camera(front: bool) -> bool {
+    #[cfg(feature = "embedded")]
+    if !crate::embed::camera_allowed() { return false; }
+    imp::has_camera(front)
+}
+
+pub fn take_photo(front: bool) -> Option<Vec<u8>> {
+    #[cfg(feature = "embedded")]
+    if !crate::embed::camera_allowed() { return None; }
+    imp::take_photo(front)
+}
 
 // The raw JNI mic bridge, for the shared implementation in
 // `crate::audio::mic` (Android only).

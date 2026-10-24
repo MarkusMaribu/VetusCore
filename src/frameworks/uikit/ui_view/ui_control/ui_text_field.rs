@@ -526,6 +526,43 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
+// Host IMEs report complete editing values (selection replacement, composing
+// text and autocorrection), while UIKit delegates receive a UTF-16 NSRange.
+// https://developer.apple.com/documentation/uikit/uitextfielddelegate/textfield(_:shouldchangecharactersin:replacementstring:)
+pub fn handle_edit(env: &mut Environment, field: id, text: String) {
+    let current: id = msg![env; field text];
+    let old = if current == nil { String::new() } else {
+        ns_string::to_rust_string(env, current).into_owned()
+    };
+    if old == text { return; }
+    let (range, replacement) = editing_change(&old, &text);
+    let replacement = ns_string::from_rust_string(env, replacement);
+    let delegate = env.objc.borrow::<UITextFieldHostObject>(field).delegate;
+    let selector = env.objc.register_host_selector(
+        "textField:shouldChangeCharactersInRange:replacementString:".to_string(), &mut env.mem);
+    let accepted = delegate == nil || !msg![env; delegate respondsToSelector:selector]
+        || msg![env; delegate textField:field shouldChangeCharactersInRange:range replacementString:replacement];
+    if accepted {
+        let value = ns_string::from_rust_string(env, text);
+        let _: () = msg![env; field setText:value];
+        let _: () = msg![env; field setNeedsDisplay];
+        release(env, value);
+    }
+    release(env, replacement);
+}
+
+fn editing_change(old: &str, new: &str) -> (NSRange, String) {
+    let old: Vec<char> = old.chars().collect();
+    let new: Vec<char> = new.chars().collect();
+    let prefix = old.iter().zip(&new).take_while(|(a,b)| a == b).count();
+    let suffix = old[prefix..].iter().rev().zip(new[prefix..].iter().rev())
+        .take_while(|(a,b)| a == b).count();
+    (NSRange {
+        location: old[..prefix].iter().map(|c| c.len_utf16() as u32).sum(),
+        length: old[prefix..old.len()-suffix].iter().map(|c| c.len_utf16() as u32).sum(),
+    }, new[prefix..new.len()-suffix].iter().collect())
+}
+
 pub fn handle_text(env: &mut Environment, text_field: id, text: String) {
     let txt = ns_string::from_rust_string(env, text);
     let text_label = env
@@ -635,5 +672,29 @@ pub fn handle_return(env: &mut Environment, text_field: id) {
                 let _: () = msg![env; delegate textFieldShouldReturn:text_field];
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod editing_tests {
+    use super::*;
+
+    #[test]
+    fn host_edits_replace_selections_and_report_utf16_ranges() {
+        let (range, replacement) = editing_change("A😺 cat", "A🐈 cat");
+        assert_eq!((range.location, range.length), (1, 2));
+        assert_eq!(replacement, "🐈");
+        let mut env = crate::environment::touch_test_environment();
+        let env = &mut env;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let field: id = msg_class![env; UITextField alloc];
+        let field: id = msg![env; field initWithFrame:(CGRect::default())];
+        for value in ["Tom", "Timo", "😺", ""] {
+            crate::frameworks::uikit::ui_responder::handle_host_edit(env, field, value.to_string());
+            let actual: id = msg![env; field text];
+            assert_eq!(ns_string::to_rust_string(env, actual), value);
+        }
+        release(env, field);
+        release(env, pool);
     }
 }

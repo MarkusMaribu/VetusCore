@@ -275,6 +275,11 @@ pub fn stop() {
 }
 
 fn init_backend() -> bool {
+    #[cfg(feature = "embedded")]
+    if !crate::embed::microphone_allowed() {
+        *lock(&BACKEND) = Backend::None;
+        return false;
+    }
     // On Android the AudioRecord JNI bridge is the preferred backend.
     #[cfg(target_os = "android")]
     if crate::android_media::jni_start_mic() {
@@ -298,6 +303,7 @@ fn init_backend() -> bool {
             return false;
         }
         openal::alcCaptureStart(dev);
+        log!("Host microphone capture started through OpenAL.");
         *lock(&BACKEND) = Backend::OpenAL(SendDevice(dev));
         true
     }
@@ -330,11 +336,7 @@ fn poll_once() {
         #[cfg(target_os = "android")]
         Backend::Android => {
             let chunk = crate::android_media::jni_read_mic_chunk();
-            if chunk.is_empty() {
-                // No fresh data this tick; advance with silence so the
-                // stream keeps the real-time rate.
-                append_silence_tick();
-            } else {
+            if !chunk.is_empty() {
                 append_samples(&chunk);
             }
         }
@@ -342,9 +344,7 @@ fn poll_once() {
             let dev = dev.0;
             let mut available: openal::alc_types::ALCint = 0;
             openal::alcGetIntegerv(dev, openal::ALC_CAPTURE_SAMPLES, 1, &mut available);
-            if available <= 0 {
-                append_silence_tick();
-            } else {
+            if available > 0 {
                 let mut samples = vec![0i16; available as usize];
                 openal::alcCaptureSamples(dev, samples.as_mut_ptr().cast(), available);
                 append_samples(&samples);

@@ -9,6 +9,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/vetus_embedded.yml"
+      - "LICENSE"
+      - "NOTICE"
+      - "LICENSING.md"
+      - "dev-scripts/collect-licenses.py"
+      - "dev-scripts/licenses/**"
 
 jobs:
   arm64:
@@ -35,7 +40,15 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
         run: cargo build -p vetus_embed --release --target aarch64-linux-android
+      - name: Package license and source notices
+        run: |
+          mkdir -p dist/vetus-core
+          cp target/aarch64-linux-android/release/libvetus_core.so dist/vetus-core/
+          cp LICENSE NOTICE LICENSING.md dist/vetus-core/
+          python3 dev-scripts/collect-licenses.py dist/vetus-core/THIRD_PARTY_NOTICES.txt
+          printf 'https://github.com/%s/tree/%s\n' "$GITHUB_REPOSITORY" "$GITHUB_SHA" > dist/vetus-core/SOURCE.txt
+          git submodule status --recursive >> dist/vetus-core/SOURCE.txt
       - uses: actions/upload-artifact@v4
         with:
           name: libvetus_core-arm64
-          path: target/aarch64-linux-android/release/libvetus_core.so
+          path: dist/vetus-core/

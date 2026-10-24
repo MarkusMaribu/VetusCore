@@ -43,6 +43,110 @@ extern CFStringRef CFStringCreateWithCString(void *, const char *, unsigned int)
 extern void CFRelease(const void *);
 extern CFStringRef kCFRunLoopDefaultMode, kCFRunLoopCommonModes;
 
+typedef struct OpaqueAudioQueueTimeline *AudioQueueTimelineRef;
+typedef struct {
+  double sampleTime;
+  unsigned long long hostTime;
+  double rateScalar;
+  unsigned long long wordClockTime;
+  short subframes, subframeDivisor;
+  UInt32 counter, type, smpteFlags;
+  short hours, minutes, seconds, frames;
+  UInt32 flags, reserved;
+} AudioTimeStamp;
+OSStatus AudioQueueCreateTimeline(AudioQueueRef, AudioQueueTimelineRef *);
+OSStatus AudioQueueDisposeTimeline(AudioQueueRef, AudioQueueTimelineRef);
+OSStatus AudioQueueGetCurrentTime(AudioQueueRef, AudioQueueTimelineRef,
+                                 AudioTimeStamp *, unsigned char *);
+OSStatus AudioQueueGetProperty(AudioQueueRef, UInt32, void *, UInt32 *);
+OSStatus AudioQueueGetPropertySize(AudioQueueRef, UInt32, UInt32 *);
+OSStatus AudioQueuePause(AudioQueueRef);
+OSStatus AudioQueueReset(AudioQueueRef);
+
+static void timeline_callback(void *context, AudioQueueRef queue,
+                              AudioQueueBufferRef buffer) {}
+
+// AudioQueue.h: sample time is relative to queue start, at the queue rate;
+// timelines independently report discontinuities. These calls previously
+// resolved to return-0 stubs without writing either output.
+// https://developer.apple.com/documentation/audiotoolbox/audioqueuegetcurrenttime(_:_:_:_:)
+// https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.6.sdk/System/Library/Frameworks/AudioToolbox.framework/Versions/A/Headers/AudioQueue.h
+int test_audio_queue_timeline(void) {
+  AudioStreamBasicDescription format = {22050, 0x6c70636d, 12, 2, 1, 2, 1, 16, 0};
+  AudioQueueRef queue;
+  if (AudioQueueNewOutput(&format, timeline_callback, NULL, NULL, NULL, 0, &queue)) return -1;
+  int result = 0;
+  AudioQueueTimelineRef a = NULL, b = NULL;
+  AudioTimeStamp first, second;
+  memset(&first, 0xa5, sizeof(first));
+  UInt32 size = 0, channels = 0;
+  double rate = 0;
+  if (AudioQueueGetPropertySize(queue, 'aqsr', &size) || size != sizeof(rate)) {
+    result = -2; goto cleanup;
+  }
+  if (AudioQueueGetProperty(queue, 'aqsr', &rate, &size) || rate != 22050) {
+    result = -3; goto cleanup;
+  }
+  size = sizeof(channels);
+  if (AudioQueueGetProperty(queue, 'aqdc', &channels, &size) || channels != 1) {
+    result = -4; goto cleanup;
+  }
+  if (AudioQueueCreateTimeline(queue, &a) || !a ||
+      AudioQueueCreateTimeline(queue, &b) || !b || a == b) {
+    result = -5; goto cleanup;
+  }
+  AudioQueueBufferRef buffer;
+  if (AudioQueueAllocateBuffer(queue, 44100, &buffer)) { result = -6; goto cleanup; }
+  memset(buffer->mAudioData, 0, 44100);
+  buffer->mAudioDataByteSize = 44100;
+  if (AudioQueueEnqueueBuffer(queue, buffer, 0, NULL) || AudioQueueStart(queue, NULL)) {
+    result = -7; goto cleanup;
+  }
+  if (AudioQueueGetCurrentTime(queue, a, &first, NULL) || (first.flags & 3) != 3) {
+    result = -8; goto cleanup;
+  }
+  usleep(80000);
+  unsigned char discontinuity = 99;
+  if (AudioQueueGetCurrentTime(queue, a, &second, &discontinuity) ||
+      second.sampleTime <= first.sampleTime + 220 || discontinuity != 0 ||
+      second.hostTime <= first.hostTime) { result = -9; goto cleanup; }
+  if (AudioQueuePause(queue) || AudioQueueGetCurrentTime(queue, a, &first, NULL)) {
+    result = -10; goto cleanup;
+  }
+  usleep(40000);
+  if (AudioQueueGetCurrentTime(queue, a, &second, NULL) ||
+      second.sampleTime != first.sampleTime) { result = -11; goto cleanup; }
+  discontinuity = 99;
+  if (AudioQueueGetCurrentTime(queue, NULL, NULL, &discontinuity) || discontinuity != 99) {
+    result = -12; goto cleanup;
+  }
+  if (AudioQueueStart(queue, NULL)) { result = -16; goto cleanup; }
+  usleep(600000);
+  usleep(600000);
+  // An exhausted OpenAL source reports offset zero. The queue clock must
+  // still include the whole second that actually played, including buffers
+  // our delivery loop has already recycled.
+  if (AudioQueueGetCurrentTime(queue, a, &second, &discontinuity) ||
+      second.sampleTime != 22050 || discontinuity != 1) {
+    printf("drained queue: sampleTime=%f discontinuity=%u\n", second.sampleTime, discontinuity);
+    result = -17; goto cleanup;
+  }
+  if (AudioQueueReset(queue) || AudioQueueEnqueueBuffer(queue, buffer, 0, NULL) ||
+      AudioQueueStart(queue, NULL)) { result = -13; goto cleanup; }
+  if (AudioQueueGetCurrentTime(queue, a, NULL, &discontinuity) || discontinuity != 1 ||
+      AudioQueueGetCurrentTime(queue, a, NULL, &discontinuity) || discontinuity != 0 ||
+      AudioQueueGetCurrentTime(queue, b, NULL, &discontinuity) || discontinuity != 1) {
+    result = -14; goto cleanup;
+  }
+  if (AudioQueueDisposeTimeline(queue, a) ||
+      AudioQueueGetCurrentTime(queue, a, NULL, NULL) == 0 ||
+      AudioQueueDisposeTimeline(queue, a) == 0) { result = -15; goto cleanup; }
+  // Disposing the queue owns b's lifetime too.
+cleanup:
+  AudioQueueDispose(queue, 1);
+  return result;
+}
+
 
 typedef struct {
   long version;
@@ -142,6 +246,8 @@ void *AudioComponentFindNext(void *, const ComponentDescription *);
 OSStatus AudioComponentInstanceNew(void *, AudioUnit *);
 OSStatus AudioComponentInstanceDispose(AudioUnit);
 OSStatus AudioUnitSetProperty(AudioUnit, UInt32, UInt32, UInt32, const void *, UInt32);
+OSStatus AudioUnitGetProperty(AudioUnit, UInt32, UInt32, UInt32, void *, UInt32 *);
+OSStatus AudioUnitRender(AudioUnit, UInt32 *, const void *, UInt32, UInt32, AudioBufferList *);
 OSStatus AudioUnitInitialize(AudioUnit);
 OSStatus AudioUnitUninitialize(AudioUnit);
 OSStatus AudioOutputUnitStart(AudioUnit);
@@ -190,5 +296,68 @@ dispose:
   if (started && AudioOutputUnitStop(unit) && result == 0) result = -8;
   if (initialized && AudioUnitUninitialize(unit) && result == 0) result = -9;
   if (AudioComponentInstanceDispose(unit) && result == 0) result = -10;
+  return result;
+}
+
+static AudioUnit recording_unit;
+static int recording_callbacks, recording_error;
+static OSStatus unit_record(void *context, UInt32 *flags, const void *timestamp,
+                            UInt32 bus, UInt32 frames, AudioBufferList *data) {
+  recording_callbacks++;
+  if (bus != 1 || data != NULL || timestamp == NULL || frames > 1024) {
+    recording_error = 1; return 0;
+  }
+  short samples[1024];
+  memset(samples, 0xa5, sizeof(samples));
+  AudioBufferList input = {1, {{1, sizeof(samples), samples}}};
+  if (AudioUnitRender(recording_unit, flags, timestamp, bus, frames, &input) ||
+      input.buffers[0].size != frames * sizeof(short)) recording_error = 2;
+  return 0;
+}
+
+// RemoteIO recording is output scope, element 1. Its independent input
+// notification has NULL ioData and bus 1; it must not replace playback.
+// https://developer.apple.com/library/archive/documentation/MusicAudio/Conceptual/AudioUnitHostingGuide_iOS/UsingSpecificAudioUnits/UsingSpecificAudioUnits.html
+int test_remote_io_recording_callback(void) {
+  ComponentDescription description = {'auou', 'rioc', 'appl', 0, 0};
+  void *component = AudioComponentFindNext(NULL, &description);
+  if (!component || AudioComponentInstanceNew(component, &recording_unit)) return -1;
+  int result = 0, initialized = 0, started = 0;
+  UInt32 enabled = 1;
+  RenderCallbackStruct output = {unit_render, NULL}, input = {unit_record, NULL};
+  AudioStreamBasicDescription playback = {24000, 'lpcm', 12, 4, 1, 4, 2, 16, 0};
+  AudioStreamBasicDescription recording = {22050, 'lpcm', 12, 2, 1, 2, 1, 16, 0};
+  if (AudioUnitSetProperty(recording_unit, 23, 0, 0, &output, sizeof(output)) ||
+      AudioUnitSetProperty(recording_unit, 8, 1, 0, &playback, sizeof(playback)) ||
+      AudioUnitSetProperty(recording_unit, 2003, 1, 1, &enabled, sizeof(enabled)) ||
+      AudioUnitSetProperty(recording_unit, 8, 2, 1, &recording, sizeof(recording)) ||
+      AudioUnitSetProperty(recording_unit, 2005, 0, 0, &input, sizeof(input))) {
+    result = -2; goto dispose;
+  }
+  AudioStreamBasicDescription actual;
+  UInt32 size = sizeof(actual);
+  if (AudioUnitGetProperty(recording_unit, 8, 1, 0, &actual, &size) ||
+      actual.mSampleRate != 24000 || actual.mChannelsPerFrame != 2) {
+    result = -3; goto dispose;
+  }
+  if (AudioUnitInitialize(recording_unit)) { result = -4; goto dispose; }
+  initialized = 1;
+  unit_callbacks = recording_callbacks = recording_error = 0;
+  if (AudioOutputUnitStart(recording_unit)) { result = -5; goto dispose; }
+  started = 1;
+  CFStringRef custom = CFStringCreateWithCString(NULL, "TestAppRecordingMode", 0x08000100);
+  CFRunLoopSourceContext context = {0};
+  context.perform = idle_audio_source;
+  void *source = CFRunLoopSourceCreate(NULL, 0, &context);
+  CFRunLoopAddSource(CFRunLoopGetCurrent(), source, custom);
+  CFRunLoopRunInMode(custom, 0.2, 0);
+  if (!unit_callbacks || !recording_callbacks || recording_error) result = -6;
+  CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, custom);
+  CFRelease(source);
+  CFRelease(custom);
+dispose:
+  if (started) AudioOutputUnitStop(recording_unit);
+  if (initialized) AudioUnitUninitialize(recording_unit);
+  AudioComponentInstanceDispose(recording_unit);
   return result;
 }

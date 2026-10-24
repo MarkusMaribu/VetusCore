@@ -4259,6 +4259,35 @@ impl Environment {
     }
 }
 
+#[cfg(test)]
+// Exercise the real UIKit event dispatcher without a host GL window or app.
+pub(crate) fn touch_test_environment() -> Environment {
+    let mut env = unsafe { Environment::new_fake() };
+    env.mem = NullableBox::new(mem::Mem::new());
+    env.cpu = NullableBox::new(cpu::Cpu::new(None));
+    env.objc = NullableBox::new(objc::ObjC::new());
+    env.dyld = NullableBox::new(dyld::Dyld::new());
+    env.framework_state = Default::default();
+    env.libc_state = Default::default();
+    env.mutex_state = Default::default();
+    env.options = NullableBox::new(options::Options::default());
+    env.bundle = NullableBox::new(bundle::Bundle::new_fake_bundle());
+    env.fs = NullableBox::new(fs::Fs::new_fake_fs());
+    env.threads.push(Thread {
+        active: true,
+        blocked_by: ThreadBlock::NotBlocked,
+        return_value: None,
+        guest_context: None,
+        host_context: None,
+        stack: None,
+        thread_local_framework_state: Default::default(),
+    });
+    env.dyld.do_initial_linking_with_no_bins(&mut env.mem, &mut env.objc);
+    stack::prep_stack_for_start(&mut env.mem, &mut env.cpu, &[], &[], &[], false);
+    env.cpu.set_cpsr(cpu::Cpu::CPSR_USER_MODE);
+    env
+}
+
 impl Drop for Environment {
     // Clean up all the remaining HostContexts. This isn't strictly required,
     // since this should only occur after a sucessful panic or the app ending,

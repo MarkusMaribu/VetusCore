@@ -314,3 +314,95 @@ int test_UIView_EAGL_retina_is_opt_in(void) {
   [pool release];
   return result;
 }
+
+
+@interface NSURLRequest : NSObject
++ (id)requestWithURL:(NSURL *)url;
+@end
+@interface UIWebView : UIView
+- (void)setDelegate:(id)delegate;
+- (void)loadRequest:(NSURLRequest *)request;
+- (BOOL)isLoading;
+@end
+static int web_navigation_attempts;
+static int web_load_starts;
+@interface WebNavigationProbe : NSObject @end
+@implementation WebNavigationProbe
+- (BOOL)webView:(id)view shouldStartLoadWithRequest:(id)request navigationType:(NSInteger)kind {
+  web_navigation_attempts++;
+  return NO;
+}
+- (void)webViewDidStartLoad:(id)view { web_load_starts++; }
+@end
+
+// UIWebView inherits UIView geometry and asks its delegate before starting a load.
+// https://developer.apple.com/documentation/uikit/uiwebviewdelegate
+int test_UIWebView_frame_and_navigation_veto(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  UIWebView *view = [[UIWebView alloc] initWithFrame:CGRectMake(11, 23, 201, 307)];
+  CGRect frame = [view frame];
+  CGRect bounds = [view bounds];
+  int result = 0;
+  if (frame.origin.x != 11 || frame.origin.y != 23 || frame.size.width != 201 || frame.size.height != 307 ||
+      bounds.size.width != 201 || bounds.size.height != 307) result = -1;
+  WebNavigationProbe *probe = [[WebNavigationProbe alloc] init];
+  [view setDelegate:probe];
+  web_navigation_attempts = 0;
+  web_load_starts = 0;
+  [view loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.invalid/"]]];
+  if (web_navigation_attempts != 1 || web_load_starts != 0 || [view isLoading]) result = -2;
+  [view setDelegate:nil];
+  [probe release];
+  [view release];
+  [pool release];
+  return result;
+}
+
+
+@interface NSError : NSObject
+- (NSInteger)code;
+- (NSString *)domain;
+@end
+@interface UIApplication (BlockedLinkTests)
+- (BOOL)openURL:(NSURL *)url;
+@end
+static int blocked_link_failures;
+static int blocked_link_finishes;
+static NSInteger blocked_link_error;
+@interface BlockedLinkProbe : NSObject @end
+@implementation BlockedLinkProbe
+// Host policy must reject and notify even if an SDK would veto the navigation.
+- (BOOL)webView:(id)view shouldStartLoadWithRequest:(id)request navigationType:(NSInteger)kind { return NO; }
+- (void)webView:(id)view didFailLoadWithError:(NSError *)error {
+  blocked_link_failures++;
+  blocked_link_error = [error code];
+}
+- (void)webViewDidFinishLoad:(id)view { blocked_link_finishes++; }
+@end
+
+// Invoked separately with --disable-links: denied requests must fail rather than
+// reporting a successful load or leaving an SDK's login dialog waiting forever.
+int TestApp_blocked_links_test_main(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  UIApplication *application = [UIApplication sharedApplication];
+  if (application == nil) application = [[UIApplication alloc] init];
+  NSURL *url = [NSURL URLWithString:@"vetus-link-policy-test://blocked"];
+  if ([application canOpenURL:[NSURL URLWithString:@"https://example.invalid/"]] ||
+      [application canOpenURL:url] || [application openURL:url]) return 1;
+  UIWebView *view = [[UIWebView alloc] initWithFrame:CGRectMake(0, 0, 320, 480)];
+  BlockedLinkProbe *probe = [[BlockedLinkProbe alloc] init];
+  blocked_link_failures = blocked_link_finishes = 0;
+  blocked_link_error = 0;
+  [view setDelegate:probe];
+  [view loadRequest:[NSURLRequest requestWithURL:url]];
+  if (blocked_link_failures != 0) return 2; // The failure must be asynchronous.
+  for (int i = 0; i < 20 && blocked_link_failures == 0; i++)
+    [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+  int result = blocked_link_failures == 1 && blocked_link_finishes == 0 &&
+      blocked_link_error == -1 && ![view isLoading] ? 0 : 3;
+  [view setDelegate:nil];
+  [view release];
+  [probe release];
+  [pool release];
+  return result;
+}

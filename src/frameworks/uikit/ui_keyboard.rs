@@ -161,6 +161,26 @@ pub struct State {
 }
 
 pub fn start_text_input(env: &mut crate::Environment) {
+    #[cfg(feature = "embedded")]
+    {
+        let responder = env.framework_state.uikit.ui_responder.first_responder;
+        let responds = |env: &mut crate::Environment, name: &str| -> bool {
+            let selector = env.objc.register_host_selector(name.to_string(), &mut env.mem);
+            crate::objc::msg![env; responder respondsToSelector:selector]
+        };
+        let text = if responder != crate::objc::nil && responds(env, "text") {
+            let text: crate::objc::id = crate::objc::msg![env; responder text];
+            if text == crate::objc::nil { String::new() } else {
+                crate::frameworks::foundation::ns_string::to_rust_string(env, text).into_owned()
+            }
+        } else { String::new() };
+        env.framework_state.uikit.ui_responder.host_text = text.clone();
+        let password: bool = responds(env, "isSecureTextEntry")
+            && crate::objc::msg![env; responder isSecureTextEntry];
+        let class = env.objc.get_known_class("UITextView", &mut env.mem);
+        let multiline: bool = crate::objc::msg![env; responder isKindOfClass:class];
+        crate::embed::set_keyboard_snapshot(&text, password, multiline);
+    }
     if env.window.is_some() {
         env.on_parent_stack_in_coroutine(|window, _| window.start_text_input());
     }

@@ -9,7 +9,7 @@
 //! never loads it: a bound service in `:vetusN` does, and renders into a
 //! Surface the launcher hands over.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -26,9 +26,10 @@ const GET_STATIC_METHOD_ID: usize = 113;
 const CALL_STATIC_INT_METHOD_A: usize = 131;
 const CALL_STATIC_BOOLEAN_METHOD_A: usize = 119;
 const CALL_STATIC_VOID_METHOD_A: usize = 143;
-const NEW_STRING_UTF: usize = 167;
-const GET_STRING_UTF_CHARS: usize = 169;
-const RELEASE_STRING_UTF_CHARS: usize = 170;
+const NEW_STRING: usize = 163;
+const GET_STRING_LENGTH: usize = 164;
+const GET_STRING_CHARS: usize = 165;
+const RELEASE_STRING_CHARS: usize = 166;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -62,15 +63,13 @@ fn vm() -> *mut c_void {
 }
 
 fn java_string(env: *mut c_void, value: &str) -> *mut c_void {
-    let Ok(text) = CString::new(value) else {
-        return std::ptr::null_mut();
-    };
-    let Some(new_string): Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void> =
-        (unsafe { touchHLE::android_jni::table_fn(env, NEW_STRING_UTF) })
+    let text: Vec<u16> = value.encode_utf16().collect();
+    let Some(new_string): Option<unsafe extern "C" fn(*mut c_void, *const u16, c_int) -> *mut c_void> =
+        (unsafe { touchHLE::android_jni::table_fn(env, NEW_STRING) })
     else {
         return std::ptr::null_mut();
     };
-    unsafe { new_string(env, text.as_ptr()) }
+    unsafe { new_string(env, text.as_ptr(), text.len() as c_int) }
 }
 
 fn rust_string(env: *mut c_void, value: *mut c_void) -> Option<String> {
@@ -78,15 +77,18 @@ fn rust_string(env: *mut c_void, value: *mut c_void) -> Option<String> {
         return None;
     }
     let Some(get): Option<
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8) -> *const c_char,
-    > = (unsafe { touchHLE::android_jni::table_fn(env, GET_STRING_UTF_CHARS) })
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8) -> *const u16,
+    > = (unsafe { touchHLE::android_jni::table_fn(env, GET_STRING_CHARS) })
     else {
         return None;
     };
-    let Some(release): Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char)> =
-        (unsafe { touchHLE::android_jni::table_fn(env, RELEASE_STRING_UTF_CHARS) })
+    let Some(release): Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u16)> =
+        (unsafe { touchHLE::android_jni::table_fn(env, RELEASE_STRING_CHARS) })
     else {
         return None;
+    };
+    let length: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int = unsafe {
+        touchHLE::android_jni::table_fn(env, GET_STRING_LENGTH)?
     };
     unsafe {
         let mut copy = 0u8;
@@ -94,7 +96,7 @@ fn rust_string(env: *mut c_void, value: *mut c_void) -> Option<String> {
         if chars.is_null() {
             return None;
         }
-        let text = CStr::from_ptr(chars).to_string_lossy().into_owned();
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(chars, length(env, value) as usize));
         release(env, value, chars);
         Some(text)
     }
@@ -201,7 +203,7 @@ fn ensure_cache(env: *mut c_void) -> Option<&'static Cache> {
         class,
         orientation: method("onRequestOrientation", "(I)V"),
         status_bar: method("onStatusBarHidden", "(Z)V"),
-        keyboard: method("onKeyboard", "(Z)V"),
+        keyboard: method("onKeyboard", "(ZLjava/lang/String;)V"),
         idle_timer: method("onIdleTimer", "(Z)V"),
         open_url: method("onOpenUrl", "(Ljava/lang/String;)Z"),
         alert: method("onAlert", "(Ljava/lang/String;Ljava/lang/String;)I"),
@@ -241,8 +243,12 @@ fn host_status_bar(hidden: bool) {
     );
 }
 
-fn host_keyboard(show: bool) {
-    call_void(|cache| cache.keyboard, &[JValue { z: u8::from(show) }]);
+fn host_keyboard(show: bool, snapshot: &str) {
+    let _ = with_env(|env| {
+        let snapshot = java_string(env, snapshot);
+        call_void(|cache| cache.keyboard, &[JValue { z: u8::from(show) }, JValue { l: snapshot }]);
+        delete_local(env, snapshot);
+    });
 }
 
 fn host_idle(enabled: bool) {
@@ -471,8 +477,17 @@ pub extern "system" fn Java_com_markusmaribu_alpinelauncher_vetus_VetusCore_nati
 pub extern "system" fn Java_com_markusmaribu_alpinelauncher_vetus_VetusCore_nativeClearSurface(
     _env: *mut c_void,
     _class: *mut c_void,
+) -> i64 {
+    touchHLE::embed::set_native_window(0) as i64
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_markusmaribu_alpinelauncher_vetus_VetusCore_nativeAwaitSurfaceRelease(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    generation: i64,
 ) {
-    touchHLE::embed::set_native_window(0);
+    touchHLE::embed::wait_for_surface_release(generation as u64);
 }
 
 #[no_mangle]
@@ -542,6 +557,17 @@ pub extern "system" fn Java_com_markusmaribu_alpinelauncher_vetus_VetusCore_nati
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_markusmaribu_alpinelauncher_vetus_VetusCore_nativePostEditingText(
+    env: *mut c_void, _class: *mut c_void, text: *mut c_void,
+) {
+    if let Some(text) = rust_string(env, text) {
+        touchHLE::embed::push_input(touchHLE::embed::InputEvent {
+            kind: touchHLE::embed::InputKind::EditingText(text),
+        });
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_markusmaribu_alpinelauncher_vetus_VetusCore_nativePostKey(
     _env: *mut c_void,
     _class: *mut c_void,
@@ -549,6 +575,8 @@ pub extern "system" fn Java_com_markusmaribu_alpinelauncher_vetus_VetusCore_nati
 ) {
     let kind = if key == 0 {
         touchHLE::embed::InputKind::Backspace
+    } else if key == 2 {
+        touchHLE::embed::InputKind::DismissKeyboard
     } else {
         touchHLE::embed::InputKind::Return
     };

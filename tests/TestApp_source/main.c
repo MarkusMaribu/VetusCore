@@ -15,9 +15,13 @@
 #include <string.h>
 
 int TestApp_cli_tests_main(void);
+int TestApp_blocked_links_test_main(void);
 int TestApp_gui_tests_main(int argc, char **argv);
 
 int main(int argc, char **argv) {
+  if (argc == 2 && !strcmp(argv[1], "--blocked-links-tests")) {
+    return TestApp_blocked_links_test_main();
+  }
   if (argc == 2 && !strcmp(argv[1], "--cli-tests")) {
     printf("Starting command-line automated tests (omit --cli-tests for UIKit "
            "test app).\n");

@@ -309,6 +309,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)canOpenURL:(id)url { // NSURL
+    if env.options.disable_links { return false; }
     // Apple `-[UIApplication canOpenURL:]` documentation: returns `YES`
     // if the URL can be handled — i.e. the device has at least one
     // installed application that has registered for the URL's scheme
@@ -436,14 +437,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)openURL:(id)url { // NSURL
+    if url == nil { return false; }
     let ns_string = msg![env; url absoluteString];
     let url_string = ns_string::to_rust_string(env, ns_string);
+    if env.options.disable_links {
+        #[cfg(feature = "embedded")]
+        let _ = crate::window::open_url(env, &url_string);
+        return false;
+    }
     // Hand the URL to the host (on Android this opens the system browser
     // via MainActivity.openExternalUrl and the emulator keeps running —
     // exiting the process here killed the app before the intent could
     // dispatch, so links never opened).
     if let Err(e) = crate::window::open_url(env, &url_string) {
         echo!("App opened URL {:?} unsuccessfully ({}).", url_string, e);
+        return false;
     } else {
         echo!("App opened URL {:?}.", url_string);
     }

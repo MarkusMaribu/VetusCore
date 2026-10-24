@@ -624,10 +624,14 @@ fn CGFontGetStemV(env: &mut Environment, font: CGFontRef) -> f32 {
 ///
 /// Returns the bounding box of the font in design units. Read from the
 /// 'head' table (xMin, yMin, xMax, yMax at offsets 36-43).
-fn CGFontGetFontBBox(env: &mut Environment, font: CGFontRef, out: MutVoidPtr) {
+///
+/// This is a struct return, not an explicit output argument. The guest ABI
+/// supplies its hidden result pointer before `font`; `GuestRet` handles it.
+/// https://developer.apple.com/documentation/coregraphics/cgfont/fontbbox
+fn CGFontGetFontBBox(env: &mut Environment, font: CGFontRef) -> super::CGRect {
     use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
-    if font.is_null() || out.is_null() {
-        return;
+    if font.is_null() {
+        return CGRect::default();
     }
     if is_data_provider_font(env, font) {
         let head_data = env
@@ -641,16 +645,13 @@ fn CGFontGetFontBBox(env: &mut Environment, font: CGFontRef, out: MutVoidPtr) {
                 let y_min = i16::from_be_bytes([data[38], data[39]]) as f32;
                 let x_max = i16::from_be_bytes([data[40], data[41]]) as f32;
                 let y_max = i16::from_be_bytes([data[42], data[43]]) as f32;
-                let rect = CGRect {
+                return CGRect {
                     origin: CGPoint { x: x_min, y: y_min },
                     size: CGSize {
                         width: x_max - x_min,
                         height: y_max - y_min,
                     },
                 };
-                let p: crate::mem::MutPtr<CGRect> = out.cast();
-                env.mem.write(p, rect);
-                return;
             }
         }
     }
@@ -658,15 +659,13 @@ fn CGFontGetFontBBox(env: &mut Environment, font: CGFontRef, out: MutVoidPtr) {
     let upm = CGFontGetUnitsPerEm(env, font) as CGFloat;
     let asc = CGFontGetAscent(env, font) as CGFloat;
     let desc = CGFontGetDescent(env, font) as CGFloat;
-    let rect = CGRect {
+    CGRect {
         origin: CGPoint { x: 0.0, y: desc },
         size: CGSize {
             width: upm,
             height: asc - desc,
         },
-    };
-    let p: crate::mem::MutPtr<CGRect> = out.cast();
-    env.mem.write(p, rect);
+    }
 }
 
 // =========================================================================
@@ -973,7 +972,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGFontGetXHeight(_)),
     export_c_func!(CGFontGetItalicAngle(_)),
     export_c_func!(CGFontGetStemV(_)),
-    export_c_func!(CGFontGetFontBBox(_, _)),
+    export_c_func!(CGFontGetFontBBox(_)),
     // Per-glyph metrics
     export_c_func!(CGFontGetGlyphAdvances(_, _, _, _)),
     export_c_func!(CGFontGetGlyphBBoxes(_, _, _, _)),

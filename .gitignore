@@ -40,6 +40,12 @@ DUMP.txt
 *.log
 touchHLE_apps/
 target/
+# Local compatibility captures, downloaded apps/SDKs, and alternate Cargo outputs.
+/compat-evidence/
+/ta/
+/tg/
+/target-android/
+/target-gnu/
 *.ipa
 touchHLE_pvrtc_cache/
 

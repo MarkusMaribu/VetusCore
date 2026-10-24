@@ -129,15 +129,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (id)init {
-    this
+    msg_super![env; this init]
 }
 
-- (id)initWithFrame:(CGRect)_frame {
-    this
+- (id)initWithFrame:(CGRect)frame {
+    msg_super![env; this initWithFrame:frame]
 }
 
-- (id)initWithCoder:(id)_coder {
-    this
+- (id)initWithCoder:(id)coder {
+    msg_super![env; this initWithCoder:coder]
 }
 
 // =========================================================================
@@ -187,6 +187,22 @@ pub const CLASSES: ClassExports = objc_classes! {
         String::new()
     };
     log!("UIWebView loadRequest: {}", url_string);
+    if env.options.disable_links {
+        log!("UIWebView request denied by host link policy");
+        #[cfg(feature = "embedded")]
+        let _ = crate::window::open_url(env, &url_string);
+        // Fail asynchronously: SDKs often attach their dialog after loadRequest:.
+        // A cancellation error (-999) only cancels a load and may be ignored.
+        env.objc.borrow_mut::<UIWebViewHostObject>(this).loading = true;
+        retain(env, this);
+        let selector = env.objc.register_host_selector("touchhleWebViewLinkBlocked:".to_string(), &mut env.mem);
+        let _: id = msg_class![env; NSTimer scheduledTimerWithTimeInterval:0.01 target:this selector:selector userInfo:nil repeats:false];
+        return;
+    }
+
+    if !should_start_load(env, this, &url_string, UIWebViewNavigationTypeOther) {
+        return;
+    }
 
     // Push current URL onto back stack before navigating.
     let old_url = env.objc.borrow::<UIWebViewHostObject>(this).current_url;
@@ -684,6 +700,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Native-overlay & async-load internals
 // =========================================================================
 
+// Report a denied navigation through the normal UIWebViewDelegate failure path.
+// https://developer.apple.com/documentation/uikit/uiwebviewdelegate
+- (())touchhleWebViewLinkBlocked:(id)_timer {
+    log!("UIWebView delivering denied-link load failure");
+    env.objc.borrow_mut::<UIWebViewHostObject>(this).loading = false;
+    let delegate = env.objc.borrow::<UIWebViewHostObject>(this).delegate;
+    let selector = env.objc.register_host_selector("webView:didFailLoadWithError:".to_string(), &mut env.mem);
+    let responds: bool = msg![env; delegate respondsToSelector:selector];
+    if responds {
+        let domain = ns_string::get_static_str(env, "NSURLErrorDomain");
+        let code = crate::frameworks::foundation::ns_error::NSURLErrorUnknown;
+        let error: id = msg_class![env; NSError errorWithDomain:domain code:code userInfo:nil];
+        () = msg![env; delegate webView:this didFailLoadWithError:error];
+    }
+    release(env, this);
+}
+
 // Called by an NSTimer scheduled in loadRequest:/loadHTMLString:/loadData:.
 // The timer argument is the (retained) NSTimer; we release our retain of
 // `this` here to keep refcounts balanced.
@@ -884,6 +917,34 @@ pub(crate) fn webview_did_remove_from_superview(env: &mut Environment, this: id)
         android_web_view::hide(overlay_id);
         env.objc.borrow_mut::<UIWebViewHostObject>(this).overlay_id = -1;
     }
+}
+
+/// Ask the application's delegate before starting a request.
+/// https://developer.apple.com/documentation/uikit/uiwebviewdelegate
+fn should_start_load(
+    env: &mut Environment,
+    this: id,
+    url: &str,
+    kind: UIWebViewNavigationType,
+) -> bool {
+    let delegate = env.objc.borrow::<UIWebViewHostObject>(this).delegate;
+    if delegate == nil {
+        return true;
+    }
+    let sel = env.objc.register_host_selector(
+        "webView:shouldStartLoadWithRequest:navigationType:".to_string(),
+        &mut env.mem,
+    );
+    let responds: bool = msg![env; delegate respondsToSelector:sel];
+    if !responds {
+        return true;
+    }
+    let string = ns_string::from_rust_string(env, url.to_string());
+    let url: id = msg_class![env; NSURL URLWithString:string];
+    let request: id = msg_class![env; NSURLRequest requestWithURL:url];
+    let allow: bool = msg![env; delegate webView:this shouldStartLoadWithRequest:request navigationType:kind];
+    release(env, string);
+    allow
 }
 
 /// Map the webview's guest frame to host window pixels and create/position

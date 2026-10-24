@@ -29,6 +29,8 @@ if [ "$PHASE" = "--prepare-files" ]; then
     pandoc -s ../CHANGELOG.md -o new_release/CHANGELOG.html
 
     cp -r gpl-3.0.txt new_release/COPYING.txt
+    cp ../LICENSE ../NOTICE ../LICENSING.md new_release/
+    python3 collect-licenses.py new_release/THIRD_PARTY_NOTICES.txt
 
     cp ../OPTIONS_HELP.txt new_release/
     cp ../touchHLE_default_options.txt new_release/
@@ -76,7 +78,7 @@ elif [ "$PHASE" = "--create-zip-windows" ] || [ "$PHASE" = "--create-zip-linux" 
         # full set of support files (dylibs, fonts, options) bundled alongside.
         zip -r "$OUTPUT_PATH" *
     else
-        zip "$OUTPUT_PATH" CHANGELOG.html COPYING.txt README.html
+        zip "$OUTPUT_PATH" CHANGELOG.html COPYING.txt README.html LICENSE NOTICE LICENSING.md THIRD_PARTY_NOTICES.txt
     fi
 else
     echo "Unknown or missing phase."

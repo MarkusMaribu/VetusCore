@@ -1844,12 +1844,7 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_tex0);
     let blend_was_on = gles.IsEnabled(gles2::BLEND) != 0;
     let attribs = [program.a_pos as GLuint, program.a_uv as GLuint, program.a_col as GLuint];
-    let mut attrib_states = [0u8; 3];
-    for (slot, &attrib) in attrib_states.iter_mut().zip(attribs.iter()) {
-        let mut v: GLint = 0;
-        gles.GetVertexAttribiv(attrib as GLuint, gles2::VERTEX_ATTRIB_ARRAY_ENABLED, &mut v);
-        *slot = v as u8;
-    }
+    let saved_attribs = crate::gles::util::SavedVertexAttribArrays::save(gles, attribs);
 
     gles.UseProgram(program.program);
     gles.Uniform2f(program.u_viewport, viewport.2 as f32, viewport.3 as f32);
@@ -1918,13 +1913,7 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
         gles.DrawArrays(gles2::TRIANGLE_STRIP, 0, 4);
     }
 
-    for (&attr, &was) in attribs.iter().zip(attrib_states.iter()) {
-        if was != 0 {
-            gles.EnableVertexAttribArray(attr as _);
-        } else {
-            gles.DisableVertexAttribArray(attr as _);
-        }
-    }
+    saved_attribs.restore(gles);
     if !blend_was_on {
         gles.Disable(gles2::BLEND);
     }

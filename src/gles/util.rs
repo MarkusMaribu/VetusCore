@@ -5,6 +5,9 @@
  */
 //! Shared utilities.
 
+mod vertex_attrib;
+pub(crate) use vertex_attrib::SavedVertexAttribArrays;
+
 use super::gles11_raw as gles11; // constants only
 use super::gles11_raw::types::{GLenum, GLfixed, GLfloat, GLint, GLsizei};
 use super::GLES;

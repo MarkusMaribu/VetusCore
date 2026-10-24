@@ -1,0 +1,30 @@
+VetusCore
+Source: https://github.com/MarkusMaribu/VetusCore
+
+VetusCore is an independently maintained fork of HyperHLE-Reborn:
+https://github.com/KlugKlugTG/HyperHLE-Reborn
+
+HyperHLE-Reborn carries forward HyperHLE and touchHLE:
+https://github.com/HyperHLE/HyperHLE
+https://github.com/touchHLE/touchHLE
+
+Credit belongs to the contributors to each project. Copyright in existing
+work remains with its respective holders. Contributor history is preserved
+in Git. VetusCore adds the Alpine/Vetus embedded Android interface and
+further emulator compatibility changes.
+
+The emulator Source Code Form, including modifications to MPL-covered
+files, is subject to the Mozilla Public License, v. 2.0. A copy is provided
+in LICENSE, or can be obtained at https://mozilla.org/MPL/2.0/.
+
+The iOS host and packaging were imported upstream from Applesauce:
+https://github.com/johnny901901901/Applesauce
+See platform/ios/README.md and individual source notices.
+
+Third-party components retain their own copyright notices and licenses.
+See LICENSING.md, the component license files, and the generated
+THIRD_PARTY_NOTICES.txt included with packaged builds.
+
+Project names identify provenance; no upstream endorsement or transfer of
+trademark rights is implied. No rights to third-party apps, game assets,
+Apple SDKs, or firmware are granted by this project's license.
