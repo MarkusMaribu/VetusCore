@@ -13,6 +13,8 @@ View options:
         On desktop systems, choose whether resizing a window preserves the
         emulated display's aspect ratio. By default, the display stretches to
         fill the window. The app picker also exposes this in Graphics settings.
+        Embedded Vetus sessions preserve the aspect ratio by default; the host
+        can disable this to stretch the display to fill the available area.
 
     --landscape-left
     --landscape-right
@@ -60,8 +62,9 @@ Device options:
         bundle itself, falling back to iPhone if needed.
 
         Accepted values are "auto" plus any of the specific device models
-        below. The legacy names "iphone", "iphone5" and "ipad" are still
-        accepted as aliases (mapping to iPhone 3GS, iPhone 5 and iPad 2).
+        below. "iphone" and "ipad" choose a model within that class using the
+        app's hardware requirements, preferring iPhone 3GS and iPad 2 when
+        compatible. A specific model name keeps that model pinned.
 
         iPhone family (32-bit):
             iphone-2g  (iPhone1,1)   iphone-3g  (iPhone1,2)
@@ -514,12 +517,9 @@ Other options:
         enabled by an app-specific options file.
 
     --rotation-fix
-        Use UIKit's actual autorotation state to decide whether EAGL needs an
-        extra 180-degree presentation compensation. This fixes iPad games that
-        should only get the compensation when UIKit really rotated their root
-        view. Without this flag, HyperHLE keeps the legacy iPad/non-portrait
-        heuristic. Disabled globally; the bundled default-options file enables
-        this together with --fix-movie-player for GTA III.
+        Present OpenGL contents using the active drawable's layer transforms,
+        matching Core Animation composition. Enabled by default. Rotations of
+        unrelated views (including intro movies) do not affect the game frame.
 
     --no-rotation-fix
         Explicitly use the legacy iPad/non-portrait rotation heuristic, even if

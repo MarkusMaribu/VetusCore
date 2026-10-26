@@ -14,7 +14,9 @@ use super::ca_eagl_layer::find_fullscreen_eagl_layer;
 use super::ca_layer::CALayerHostObject;
 use crate::frameworks::core_animation::animation;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
-use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect};
+use crate::frameworks::core_graphics::{
+    cg_bitmap_context, cg_image, CGFloat, CGPoint, CGRect, CGSize,
+};
 use crate::frameworks::foundation::ns_time_interval_to_duration_or_zero;
 use crate::gles::gles11_raw as gles11; // constants only
 use crate::gles::gles11_raw::types::*;
@@ -37,6 +39,7 @@ pub(super) struct State {
     recomposite_next: Option<Instant>,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
+    mask_targets: Vec<(GLuint, GLuint, u32, u32)>,
 }
 
 struct MiscGlObjects {
@@ -99,28 +102,16 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
     let fullscreen_eagl_layer = find_fullscreen_eagl_layer(env);
     if fullscreen_eagl_layer != nil {
-        let has_presented = {
-            let host_obj = env.objc.borrow::<CALayerHostObject>(fullscreen_eagl_layer);
-            host_obj.presented_pixels.is_some() || host_obj.presented_directly
-        };
-        if has_presented && !force && !crate::frameworks::media_player::has_active_video(env) {
-            // EAGLContext normally presents the fullscreen drawable directly.
-            // Native ES1 readback and movie overlays are the exceptions that
-            // need the Core Animation compositor.
-            //
-            // The fast path is only valid once the EAGL layer has actually
-            // presented at least one frame. Some apps (e.g. Doodle Jump) sit
-            // on a UIKit screen — menus, cross-promo/"prize" popups — while the
-            // fullscreen EAGL layer stays idle and never presents. In that
-            // state the fast path would skip composition and leave the screen
-            // blank, so fall through to the Core Animation compositor and draw
-            // the UIKit view/layer tree instead. Once the app starts driving
-            // GL (presentRenderbuffer sets presented_pixels on the readback
-            // path, or presented_directly on the GPU path), the fast path
-            // takes over again. Checking only presented_pixels made the
-            // compositor keep swapping its own frame (with a black EAGL
-            // layer) in between every GPU-presented game frame, which shows
-            // up as constant black flicker.
+        let presented_directly =
+            super::ca_eagl_layer::is_presented_directly(&env.objc, fullscreen_eagl_layer);
+        if presented_directly && !force && !crate::frameworks::media_player::has_active_video(env) {
+            // Only GPU presentation owns the screen without the compositor.
+            // Cached readback pixels still need composition: the guest can
+            // stop presenting GL frames while UIKit keeps changing, such as
+            // Doodle Jump's game-over name field. Keep displaying that cached
+            // background and repainting the text instead of freezing the UI.
+            // Conversely, compositing over a directly presented drawable
+            // with no cached pixels would overwrite it with a black frame.
             log_dbg!("Using CAEAGLLayer fast path, skipping composition");
             return None;
         }
@@ -206,7 +197,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     let fb_height = screen_bounds.size.height as u32 * scale_hack * ui_scale;
     let present_frame_args = (
         env.window().viewport(),
-        env.window().rotation_matrix(),
+        env.window().screen_coordinate_rotation(),
         env.window().virtual_cursor_visible_at(),
     );
     let host_framebuffer = env.window().host_framebuffer();
@@ -657,6 +648,9 @@ pub(super) fn display_layers(env: &mut Environment, root_layer: id) {
         for &layer in &host_obj.sublayers {
             traverse(objc, layer, layers_needing_display);
         }
+        if host_obj.mask != nil {
+            traverse(objc, host_obj.mask, layers_needing_display);
+        }
     }
 
     let mut layers_needing_display = Vec::new();
@@ -724,7 +718,38 @@ unsafe fn composite_layer_transformed(
     if host_obj.hidden {
         return;
     }
+    if host_obj.mask != nil || host_obj.masks_to_bounds {
+        composite_masked_layer(
+            env,
+            animation_state,
+            layer,
+            cumulative_transform,
+            opacity,
+            local_transform,
+            host_obj,
+        );
+    } else {
+        composite_layer_contents(
+            env,
+            animation_state,
+            layer,
+            cumulative_transform,
+            opacity,
+            local_transform,
+            host_obj,
+        );
+    }
+}
 
+unsafe fn composite_layer_contents(
+    env: &mut Environment,
+    animation_state: &mut animation::State,
+    layer: id,
+    cumulative_transform: Matrix<4>,
+    opacity: CGFloat,
+    local_transform: Matrix<4>,
+    host_obj: CALayerHostObject,
+) {
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
 
@@ -1011,6 +1036,20 @@ unsafe fn composite_layer_transformed(
             gles.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
         }
 
+        let dimensions = texture_size.unwrap_or((1, 1));
+        let rect = contents_frame(
+            host_obj.bounds,
+            dimensions,
+            host_obj.contents_scale,
+            &host_obj.contents_gravity,
+        );
+        gles.MatrixMode(gles11::MODELVIEW);
+        load_matrix(
+            gles.as_mut(),
+            Matrix::<4>::from(&Matrix::scale_2d(rect.size.width, rect.size.height))
+                .multiply(&Matrix::translate_3d(rect.origin.x, rect.origin.y, 0.0))
+                .multiply(&cumulative_transform),
+        );
         gles.EnableClientState(gles11::VERTEX_ARRAY);
         gles.BindBuffer(gles11::ARRAY_BUFFER, misc.basic_square_buffer);
         gles.VertexPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
@@ -1044,8 +1083,7 @@ unsafe fn composite_layer_transformed(
     // We clone the sublayer list, sort by zPosition (stable sort preserves
     // order of equal elements), then composite each child.
     let sorted_sublayers = {
-        let original_host_obj = env.objc.borrow::<CALayerHostObject>(layer);
-        let mut sublayers_copy = original_host_obj.sublayers.clone();
+        let mut sublayers_copy = host_obj.sublayers.clone();
         sublayers_copy.sort_by(|&a, &b| {
             let z_a = env.objc.borrow::<CALayerHostObject>(a).z_position;
             let z_b = env.objc.borrow::<CALayerHostObject>(b).z_position;
@@ -1063,6 +1101,234 @@ unsafe fn composite_layer_transformed(
             opacity,
         )
     }
+}
+
+/// Image alignment uses Core Animation's vertical axis (top is the high-y
+/// edge for unflipped contents), independently of UIKit view coordinates.
+/// https://developer.apple.com/documentation/quartzcore/calayer/contentsgravity
+fn contents_frame(bounds: CGRect, pixels: (u32, u32), scale: f32, gravity: &str) -> CGRect {
+    if gravity == "resize" || gravity.is_empty() {
+        return bounds;
+    }
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let mut width = pixels.0 as f32 / scale;
+    let mut height = pixels.1 as f32 / scale;
+    if gravity == "resizeAspect" || gravity == "resizeAspectFill" {
+        let sx = bounds.size.width / width;
+        let sy = bounds.size.height / height;
+        let factor = if gravity == "resizeAspect" {
+            sx.min(sy)
+        } else {
+            sx.max(sy)
+        };
+        width *= factor;
+        height *= factor;
+    }
+    let dx = bounds.size.width - width;
+    let dy = bounds.size.height - height;
+    let x = match gravity {
+        "left" | "topLeft" | "bottomLeft" => 0.0,
+        "right" | "topRight" | "bottomRight" => dx,
+        _ => dx / 2.0,
+    };
+    let y = match gravity {
+        "top" | "topLeft" | "topRight" => dy,
+        "bottom" | "bottomLeft" | "bottomRight" => 0.0,
+        _ => dy / 2.0,
+    };
+    CGRect {
+        origin: CGPoint {
+            x: bounds.origin.x + x,
+            y: bounds.origin.y + y,
+        },
+        size: CGSize { width, height },
+    }
+}
+
+/// Full-screen offscreen targets are pooled across frames and nested masks.
+/// Keeping the viewport unchanged preserves transforms, including rotations.
+unsafe fn mask_target(env: &mut Environment) -> (GLuint, GLuint, u32, u32) {
+    let (_, _, width, height) = env
+        .framework_state
+        .core_animation
+        .composition
+        .texture_framebuffer
+        .unwrap();
+    let cached = env
+        .framework_state
+        .core_animation
+        .composition
+        .mask_targets
+        .pop();
+    let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+    let (texture, framebuffer) = if let Some((t, f, w, h)) = cached {
+        if (w, h) == (width, height) {
+            gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, f);
+            return (t, f, w, h);
+        }
+        gl.DeleteTextures(1, &t);
+        gl.DeleteFramebuffersOES(1, &f);
+        (0, 0)
+    } else {
+        (0, 0)
+    };
+    let (mut texture, mut framebuffer) = (texture, framebuffer);
+    gl.GenTextures(1, &mut texture);
+    gl.BindTexture(gles11::TEXTURE_2D, texture);
+    gl.TexImage2D(
+        gles11::TEXTURE_2D,
+        0,
+        gles11::RGBA as _,
+        width as _,
+        height as _,
+        0,
+        gles11::RGBA,
+        gles11::UNSIGNED_BYTE,
+        std::ptr::null(),
+    );
+    for (name, value) in [
+        (gles11::TEXTURE_MIN_FILTER, gles11::LINEAR),
+        (gles11::TEXTURE_MAG_FILTER, gles11::LINEAR),
+        (gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE),
+        (gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE),
+    ] {
+        gl.TexParameteri(gles11::TEXTURE_2D, name, value as _);
+    }
+    gl.GenFramebuffersOES(1, &mut framebuffer);
+    gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
+    gl.FramebufferTexture2DOES(
+        gles11::FRAMEBUFFER_OES,
+        gles11::COLOR_ATTACHMENT0_OES,
+        gles11::TEXTURE_2D,
+        texture,
+        0,
+    );
+    assert_eq!(
+        gl.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES),
+        gles11::FRAMEBUFFER_COMPLETE_OES
+    );
+    (texture, framebuffer, width, height)
+}
+
+unsafe fn clear_mask_target(env: &mut Environment, framebuffer: GLuint) {
+    let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+    gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
+    gl.ClearColor(0.0, 0.0, 0.0, 0.0);
+    gl.Clear(gles11::COLOR_BUFFER_BIT);
+}
+
+unsafe fn draw_target(env: &mut Environment, texture: GLuint, opacity: f32, multiply_alpha: bool) {
+    let misc = env
+        .framework_state
+        .core_animation
+        .composition
+        .misc_gl_objects
+        .as_ref()
+        .unwrap();
+    let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+    gl.MatrixMode(gles11::PROJECTION);
+    gl.PushMatrix();
+    gl.LoadIdentity();
+    gl.MatrixMode(gles11::MODELVIEW);
+    gl.PushMatrix();
+    load_matrix(
+        gl.as_mut(),
+        Matrix::<4>::from(&Matrix::scale_2d(2.0, 2.0))
+            .multiply(&Matrix::translate_3d(-1.0, -1.0, 0.0)),
+    );
+    gl.Color4f(opacity, opacity, opacity, opacity);
+    gl.Enable(gles11::BLEND);
+    if multiply_alpha {
+        gl.BlendFunc(gles11::ZERO, gles11::SRC_ALPHA);
+    } else {
+        gl.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
+    }
+    gl.Enable(gles11::TEXTURE_2D);
+    gl.BindTexture(gles11::TEXTURE_2D, texture);
+    gl.EnableClientState(gles11::VERTEX_ARRAY);
+    gl.BindBuffer(gles11::ARRAY_BUFFER, misc.basic_square_buffer);
+    gl.VertexPointer(2, gles11::FLOAT, 0, std::ptr::null());
+    gl.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+    gl.TexCoordPointer(2, gles11::FLOAT, 0, std::ptr::null());
+    gl.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, misc.index_buffer);
+    gl.DrawElements(
+        gles11::TRIANGLES,
+        6,
+        gles11::UNSIGNED_BYTE,
+        std::ptr::null(),
+    );
+    gl.PopMatrix();
+    gl.MatrixMode(gles11::PROJECTION);
+    gl.PopMatrix();
+    gl.MatrixMode(gles11::MODELVIEW);
+}
+
+/// Apply the mask's alpha to the complete subtree, not just its image.
+/// https://developer.apple.com/documentation/quartzcore/calayer/mask
+unsafe fn composite_masked_layer(
+    env: &mut Environment,
+    state: &mut animation::State,
+    layer: id,
+    parent: Matrix<4>,
+    opacity: f32,
+    local: Matrix<4>,
+    mut host: CALayerHostObject,
+) {
+    let transform = local
+        .multiply(&host.local_to_superlayer_transform_3d())
+        .multiply(&parent);
+    let mask = host.mask;
+    let clip = host.masks_to_bounds;
+    let bounds = host.bounds;
+    let radius = host.corner_radius;
+    let group_opacity = opacity * host.opacity;
+    host.opacity = 1.0;
+    let mut previous = 0;
+    {
+        let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+        gl.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut previous);
+    }
+    let content = mask_target(env);
+    let alpha = mask_target(env);
+    clear_mask_target(env, content.1);
+    composite_layer_contents(env, state, layer, parent, 1.0, local, host);
+    if mask != nil {
+        clear_mask_target(env, alpha.1);
+        composite_layer_recursive(env, state, mask, transform, 1.0);
+        {
+            let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+            gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, content.1);
+        }
+        draw_target(env, alpha.0, 1.0, true);
+    }
+    if clip {
+        clear_mask_target(env, alpha.1);
+        let clipping = CALayerHostObject::bounds_mask(bounds, radius);
+        composite_layer_contents(
+            env,
+            state,
+            nil,
+            transform,
+            1.0,
+            Matrix::identity(),
+            clipping,
+        );
+        {
+            let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+            gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, content.1);
+        }
+        draw_target(env, alpha.0, 1.0, true);
+    }
+    {
+        let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+        gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, previous as _);
+    }
+    draw_target(env, content.0, group_opacity, false);
+    env.framework_state
+        .core_animation
+        .composition
+        .mask_targets
+        .extend([content, alpha]);
 }
 
 const FLOATS_PER_POINT: usize = 2;
@@ -1193,4 +1459,59 @@ unsafe fn upload_rgba8_pixels(
         gles11::CLAMP_TO_EDGE as _,
     );
     dimensions
+}
+
+#[cfg(test)]
+mod contents_tests {
+    use super::*;
+    fn bounds() -> CGRect {
+        CGRect {
+            origin: CGPoint { x: 10.0, y: 20.0 },
+            size: CGSize {
+                width: 100.0,
+                height: 80.0,
+            },
+        }
+    }
+    // Position gravities preserve image point size; scaling gravities preserve
+    // aspect only when requested. Nonzero bounds and Retina scale both matter.
+    // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreAnimation_guide/SettingUpLayerObjects/SettingUpLayerObjects.html
+    #[test]
+    fn gravity_preserves_native_image_size_and_alignment() {
+        let center = contents_frame(bounds(), (400, 80), 2.0, "center");
+        assert_eq!(center.origin, CGPoint { x: -40.0, y: 40.0 });
+        assert_eq!(
+            center.size,
+            CGSize {
+                width: 200.0,
+                height: 40.0
+            }
+        );
+        let top = contents_frame(bounds(), (400, 80), 2.0, "topLeft");
+        assert_eq!(top.origin, CGPoint { x: 10.0, y: 60.0 });
+        let bottom = contents_frame(bounds(), (400, 80), 2.0, "bottomRight");
+        assert_eq!(bottom.origin, CGPoint { x: -90.0, y: 20.0 });
+    }
+    #[test]
+    fn aspect_fit_and_fill_use_different_scales() {
+        let fit = contents_frame(bounds(), (400, 80), 2.0, "resizeAspect");
+        assert_eq!(
+            fit.size,
+            CGSize {
+                width: 100.0,
+                height: 20.0
+            }
+        );
+        assert_eq!(fit.origin, CGPoint { x: 10.0, y: 50.0 });
+        let fill = contents_frame(bounds(), (400, 80), 2.0, "resizeAspectFill");
+        assert_eq!(
+            fill.size,
+            CGSize {
+                width: 400.0,
+                height: 80.0
+            }
+        );
+        assert_eq!(fill.origin, CGPoint { x: -140.0, y: 20.0 });
+        assert_eq!(contents_frame(bounds(), (400, 80), 2.0, "resize"), bounds());
+    }
 }

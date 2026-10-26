@@ -97,6 +97,8 @@ pub struct Options {
     pub preserve_aspect_ratio: bool,
     pub device_family: Option<DeviceFamily>,
     pub auto_device_family: bool,
+    /// `iphone`/`ipad` select a class; model-specific names pin the hardware.
+    pub generic_device_family: bool,
     /// When set, the guest sees a screen of exactly this size (in points) and
     /// scale 1.0, instead of one of the fixed device profiles. Populated by
     /// `--device-family=auto` (from the host display) or via the explicit
@@ -139,7 +141,7 @@ pub struct Options {
     pub gles2_compat: bool,
     pub direct_memory_access: bool,
     /// CPU affinity policy for the emulator thread on Android
-    /// (`--affinity=`): `None` = default (big cores), or one of
+    /// (`--affinity=`): `None` = Android scheduler placement, or one of
     /// `all` / `off` / `big` / an explicit CPU list like `4-7`.
     pub affinity: Option<String>,
     pub gdb_listen_addrs: Option<Vec<SocketAddr>>,
@@ -200,9 +202,9 @@ pub struct Options {
     /// rotation turns the picture sideways; `--present-rotate=0` presents it
     /// as-is. `None` keeps the automatic behaviour.
     pub present_rotate: Option<u32>,
-    /// Use UIKit's actual autorotation transform when deciding whether to add
-    /// EAGL's 180-degree presentation compensation. Off by default to retain
-    /// the legacy iPad/non-portrait heuristic; opt in with `--rotation-fix`.
+    /// Reproduce the presented drawable's layer transforms in the EAGL direct
+    /// presenter. Enabled by default; --no-rotation-fix restores the legacy
+    /// iPad/non-portrait heuristic for compatibility.
     pub rotation_fix: bool,
     /// Force EAGL `initWithAPI:` to create an OpenGL ES 1.1 (fixed-function)
     /// context even when the app requested an OpenGL ES 2.0/3.x context.
@@ -292,6 +294,7 @@ impl Default for Options {
             trainer_disabled: true,
             device_family: None,
             auto_device_family: false,
+            generic_device_family: false,
             host_screen_size: None,
             initial_orientation: DeviceOrientation::Portrait,
             ios_version: None,
@@ -335,7 +338,7 @@ impl Default for Options {
             prefer_gles2_context: false,
             mach_semaphore_spurious_wake_ms: None,
             present_rotate: None,
-            rotation_fix: false,
+            rotation_fix: true,
             force_gles1_context: std::env::var("TOUCHHLE_FORCE_GLES1_CONTEXT")
                 .map(|value| {
                     let value = value.trim();
@@ -383,6 +386,26 @@ impl Default for Options {
 }
 
 impl Options {
+    pub(crate) fn device_model_for_capabilities(
+        &self,
+        preferred: DeviceFamily,
+        requirements: &[(&str, bool)],
+    ) -> Option<DeviceFamily> {
+        if self.device_family.is_none() || self.auto_device_family || self.generic_device_family {
+            preferred.model_for_capabilities(requirements)
+        } else {
+            Some(preferred)
+        }
+    }
+
+    /// iOS 8 rotates the window/screen coordinate space itself. Older iOS
+    /// versions keep portrait screen coordinates and rotate the root view.
+    /// https://developer.apple.com/documentation/uikit/uicoordinatespace
+    pub(crate) fn interface_oriented_screen_coordinates(&self) -> bool {
+        self.ios_version.unwrap_or(LATEST_IOS_VERSION).0 >= 8
+            || crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS")
+    }
+
     /// Parse the command-line argument syntax for an option. Returns `Ok(true)`
     /// if the option was valid and has been applied, or `Ok(false)` if the
     /// option was not recognized.
@@ -426,11 +449,14 @@ impl Options {
         } else if let Some(value) = arg.strip_prefix("--device-family=") {
             if value == "auto" {
                 self.auto_device_family = true;
+                self.generic_device_family = false;
                 self.device_family = None;
             } else {
                 let parsed = DeviceFamily::try_from(value)
                     .map_err(|_| "Invalid device family".to_string())?;
                 self.auto_device_family = false;
+                self.generic_device_family =
+                    matches!(value.to_ascii_lowercase().as_str(), "iphone" | "ipad");
                 self.device_family = Some(parsed);
             }
         } else if let Some(value) = arg.strip_prefix("--ios-version=") {
@@ -783,6 +809,29 @@ mod option_parsing_tests {
     use super::*;
 
     #[test]
+    fn generic_family_uses_bundle_requirements_but_specific_models_stay_pinned() {
+        let mut options = Options::default();
+        let requirements = [("gyroscope", true)];
+        options.parse_argument("--device-family=iphone").unwrap();
+        assert_eq!(
+            options.device_model_for_capabilities(options.device_family.unwrap(), &requirements),
+            Some(DeviceFamily::iPhone4)
+        );
+        options
+            .parse_argument("--device-family=iphone-3gs")
+            .unwrap();
+        assert_eq!(
+            options.device_model_for_capabilities(options.device_family.unwrap(), &requirements),
+            Some(DeviceFamily::iPhone3GS)
+        );
+        options.parse_argument("--device-family=auto").unwrap();
+        assert_eq!(
+            options.device_model_for_capabilities(DeviceFamily::iPhone3GS, &requirements),
+            Some(DeviceFamily::iPhone4)
+        );
+    }
+
+    #[test]
     fn force_composition_can_be_enabled_and_disabled() {
         let mut options = Options::default();
         assert!(!options.force_composition);
@@ -807,14 +856,14 @@ mod option_parsing_tests {
     }
 
     #[test]
-    fn rotation_fix_is_opt_in_and_can_be_disabled() {
+    fn layer_based_rotation_is_default_and_can_be_disabled() {
         let mut options = Options::default();
-        assert!(!options.rotation_fix);
-
-        assert!(options.parse_argument("--rotation-fix").unwrap());
         assert!(options.rotation_fix);
 
         assert!(options.parse_argument("--no-rotation-fix").unwrap());
         assert!(!options.rotation_fix);
+
+        assert!(options.parse_argument("--rotation-fix").unwrap());
+        assert!(options.rotation_fix);
     }
 }

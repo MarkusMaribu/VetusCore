@@ -12,6 +12,9 @@ use crate::frameworks::core_graphics::cg_bitmap_context::{
 use crate::frameworks::core_graphics::cg_context::{
     CGContextRef, CGContextRelease, CGContextRetain,
 };
+use crate::frameworks::core_graphics::cg_image::{
+    kCGImageAlphaNoneSkipLast, kCGImageAlphaPremultipliedLast, kCGImageByteOrder32Big,
+};
 use crate::frameworks::core_graphics::{CGFloat, CGRect, CGSize};
 use crate::mem::MutVoidPtr;
 use crate::objc::{id, msg_class, nil};
@@ -55,11 +58,11 @@ pub fn UIGraphicsGetCurrentContext(env: &mut Environment) -> CGContextRef {
 
 /// Begin an offscreen bitmap context sized `size` at `scale`.
 /// Pass `scale` = 0.0 to use the main screen scale (we treat that as 1.0).
-/// `opaque` = true omits the alpha channel (we always use RGBA for simplicity).
+/// `opaque` = true omits the alpha channel (with a padding byte per pixel).
 fn UIGraphicsBeginImageContextWithOptions(
     env: &mut Environment,
     size: CGSize,
-    _opaque: bool,
+    opaque: bool,
     scale: CGFloat,
 ) {
     let effective_scale = if scale == 0.0 { 1.0 } else { scale };
@@ -76,18 +79,19 @@ fn UIGraphicsBeginImageContextWithOptions(
     }
 
     let bytes_per_row = width * 4;
-    let data: MutVoidPtr = env.mem.alloc(bytes_per_row * height).cast();
-
-    // kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big = 0x00020008
+    // Let the bitmap context own the buffer. The old magic value 0x20008
+    // described neither a valid alpha layout nor a supported byte order,
+    // causing transparent image pixels to replace the background with black.
+    let alpha = if opaque { kCGImageAlphaNoneSkipLast } else { kCGImageAlphaPremultipliedLast };
     let context = CGBitmapContextCreate(
         env,
-        data,
+        MutVoidPtr::null(),
         width as _,
         height as _,
         8,
         bytes_per_row as _,
         nil, // device RGB
-        0x0002_0008,
+        alpha | kCGImageByteOrder32Big,
     );
 
     if context.is_null() {

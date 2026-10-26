@@ -72,6 +72,20 @@ unsafe fn current_bound_texture(gles: &mut dyn GLES, target: GLenum) -> Option<G
     GLuint::try_from(texture).ok()
 }
 
+/// An image upload addresses one cube face, but texture parameters address
+/// the cube object. Forwarding the face to glTexParameteri raises INVALID_ENUM.
+/// https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glTexParameter.xml
+unsafe fn set_uploaded_texture_min_filter(gles: &mut dyn GLES, image_target: GLenum) {
+    let texture_target = if (TEXTURE_CUBE_MAP_POSITIVE_X..=TEXTURE_CUBE_MAP_NEGATIVE_Z)
+        .contains(&image_target)
+    {
+        TEXTURE_CUBE_MAP
+    } else {
+        image_target
+    };
+    gles.TexParameteri(texture_target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+}
+
 fn pvrtc_subimage_matches_level(
     texture_level: Option<(GLsizei, GLsizei, GLenum)>,
     xoffset: GLint,
@@ -275,8 +289,8 @@ where
 
 fn glGetError(env: &mut Environment) -> GLenum {
     let ignore_gl_errors = env.options.ignore_gl_errors;
-    with_ctx_and_mem(env, |gles, _mem| {
-        let err = unsafe { gles.GetError() };
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| {
+        let err = unsafe { guest_gl_error(gles, shadow) };
         if err != 0 {
             if ignore_gl_errors {
                 return 0;
@@ -1383,7 +1397,7 @@ fn glGetTexParameteriv(
     params: MutPtr<GLint>,
 ) {
     with_ctx_and_mem(env, |gles, mem| {
-        let params = mem.ptr_at_mut(params, 1);
+        let params = mem.ptr_at_mut(params, if pname == gles11::TEXTURE_CROP_RECT_OES { 4 } else { 1 });
         unsafe { gles.GetTexParameteriv(target, pname, params) }
     })
 }
@@ -1394,7 +1408,7 @@ fn glGetTexParameterfv(
     params: MutPtr<GLfloat>,
 ) {
     with_ctx_and_mem(env, |gles, mem| {
-        let params = mem.ptr_at_mut(params, 1);
+        let params = mem.ptr_at_mut(params, if pname == gles11::TEXTURE_CROP_RECT_OES { 4 } else { 1 });
         unsafe { gles.GetTexParameterfv(target, pname, params) }
     })
 }
@@ -1405,7 +1419,7 @@ fn glGetTexParameterxv(
     params: MutPtr<GLfixed>,
 ) {
     with_ctx_and_mem(env, |gles, mem| {
-        let params = mem.ptr_at_mut(params, 1);
+        let params = mem.ptr_at_mut(params, if pname == gles11::TEXTURE_CROP_RECT_OES { 4 } else { 1 });
         unsafe { gles.GetTexParameterxv(target, pname, params) }
     })
 }
@@ -2778,18 +2792,12 @@ fn glTexParameteri(env: &mut Environment, target: GLenum, pname: GLenum, param: 
             );
         }
     }
-    if pname == gles11::TEXTURE_CROP_RECT_OES {
-        return;
-    }
     let param = maybe_demipmap_min_filter(env, pname, param);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.TexParameteri(target, pname, param)
     })
 }
 fn glTexParameterf(env: &mut Environment, target: GLenum, pname: GLenum, param: GLfloat) {
-    if pname == gles11::TEXTURE_CROP_RECT_OES {
-        return;
-    }
     // Floats can also be used to pass enum-valued min-filter params (an
     // OpenGL quirk), so route them through the same substitution.
     let param = maybe_demipmap_min_filter(env, pname, param as GLint) as GLfloat;
@@ -2798,38 +2806,39 @@ fn glTexParameterf(env: &mut Environment, target: GLenum, pname: GLenum, param: 
     })
 }
 fn glTexParameterx(env: &mut Environment, target: GLenum, pname: GLenum, param: GLfixed) {
-    if pname == gles11::TEXTURE_CROP_RECT_OES {
-        return;
-    }
     // Fixed-point can also encode enum values; route through substitution.
     let param = maybe_demipmap_min_filter(env, pname, param) as GLfixed;
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.TexParameterx(target, pname, param)
     })
 }
+/// Crop rectangles are texture-object state used by every DrawTex variant.
+/// Forward all four signed components, including negative sizes for flipping.
+/// https://registry.khronos.org/OpenGL/extensions/OES/OES_draw_texture.txt
+/// https://developer.apple.com/documentation/opengles/gl_oes_draw_texture
+enum TextureCropVector {
+    Integer(ConstPtr<GLint>),
+    Float(ConstPtr<GLfloat>),
+    Fixed(ConstPtr<GLfixed>),
+}
+
+unsafe fn dispatch_texture_crop_rect(
+    gles: &mut dyn GLES, mem: &Mem, target: GLenum, vector: TextureCropVector,
+) {
+    match vector {
+        TextureCropVector::Integer(params) =>
+            gles.TexParameteriv(target, gles11::TEXTURE_CROP_RECT_OES, mem.ptr_at(params, 4)),
+        TextureCropVector::Float(params) =>
+            gles.TexParameterfv(target, gles11::TEXTURE_CROP_RECT_OES, mem.ptr_at(params, 4)),
+        TextureCropVector::Fixed(params) =>
+            gles.TexParameterxv(target, gles11::TEXTURE_CROP_RECT_OES, mem.ptr_at(params, 4)),
+    }
+}
+
 fn glTexParameteriv(env: &mut Environment, target: GLenum, pname: GLenum, params: ConstPtr<GLint>) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
-            return;
-        }
-
         with_ctx_and_mem(env, |gles, mem| unsafe {
-            let params_ptr = mem.ptr_at(params, 4);
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static SEEN: AtomicBool = AtomicBool::new(false);
-                if !SEEN.swap(true, Ordering::Relaxed) {
-                    let crop = from_raw_parts(params_ptr, 4);
-                    log!(
-                        "TOUCHHLE_ENABLE_TEXTURE_CROP_RECT=1: first glTexParameteriv(GL_TEXTURE_CROP_RECT_OES) = [{}, {}, {}, {}]",
-                        crop[0],
-                        crop[1],
-                        crop[2],
-                        crop[3]
-                    );
-                }
-            }
-            gles.TexParameteriv(target, pname, params_ptr)
+            dispatch_texture_crop_rect(gles, mem, target, TextureCropVector::Integer(params));
         });
         return;
     }
@@ -2855,27 +2864,8 @@ fn glTexParameterfv(
     params: ConstPtr<GLfloat>,
 ) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
-            return;
-        }
-
         with_ctx_and_mem(env, |gles, mem| unsafe {
-            let params_ptr = mem.ptr_at(params, 4);
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static SEEN: AtomicBool = AtomicBool::new(false);
-                if !SEEN.swap(true, Ordering::Relaxed) {
-                    let crop = from_raw_parts(params_ptr, 4);
-                    log!(
-                        "TOUCHHLE_ENABLE_TEXTURE_CROP_RECT=1: first glTexParameterfv(GL_TEXTURE_CROP_RECT_OES) = [{}, {}, {}, {}]",
-                        crop[0],
-                        crop[1],
-                        crop[2],
-                        crop[3]
-                    );
-                }
-            }
-            gles.TexParameterfv(target, pname, params_ptr)
+            dispatch_texture_crop_rect(gles, mem, target, TextureCropVector::Float(params));
         });
         return;
     }
@@ -2901,27 +2891,8 @@ fn glTexParameterxv(
     params: ConstPtr<GLfixed>,
 ) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
-            return;
-        }
-
         with_ctx_and_mem(env, |gles, mem| unsafe {
-            let params_ptr = mem.ptr_at(params, 4);
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static SEEN: AtomicBool = AtomicBool::new(false);
-                if !SEEN.swap(true, Ordering::Relaxed) {
-                    let crop = from_raw_parts(params_ptr, 4);
-                    log!(
-                        "TOUCHHLE_ENABLE_TEXTURE_CROP_RECT=1: first glTexParameterxv(GL_TEXTURE_CROP_RECT_OES) = [{}, {}, {}, {}]",
-                        crop[0],
-                        crop[1],
-                        crop[2],
-                        crop[3]
-                    );
-                }
-            }
-            gles.TexParameterxv(target, pname, params_ptr)
+            dispatch_texture_crop_rect(gles, mem, target, TextureCropVector::Fixed(params));
         });
         return;
     }
@@ -3117,7 +3088,7 @@ fn glTexImage2D(
                     "First fix_texture_min_filter override: forcing GL_TEXTURE_MIN_FILTER=GL_LINEAR after glTexImage2D(level=0) [this log will only be shown once]"
                 );
             }
-            gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+            set_uploaded_texture_min_filter(gles, target);
         }
     })
 }
@@ -3261,7 +3232,7 @@ fn glCompressedTexImage2D(
                 }
             }
             if fix_filter {
-                gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                set_uploaded_texture_min_filter(gles, target);
             }
             return;
         }
@@ -3295,7 +3266,7 @@ fn glCompressedTexImage2D(
                     }
                 }
                 if fix_filter {
-                    gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                    set_uploaded_texture_min_filter(gles, target);
                 }
                 return;
             }
@@ -3362,7 +3333,7 @@ fn glCompressedTexImage2D(
         }
 
         if fix_filter {
-            gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+            set_uploaded_texture_min_filter(gles, target);
         }
     })
 }
@@ -4696,24 +4667,6 @@ fn normalize_shader_preprocessor_whitespace(source: &str) -> String {
     out
 }
 
-fn normalize_asphalt8_shader_source(source: &str) -> String {
-    source
-        .replace("#endif]", "#endif")
-        .replace("||\r\n", "|| ")
-        .replace("||\n", "|| ")
-        .replace("|| \r\n", "|| ")
-        .replace("|| \n", "|| ")
-        .replace("&&\r\n", "&& ")
-        .replace("&&\n", "&& ")
-        .replace("&& \r\n", "&& ")
-        .replace("&& \n", "&& ")
-        .replace("vec3(1,1,1)", "vec3(1.0, 1.0, 1.0)")
-        .replace("vec4(0.5, 0, 0, 0)", "vec4(0.5, 0.0, 0.0, 0.0)")
-        .replace("vec4(0, 0.5, 0, 0)", "vec4(0.0, 0.5, 0.0, 0.0)")
-        .replace("vec4(0, 0, 0.5, 0)", "vec4(0.0, 0.0, 0.5, 0.0)")
-        .replace("vec4(0.5, 0.5, 0.5, 1)", "vec4(0.5, 0.5, 0.5, 1.0)")
-}
-
 /// Move every `#extension` directive to the top of the shader source (right
 /// after the `#version` line, if any). GLSL ES requires extension directives
 /// to appear before any non-preprocessor tokens; strict compilers (ANGLE,
@@ -5864,7 +5817,6 @@ fn glShaderSource(
     //    uniform `CC_PMatrix` declared as type `f16mat4` and type `mat4`.
     let src = String::from_utf8_lossy(&raw_source);
     let src = normalize_shader_preprocessor_whitespace(&src);
-    let src = normalize_asphalt8_shader_source(&src);
     // 3. Hoist `#extension` directives to the top — strict compilers (ANGLE
     //    etc.) reject them after non-preprocessor tokens; see
     //    `hoist_shader_extension_directives`.
@@ -6956,13 +6908,106 @@ fn glTexStorage2D(
     height: GLsizei,
 ) {
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
-        let bound_texture = current_bound_texture(gles, target);
-        gles.TexStorage2D(target, levels, internalformat, width, height);
-        if let Some(texture) = bound_texture {
-            shadow.forget_pvrtc_texture(texture);
-        }
+        texture_storage_2d(gles, shadow, target, levels, internalformat, width, height);
     });
 }
+
+unsafe fn texture_storage_2d(
+    gles: &mut dyn GLES,
+    shadow: &mut GLShadowState,
+    target: GLenum,
+    levels: GLsizei,
+    internalformat: GLenum,
+    width: GLsizei,
+    height: GLsizei,
+) {
+    let bound_texture = current_bound_texture(gles, target);
+    // Distinguish this allocation's errors from old sticky error flags without
+    // consuming either from the guest's point of view. A failed allocation
+    // must leave the previous format/dimension mirror intact.
+    preserve_driver_errors(gles, shadow);
+    let is_pvrtc = crate::gles::util::pvrtc_format_properties(internalformat).is_some();
+    if is_pvrtc
+        && (width <= 0
+            || height <= 0
+            || !(width as u32).is_power_of_two()
+            || !(height as u32).is_power_of_two())
+    {
+        if !shadow.pending_guest_errors.contains(&gles11::INVALID_VALUE) {
+            shadow.pending_guest_errors.push_back(gles11::INVALID_VALUE);
+        }
+        return;
+    }
+    // Match the mutable PVRTC decode path: use host RGBA8 storage, while
+    // retaining the guest compressed format for full-level subimage uploads.
+    // Calling TexStorage2D preserves the host's immutable-storage contract.
+    // https://registry.khronos.org/OpenGL/extensions/EXT/EXT_texture_storage.txt
+    let host_format = if is_pvrtc {
+        gles11::RGBA8_OES
+    } else {
+        internalformat
+    };
+    gles.TexStorage2D(target, levels, host_format, width, height);
+    if preserve_driver_errors(gles, shadow) {
+        return;
+    }
+    let Some(texture) = bound_texture.filter(|&texture| texture != 0) else {
+        return;
+    };
+    shadow.forget_pvrtc_texture(texture);
+    if is_pvrtc && levels > 0 && levels <= 32 && width > 0 && height > 0 {
+        let faces = if target == TEXTURE_CUBE_MAP {
+            TEXTURE_CUBE_MAP_POSITIVE_X..=TEXTURE_CUBE_MAP_NEGATIVE_Z
+        } else {
+            target..=target
+        };
+        for face in faces {
+            let (mut width, mut height) = (width, height);
+            for level in 0..levels {
+                shadow.record_pvrtc_texture_level(
+                    face,
+                    texture,
+                    level,
+                    width,
+                    height,
+                    internalformat,
+                );
+                width = (width / 2).max(1);
+                height = (height / 2).max(1);
+            }
+        }
+    }
+}
+
+/// Return error flags preserved by an internal validation query before asking
+/// the driver. OpenGL leaves error-return order implementation-dependent.
+unsafe fn guest_gl_error(gles: &mut dyn GLES, shadow: &mut GLShadowState) -> GLenum {
+    shadow
+        .pending_guest_errors
+        .pop_front()
+        .unwrap_or_else(|| gles.GetError())
+}
+
+unsafe fn preserve_driver_errors(gles: &mut dyn GLES, shadow: &mut GLShadowState) -> bool {
+    let mut any = false;
+    // GL has a finite set of error flags. Bound the loop for a broken driver
+    // that repeatedly reports an error without clearing it.
+    for _ in 0..16 {
+        let error = gles.GetError();
+        if error == gles11::NO_ERROR {
+            break;
+        }
+        any = true;
+        if !shadow.pending_guest_errors.contains(&error) {
+            shadow.pending_guest_errors.push_back(error);
+        }
+    }
+    any
+}
+
+#[cfg(test)]
+#[path = "gles_texture_storage_tests.rs"]
+mod texture_storage_tests;
 
 fn glTexStorage2DEXT(
     env: &mut Environment,
@@ -8705,17 +8750,15 @@ mod pvrtc_subimage_matching_tests {
 
 #[cfg(test)]
 mod shader_preprocessor_normalization_tests {
-    use super::{normalize_asphalt8_shader_source, normalize_shader_preprocessor_whitespace};
+    use super::normalize_shader_preprocessor_whitespace;
 
     #[test]
-    fn normalizes_asphalt8_multiline_and_numeric_shader_tokens() {
-        let src = "#if FOO ||\n BAR\n#endif]\nvec3(1,1,1); vec4(0.5, 0, 0, 0);";
-        let out = normalize_asphalt8_shader_source(src);
-        assert!(out.contains("FOO ||"));
-        assert!(!out.contains("||\n"));
-        assert!(out.contains("#endif\n"));
-        assert!(out.contains("vec3(1.0, 1.0, 1.0)"));
-        assert!(out.contains("vec4(0.5, 0.0, 0.0, 0.0)"));
+    fn preserves_shader_expressions_and_numeric_constructor_arguments() {
+        // glShaderSource must not rewrite particular expressions or join
+        // unescaped newlines. Preprocessor line boundaries are significant.
+        // https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glShaderSource.xml
+        let src = "#if FOO ||\n BAR\n#endif\nvec3(1,1,1); vec4(0.5, 0, 0, 0);";
+        assert_eq!(normalize_shader_preprocessor_whitespace(src), src);
     }
 
     #[test]
@@ -9024,5 +9067,90 @@ mod vertex_attrib_vector_tests {
             assert_eq!(driver.index, 7);
             assert_eq!(driver.values, expected[..components]);
         }
+    }
+}
+
+#[cfg(test)]
+mod uploaded_texture_filter_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Driver {
+        filters: Vec<(GLenum, GLenum, GLint)>,
+    }
+
+    impl GLES for Driver {
+        unsafe fn TexParameteri(&mut self, target: GLenum, pname: GLenum, value: GLint) {
+            // Match the ES2 driver's accepted object targets. Cube faces are
+            // valid TexImage2D targets, but invalid TexParameter targets.
+            assert!(matches!(target, gles11::TEXTURE_2D | TEXTURE_CUBE_MAP));
+            self.filters.push((target, pname, value));
+        }
+    }
+
+    #[test]
+    fn upload_filter_uses_cube_object_for_every_face() {
+        let mut driver = Driver::default();
+        for face in TEXTURE_CUBE_MAP_POSITIVE_X..=TEXTURE_CUBE_MAP_NEGATIVE_Z {
+            unsafe { set_uploaded_texture_min_filter(&mut driver, face) };
+        }
+        assert_eq!(driver.filters.len(), 6);
+        for filter in &driver.filters {
+            assert_eq!(*filter, (TEXTURE_CUBE_MAP, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint));
+        }
+        unsafe { set_uploaded_texture_min_filter(&mut driver, gles11::TEXTURE_2D) };
+        assert_eq!(driver.filters.last().unwrap().0, gles11::TEXTURE_2D);
+    }
+}
+
+#[cfg(test)]
+mod texture_crop_rect_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Capture {
+        calls: Vec<(GLenum, GLenum, Vec<f64>)>,
+    }
+    impl GLES for Capture {
+        unsafe fn TexParameteriv(&mut self, target: GLenum, pname: GLenum, values: *const GLint) {
+            self.calls.push((target, pname, std::slice::from_raw_parts(values,4).iter().map(|v| *v as f64).collect()));
+        }
+        unsafe fn TexParameterfv(&mut self, target: GLenum, pname: GLenum, values: *const GLfloat) {
+            self.calls.push((target, pname, std::slice::from_raw_parts(values,4).iter().map(|v| *v as f64).collect()));
+        }
+        unsafe fn TexParameterxv(&mut self, target: GLenum, pname: GLenum, values: *const GLfixed) {
+            self.calls.push((target, pname, std::slice::from_raw_parts(values,4).iter().map(|v| *v as f64).collect()));
+        }
+    }
+    // A sprite atlas crop and a vertically flipped crop must both reach the
+    // host. No opt-in environment variable is required by OES_draw_texture.
+    #[test]
+    fn integer_and_fixed_crops_preserve_offsets_and_signed_dimensions() {
+        let mut mem = Mem::new();
+        let ptr = mem.alloc(16).cast::<GLint>();
+        let mut driver = Capture::default();
+        for expected in [[17, 29, 128, 64], [0, 256, 256, -256]] {
+            for (i, value) in expected.iter().enumerate() { mem.write(ptr+i as u32,*value); }
+            unsafe {
+                dispatch_texture_crop_rect(&mut driver,&mem,gles11::TEXTURE_2D,TextureCropVector::Integer(ptr.cast_const()));
+                dispatch_texture_crop_rect(&mut driver,&mem,gles11::TEXTURE_2D,TextureCropVector::Fixed(ptr.cast_const()));
+            }
+            for call in &driver.calls[driver.calls.len()-2..] {
+                assert_eq!(call.0,gles11::TEXTURE_2D);
+                assert_eq!(call.1,gles11::TEXTURE_CROP_RECT_OES);
+                assert_eq!(call.2,expected.map(|v|v as f64));
+            }
+        }
+        assert_eq!(driver.calls.len(),4);
+    }
+    #[test]
+    fn float_crop_reaches_host_without_scalar_enum_conversion() {
+        let mut mem = Mem::new();
+        let ptr = mem.alloc(16).cast::<GLfloat>();
+        let expected = [-12.5f32, 128.0, 64.0, -80.0];
+        for (i,value) in expected.iter().enumerate() { mem.write(ptr+i as u32,*value); }
+        let mut driver = Capture::default();
+        unsafe { dispatch_texture_crop_rect(&mut driver,&mem,gles11::TEXTURE_2D,TextureCropVector::Float(ptr.cast_const())); }
+        assert_eq!(driver.calls.len(),1);
+        assert_eq!(driver.calls[0].2,expected.map(|v|v as f64));
     }
 }

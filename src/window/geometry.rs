@@ -5,6 +5,85 @@
  */
 //! Coordinate conversions shared by window presentation and input.
 
+use super::DeviceOrientation;
+use crate::frameworks::core_graphics::CGRect;
+use crate::matrix::Matrix;
+
+/// One coordinate-space policy for UIKit geometry, presentation and input.
+/// iOS 8 moved screen/window coordinates into the interface orientation;
+/// physical display dimensions and motion sensor coordinates stay fixed.
+/// https://developer.apple.com/documentation/uikit/uicoordinatespace
+#[derive(Clone, Copy)]
+pub(super) struct ScreenCoordinates {
+    interface_oriented: bool,
+}
+
+impl ScreenCoordinates {
+    pub(super) fn new(options: &crate::options::Options) -> Self {
+        Self {
+            interface_oriented: options.interface_oriented_screen_coordinates(),
+        }
+    }
+
+    pub(super) fn size(self, portrait: (u32, u32), orientation: DeviceOrientation) -> (u32, u32) {
+        if self.interface_oriented
+            && matches!(
+                orientation,
+                DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
+            )
+        {
+            (portrait.1, portrait.0)
+        } else {
+            portrait
+        }
+    }
+
+    pub(super) fn rotation(self, orientation: DeviceOrientation) -> Matrix<2> {
+        if self.interface_oriented {
+            return Matrix::identity();
+        }
+        use std::f32::consts::{FRAC_PI_2, PI};
+        match orientation {
+            DeviceOrientation::Portrait => Matrix::identity(),
+            DeviceOrientation::PortraitUpsideDown => Matrix::z_rotation(PI),
+            DeviceOrientation::LandscapeLeft => Matrix::z_rotation(-FRAC_PI_2),
+            DeviceOrientation::LandscapeRight => Matrix::z_rotation(FRAC_PI_2),
+        }
+    }
+
+    pub(super) fn frame_to_viewport(
+        self,
+        frame: CGRect,
+        portrait: (u32, u32),
+        orientation: DeviceOrientation,
+        viewport: (u32, u32, u32, u32),
+    ) -> (i32, i32, i32, i32) {
+        let (width, height) = self.size(portrait, orientation);
+        let (vx, vy, vw, vh) = viewport;
+        if width == 0 || height == 0 || vw == 0 || vh == 0 {
+            return (0, 0, 0, 0);
+        }
+        let rotation = self.rotation(orientation);
+        let mut low = [f32::INFINITY; 2];
+        let mut high = [f32::NEG_INFINITY; 2];
+        for x in [frame.origin.x, frame.origin.x + frame.size.width] {
+            for y in [frame.origin.y, frame.origin.y + frame.size.height] {
+                let point = rotation.transform([x / width as f32 - 0.5, y / height as f32 - 0.5]);
+                for axis in 0..2 {
+                    low[axis] = low[axis].min(point[axis]);
+                    high[axis] = high[axis].max(point[axis]);
+                }
+            }
+        }
+        (
+            (vx as f32 + (low[0] + 0.5) * vw as f32).round() as i32,
+            (vy as f32 + (low[1] + 0.5) * vh as f32).round() as i32,
+            ((high[0] - low[0]) * vw as f32).round().max(0.0) as i32,
+            ((high[1] - low[1]) * vh as f32).round().max(0.0) as i32,
+        )
+    }
+}
+
 /// Convert SDL window coordinates to drawable pixels. Query both sizes from
 /// the same window; their ratio can change when moving between displays.
 pub(super) fn window_to_drawable(
@@ -47,6 +126,20 @@ pub(super) fn fit_viewport(
     (x, y, scaled_width, scaled_height)
 }
 
+/// Choose the same presentation region for rendering and touch input.
+#[cfg(any(feature = "embedded", test))]
+pub(super) fn display_viewport(
+    app: (u32, u32),
+    screen: (u32, u32),
+    preserve_aspect_ratio: bool,
+) -> (u32, u32, u32, u32) {
+    if preserve_aspect_ratio {
+        fit_viewport(app, screen)
+    } else {
+        (0, 0, screen.0, screen.1)
+    }
+}
+
 /// Map coordinates to a unit square centered on the viewport. Coordinates
 /// outside the viewport are clamped to its edges (-0.5 and 0.5).
 /// An empty viewport maps to the center, avoiding division by zero while hidden.
@@ -68,12 +161,127 @@ mod tests {
     use super::*;
 
     #[test]
+    fn versioned_screen_coordinates_keep_rendering_and_input_in_the_same_space() {
+        // These are screen-space contracts, not device-rotation overrides.
+        // https://developer.apple.com/documentation/uikit/uicoordinatespace
+        let portrait = (320, 568);
+        let landscape = DeviceOrientation::LandscapeLeft;
+        let mut options = crate::options::Options::default();
+        for (version, expected_size, top_left) in [
+            ((7, 1, 2), (320, 568), [320.0, 0.0]),
+            ((8, 0, 0), (568, 320), [0.0, 0.0]),
+            ((12, 0, 0), (568, 320), [0.0, 0.0]),
+        ] {
+            options.ios_version = Some(version);
+            let coordinates = ScreenCoordinates::new(&options);
+            assert_eq!(coordinates.size(portrait, landscape), expected_size);
+            for orientation in [
+                DeviceOrientation::Portrait,
+                DeviceOrientation::PortraitUpsideDown,
+            ] {
+                assert_eq!(coordinates.size(portrait, orientation), portrait);
+            }
+            assert_eq!(
+                coordinates.size(portrait, DeviceOrientation::LandscapeRight),
+                expected_size
+            );
+            let mapped = coordinates
+                .rotation(landscape)
+                .inverse()
+                .unwrap()
+                .transform([-0.5, -0.5]);
+            let actual = [
+                (mapped[0] + 0.5) * expected_size.0 as f32,
+                (mapped[1] + 0.5) * expected_size.1 as f32,
+            ];
+            for axis in 0..2 {
+                assert!((actual[axis] - top_left[axis]).abs() < 0.001);
+            }
+            let full = CGRect {
+                origin: Default::default(),
+                size: crate::frameworks::core_graphics::CGSize {
+                    width: expected_size.0 as f32,
+                    height: expected_size.1 as f32,
+                },
+            };
+            // A full-screen host control must cover exactly the same viewport
+            // as the rendered scene, including letterbox offsets.
+            assert_eq!(
+                coordinates.frame_to_viewport(full, portrait, landscape, (100, 40, 1136, 640)),
+                (100, 40, 1136, 640)
+            );
+        }
+    }
+
+    #[test]
+    fn modern_and_legacy_host_control_rectangles_follow_their_screen_space() {
+        use crate::frameworks::core_graphics::{CGPoint, CGSize};
+        let frame = CGRect {
+            origin: CGPoint { x: 20.0, y: 30.0 },
+            size: CGSize {
+                width: 40.0,
+                height: 50.0,
+            },
+        };
+        let mut options = crate::options::Options::default();
+        options.ios_version = Some((8, 0, 0));
+        assert_eq!(
+            ScreenCoordinates::new(&options).frame_to_viewport(
+                frame,
+                (320, 480),
+                DeviceOrientation::LandscapeLeft,
+                (10, 20, 960, 640)
+            ),
+            (50, 80, 80, 100)
+        );
+        options.ios_version = Some((7, 1, 2));
+        assert_eq!(
+            ScreenCoordinates::new(&options).frame_to_viewport(
+                frame,
+                (320, 480),
+                DeviceOrientation::LandscapeLeft,
+                (10, 20, 960, 640)
+            ),
+            (70, 540, 100, 80)
+        );
+    }
+
+    #[test]
     fn matching_sizes_preserve_coordinates() {
         assert_eq!(fit_viewport((480, 320), (480, 320)), (0, 0, 480, 320));
         assert_eq!(
             window_to_drawable((123.0, 45.0), (480, 320), (480, 320)),
             (123.0, 45.0)
         );
+    }
+
+    #[test]
+    fn stretching_fills_portrait_and_landscape_and_keeps_touch_edges_aligned() {
+        for app in [(320, 480), (320, 568), (768, 1024)] {
+            for (app, screen) in [(app, (1080, 2200)), ((app.1, app.0), (2200, 1080))] {
+                assert_eq!(
+                    display_viewport(app, screen, true),
+                    fit_viewport(app, screen)
+                );
+                let viewport = display_viewport(app, screen, false);
+                assert_eq!(viewport, (0, 0, screen.0, screen.1));
+                assert_eq!(
+                    normalize_viewport_coords((0.0, 0.0), viewport),
+                    (-0.5, -0.5)
+                );
+                assert_eq!(
+                    normalize_viewport_coords((screen.0 as f32, screen.1 as f32), viewport),
+                    (0.5, 0.5)
+                );
+                assert_eq!(
+                    normalize_viewport_coords(
+                        (screen.0 as f32 / 2.0, screen.1 as f32 / 2.0),
+                        viewport,
+                    ),
+                    (0.0, 0.0)
+                );
+            }
+        }
     }
 
     #[test]

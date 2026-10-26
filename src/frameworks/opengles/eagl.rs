@@ -8,8 +8,8 @@
 use super::software_vao::VertexArrayState;
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_animation::ca_eagl_layer::{
-    find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, mark_presented_directly,
-    present_pixels,
+    drawable_present_rotation, find_fullscreen_eagl_layer, get_pixels_vec_for_presenting,
+    mark_presented_directly, present_pixels,
 };
 use crate::frameworks::core_graphics::{CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
@@ -175,6 +175,9 @@ pub(super) struct GLShadowState {
     pub(super) guest_bound_attribs: HashMap<GLuint, std::collections::HashSet<String>>,
     /// Dimensions and format for PVRTC levels expanded to RGBA storage.
     pub(super) pvrtc_texture_levels: HashMap<(GLenum, GLuint, GLint), (GLsizei, GLsizei, GLenum)>,
+    /// Errors observed while checking a software-emulated texture operation.
+    /// Keep them available to the guest's next glGetError calls.
+    pub(super) pending_guest_errors: std::collections::VecDeque<GLenum>,
     pub(super) current_vertex_array: GLuint,
     pub(super) software_vertex_arrays: HashSet<GLuint>,
     pub(super) software_vao_element_array_buffers: HashMap<GLuint, GLuint>,
@@ -199,6 +202,7 @@ impl Default for GLShadowState {
             generic_attribs_used: false,
             guest_bound_attribs: HashMap::new(),
             pvrtc_texture_levels: HashMap::new(),
+            pending_guest_errors: Default::default(),
             current_vertex_array: 0,
             software_vertex_arrays: HashSet::new(),
             software_vao_element_array_buffers: HashMap::new(),
@@ -2526,7 +2530,7 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
 unsafe fn present_renderbuffer(
     env: &mut Environment,
     renderbuffer: GLuint,
-    _drawable: id,
+    drawable: id,
     options: EaglPresentOptions,
     context_token: usize,
 ) {
@@ -2538,28 +2542,12 @@ unsafe fn present_renderbuffer(
     let viewport = env.window.as_mut().unwrap().viewport();
     let device_family = env.window.as_mut().unwrap().device_family();
     let device_orientation = env.window.as_mut().unwrap().current_rotation();
-    // For iPad apps in a non-portrait orientation, the UIKit auto-rotation
-    // path (`UIWindow addSubview:` in ui_window.rs) applies a rotation
-    // transform to the rootViewController's view so that the app, which
-    // typically draws content "upright" inside the EAGL layer's portrait
-    // bounds, ends up rotated for landscape display when Core Animation
-    // composites it. touchHLE bypasses CA composition for EAGL apps that
-    // call `presentRenderbuffer:` directly, so we have to replicate that
-    // additional rotation here. Without it, iPad landscape games (e.g.
-    // Plants vs. Zombies HD) render upside-down. iPhone-only landscape
-    // games (e.g. Plants vs. Zombies, the iPhone version) typically rotate
-    // their drawing themselves, so we must NOT apply the extra rotation
-    // for them.
-    // By default, retain the legacy iPad/non-portrait heuristic. The opt-in
-    // `--rotation-fix` path instead checks whether UIKit actually applied the
-    // autorotation transform, avoiding an extra 180-degree turn for apps that
-    // do not rotate their root view.
-    let rotation_compensation_trigger = if env.options.rotation_fix {
-        env.framework_state.uikit.autorotation_transform_applied
-    } else {
-        device_family.is_ipad()
-    };
-    let needs_autorotation_compensation = rotation_compensation_trigger
+    // The default direct presenter reproduces the active drawable's layer
+    // transforms rather than guessing from iPad hardware or whether UIKit
+    // ever rotated some other view (such as an intro movie).
+    // Keep the old heuristic only for an explicit --no-rotation-fix override.
+    let needs_autorotation_compensation = !env.options.rotation_fix
+        && device_family.is_ipad()
         && !matches!(
             device_orientation,
             crate::window::DeviceOrientation::Portrait
@@ -2570,14 +2558,27 @@ unsafe fn present_renderbuffer(
             "TOUCHHLE_DISABLE_PRESENT_ROTATION=1: presenting EAGL renderbuffer without texture rotation"
         );
         crate::matrix::Matrix::<2>::identity()
+    } else if options.skip_rotation {
+        crate::matrix::Matrix::<2>::identity()
+    } else if env.options.rotation_fix {
+        let Some(rotation) = drawable_present_rotation(
+            &env.objc,
+            drawable,
+            env.window.as_ref().unwrap().screen_coordinate_rotation(),
+        ) else {
+            // A collapsed/singular layer has no drawable area to present.
+            return;
+        };
+        log_once!("EAGL presenter: using the active drawable's layer transforms for rotation");
+        rotation
     } else if needs_autorotation_compensation {
         env.window
             .as_mut()
             .unwrap()
-            .rotation_matrix()
+            .screen_coordinate_rotation()
             .multiply(&crate::matrix::Matrix::z_rotation(std::f32::consts::PI))
     } else {
-        env.window.as_mut().unwrap().rotation_matrix()
+        env.window.as_mut().unwrap().screen_coordinate_rotation()
     };
     // Fixed present-rotation override: the `--present-rotate=N` option (per-app
     // via the default options file) takes precedence, then the live

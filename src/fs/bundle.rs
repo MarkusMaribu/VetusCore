@@ -10,7 +10,7 @@ use crate::libc::time::{calendar_date_to_timestamp, time_t, tm};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::io::{Cursor, Read};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use zip::result::ZipError;
@@ -172,7 +172,7 @@ impl BundleData {
             BundleData::HostDirectory(path) => FsNode::from_host_dir(&path, false),
             BundleData::Zip { zip, bundle_path } => {
                 let archive = Rc::new(RefCell::new(zip));
-                let archive_cache = Rc::new(RefCell::new(HashMap::new()));
+                let archive_cache = Rc::new(RefCell::new(ArchiveFileCache::default()));
                 let metadata_map = Rc::new(RefCell::new(HashMap::new()));
 
                 let mut archive_guard = (*archive).borrow_mut();
@@ -260,36 +260,151 @@ struct ArchivedFileMetadata {
     size: u64,
 }
 
-/// Shared (refcounted) copy of the decompressed version of a file in an IPA.
-///
-/// Seeking in compressed files is hard, so the simple solution is to read the
-/// whole file into memory. This is shared so having multiple copies of the same
-/// file open won't waste memory.
-type DecompressedFile = Rc<[u8]>;
+const IPA_MEMORY_FILE_LIMIT: u64 = 1024 * 1024;
+const IPA_MEMORY_CACHE_BUDGET: usize = 32 * 1024 * 1024;
+const IPA_CACHE_FILE_LIMIT: usize = 128;
+
+/// Large resources remain seekable without occupying anonymous memory for the
+/// entire session. The OS can reclaim disk-backed pages under memory pressure.
+#[derive(Debug)]
+enum DecompressedFile {
+    Memory(Vec<u8>),
+    Disk {
+        file: RefCell<std::fs::File>,
+        size: u64,
+    },
+}
+
+impl DecompressedFile {
+    fn size(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Disk { size, .. } => *size,
+        }
+    }
+
+    fn memory_size(&self) -> usize {
+        match self {
+            Self::Memory(bytes) => bytes.capacity(),
+            Self::Disk { .. } => 0,
+        }
+    }
+
+    fn read_entry(file: &mut zip::read::ZipFile) -> std::io::Result<Self> {
+        if file.size() <= IPA_MEMORY_FILE_LIMIT {
+            let mut bytes = Vec::with_capacity(file.size() as usize);
+            file.read_to_end(&mut bytes)?; // Includes ZIP CRC validation.
+            Ok(Self::Memory(bytes))
+        } else {
+            let mut spool = anonymous_archive_file()?;
+            let size = std::io::copy(file, &mut spool)?;
+            Ok(Self::Disk {
+                file: RefCell::new(spool),
+                size,
+            })
+        }
+    }
+}
+
+/// Anonymous scratch file: no stale extracted resources survive process death.
+fn anonymous_archive_file() -> std::io::Result<std::fs::File> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let directory = crate::paths::user_data_base_path().join("touchHLE_ipa_cache");
+    std::fs::create_dir_all(&directory)?;
+    loop {
+        let path = directory.join(format!(
+            "{}-{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // GENERIC_READ | GENERIC_WRITE | DELETE; FILE_FLAG_DELETE_ON_CLOSE.
+            options.access_mode(0xc0010000).custom_flags(0x04000100);
+        }
+        match options.open(&path) {
+            Ok(file) => {
+                #[cfg(unix)]
+                std::fs::remove_file(&path)?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ArchiveFileCache {
+    files: HashMap<usize, (u64, Rc<DecompressedFile>)>,
+    clock: u64,
+    memory_bytes: usize,
+    budget: usize,
+}
+
+impl Default for ArchiveFileCache {
+    fn default() -> Self {
+        Self {
+            files: HashMap::new(),
+            clock: 0,
+            memory_bytes: 0,
+            budget: IPA_MEMORY_CACHE_BUDGET,
+        }
+    }
+}
+
+impl ArchiveFileCache {
+    fn get(&mut self, index: usize) -> Option<Rc<DecompressedFile>> {
+        let (used, data) = self.files.get_mut(&index)?;
+        self.clock = self.clock.wrapping_add(1);
+        *used = self.clock;
+        Some(Rc::clone(data))
+    }
+
+    fn insert(&mut self, index: usize, data: Rc<DecompressedFile>) {
+        self.clock = self.clock.wrapping_add(1);
+        self.memory_bytes += data.memory_size();
+        if let Some((_, old)) = self.files.insert(index, (self.clock, data)) {
+            self.memory_bytes -= old.memory_size();
+        }
+        while self.memory_bytes > self.budget || self.files.len() > IPA_CACHE_FILE_LIMIT {
+            let memory_pressure = self.memory_bytes > self.budget;
+            let oldest = self
+                .files
+                .iter()
+                .filter(|(_, (_, data))| !memory_pressure || data.memory_size() != 0)
+                .min_by_key(|(_, (used, _))| *used)
+                .map(|(&index, _)| index)
+                .unwrap();
+            let (_, removed) = self.files.remove(&oldest).unwrap();
+            self.memory_bytes -= removed.memory_size();
+        }
+    }
+}
 
 /// Represents a file inside an IPA bundle that can be opened.
 #[derive(Debug)]
 pub struct IpaFileRef {
     archive: Rc<RefCell<ZipArchive<std::fs::File>>>,
-    archive_files_cache: Rc<RefCell<HashMap<usize, DecompressedFile>>>,
+    archive_files_cache: Rc<RefCell<ArchiveFileCache>>,
     metadata_map: Rc<RefCell<HashMap<usize, ArchivedFileMetadata>>>,
     index: usize,
 }
 
 impl IpaFileRef {
     pub fn open(&self) -> IpaFile {
-        // Some games, like THPS2, use a single resource bundle file which is
-        // opened each time a new game resource is being read.
-        // As IPA is basically an archive, this pattern requires unzipping to be
-        // done each time, which is extremely slow.
-        // The solution here is to cache unzipped data in memory, which should
-        // be OK as early iOS IPA files are relatively small in size.
-        let mut archive_cache = (*self.archive_files_cache).borrow_mut();
-        archive_cache.entry(self.index).or_insert_with(|| {
+        if let Some(data) = self.archive_files_cache.borrow_mut().get(self.index) {
+            return IpaFile { data, position: 0 };
+        }
+        let data = {
             // Read the zip entry into an owned buffer inside its own block so
             // the `archive` RefMut is released before we touch the caches.
             let mut archive = (*self.archive).borrow_mut();
-            let decoded: Option<(Vec<u8>, ArchivedFileMetadata)> = match archive
+            let decoded: Option<(DecompressedFile, ArchivedFileMetadata)> = match archive
                 .by_index(self.index)
             {
                 Ok(mut file) => {
@@ -307,28 +422,27 @@ impl IpaFileRef {
                     );
                     let timestamp = calendar_date_to_timestamp(tm);
                     let size = file.size();
-                    let mut buf = Vec::new();
-                    if let Err(e) = file.read_to_end(&mut buf) {
-                        // The central directory can be readable even when the
-                        // compressed payload is truncated or has a bad CRC.
-                        // Discarding a partial archive is safer than letting a
-                        // guest parse corrupted Unity/player data and continue
-                        // in a damaged state.
-                        log!(
-                            "Warning: IpaFileRef::open(): IO error decompressing IPA entry {}: {}; rejecting partial buffer ({} bytes).",
+                    match DecompressedFile::read_entry(&mut file) {
+                        Err(e) => {
+                            // The central directory can be readable even when the
+                            // compressed payload is truncated or has a bad CRC.
+                            // Discarding a partial archive is safer than letting a
+                            // guest parse corrupted Unity/player data and continue
+                            // in a damaged state.
+                            log!(
+                            "Warning: IpaFileRef::open(): IO error decompressing IPA entry {}: {}; rejecting partial data.",
                             self.index,
-                            e,
-                            buf.len()
+                            e
                         );
-                        None
-                    } else {
-                        Some((
-                            buf,
+                            None
+                        }
+                        Ok(data) => Some((
+                            data,
                             ArchivedFileMetadata {
                                 last_modified: timestamp.into(),
                                 size,
                             },
-                        ))
+                        )),
                     }
                 }
                 Err(ZipError::Io(e)) => {
@@ -356,7 +470,7 @@ impl IpaFileRef {
                         .borrow_mut()
                         .entry(self.index)
                         .or_insert(meta);
-                    Rc::from(buf)
+                    Rc::new(buf)
                 }
                 None => {
                     // Cache an explicit zero-size metadata record as well as
@@ -370,14 +484,14 @@ impl IpaFileRef {
                             last_modified: 0,
                             size: 0,
                         });
-                    Rc::from(Vec::new())
+                    Rc::new(DecompressedFile::Memory(Vec::new()))
                 }
             }
-        });
-        let cached_file = Rc::clone(archive_cache.get(&self.index).unwrap());
-        IpaFile {
-            file: Cursor::new(cached_file),
-        }
+        };
+        self.archive_files_cache
+            .borrow_mut()
+            .insert(self.index, Rc::clone(&data));
+        IpaFile { data, position: 0 }
     }
 
     pub fn get_last_modified(&self) -> time_t {
@@ -434,26 +548,55 @@ impl IpaFileRef {
 /// Represents an opened file in an IPA bundle.
 #[derive(Clone)]
 pub struct IpaFile {
-    file: Cursor<DecompressedFile>,
+    data: Rc<DecompressedFile>,
+    position: u64,
 }
 
 impl Debug for IpaFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IpaFile")
-            .field("size", &self.file.get_ref().len())
+            .field("size", &self.data.size())
             .finish()
     }
 }
 
 impl Read for IpaFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.file.read(buf)
+        // Match Cursor: any position beyond EOF reads zero bytes, including
+        // positions outside the host filesystem's signed seek range.
+        if buf.is_empty() || self.position >= self.data.size() {
+            return Ok(0);
+        }
+        let read = match self.data.as_ref() {
+            DecompressedFile::Memory(bytes) => {
+                let start = self.position as usize;
+                let count = buf.len().min(bytes.len() - start);
+                buf[..count].copy_from_slice(&bytes[start..start + count]);
+                count
+            }
+            DecompressedFile::Disk { file, .. } => {
+                let mut file = file.borrow_mut();
+                file.seek(SeekFrom::Start(self.position))?;
+                file.read(buf)?
+            }
+        };
+        self.position += read as u64;
+        Ok(read)
     }
 }
 
 impl std::io::Seek for IpaFile {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.file.seek(pos)
+        let position = match pos {
+            SeekFrom::Start(position) => Some(position),
+            SeekFrom::End(offset) => self.data.size().checked_add_signed(offset),
+            SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
+        }
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid IPA file seek")
+        })?;
+        self.position = position;
+        Ok(position)
     }
 }
 
@@ -462,6 +605,130 @@ mod tests {
     use super::*;
     use crate::fs::FileLocation;
     use std::io::{Read, Write};
+
+    fn cache_test_bundle(entries: &[(&str, &[u8])], stored: bool) -> (FsNode, PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "touchHLE_archive_cache_{}_{}.ipa",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let method = if stored {
+            zip::CompressionMethod::Stored
+        } else {
+            zip::CompressionMethod::Deflated
+        };
+        let options = zip::write::FileOptions::default().compression_method(method);
+        for (name, bytes) in entries {
+            zip.start_file(format!("Payload/TestApp.app/{name}"), options)
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        (BundleData::open_ipa(&path).unwrap().into_fs_node(), path)
+    }
+
+    fn cached_file<'a>(node: &'a FsNode, name: &str) -> &'a IpaFileRef {
+        let FsNode::Directory { children, .. } = node else {
+            panic!("not a directory")
+        };
+        let FsNode::File {
+            location: FileLocation::IpaFileRef(file),
+            ..
+        } = &children[name]
+        else {
+            panic!("not an archived file")
+        };
+        file
+    }
+
+    #[test]
+    fn large_ipa_resource_is_disk_backed_with_independent_seek_positions() {
+        let data: Vec<u8> = (0..IPA_MEMORY_FILE_LIMIT as usize + 257)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (node, path) = cache_test_bundle(&[("large.bin", &data)], false);
+        let entry = cached_file(&node, "large.bin");
+        let mut first = entry.open();
+        assert!(matches!(first.data.as_ref(), DecompressedFile::Disk { .. }));
+        assert_eq!(entry.get_size(), data.len() as u64);
+        first.seek(SeekFrom::Start(12345)).unwrap();
+        let mut duplicate = first.clone();
+        let mut separate = entry.open();
+        assert!(Rc::ptr_eq(&first.data, &separate.data));
+        let mut bytes = [0; 97];
+        first.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, data[12345..12345 + 97]);
+        separate.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, data[..97]);
+        duplicate.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, data[12345..12345 + 97]);
+        first.seek(SeekFrom::End(-97)).unwrap();
+        first.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, data[data.len() - 97..]);
+        assert_eq!(first.read(&mut bytes).unwrap(), 0);
+        let end = first.stream_position().unwrap();
+        assert!(first.seek(SeekFrom::Current(-(end as i64) - 1)).is_err());
+        assert_eq!(first.stream_position().unwrap(), end);
+        first.seek(SeekFrom::Start(u64::MAX)).unwrap();
+        assert_eq!(first.read(&mut bytes).unwrap(), 0);
+        drop((first, duplicate, separate, node));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ipa_memory_cache_is_bounded_without_invalidating_open_files() {
+        let data = vec![0x5a; 4096];
+        let (node, path) = cache_test_bundle(
+            &[("a", &data), ("b", &data), ("c", &data), ("d", &data)],
+            false,
+        );
+        let first = cached_file(&node, "a");
+        first.archive_files_cache.borrow_mut().budget = data.len() * 2;
+        let mut held = first.open();
+        for name in ["b", "c", "d"] {
+            cached_file(&node, name).open();
+        }
+        {
+            let cache = first.archive_files_cache.borrow();
+            assert!(cache.memory_bytes <= data.len() * 2);
+            assert!(!cache.files.contains_key(&first.index));
+        }
+        let mut actual = Vec::new();
+        held.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, data);
+        actual.clear();
+        first.open().read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, data);
+        drop((held, node));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn corrupt_large_ipa_resource_rejects_partial_disk_backing() {
+        let data = vec![0x42; IPA_MEMORY_FILE_LIMIT as usize + 17];
+        let (node, path) = cache_test_bundle(&[("large.bin", &data)], true);
+        drop(node);
+        let start = {
+            let mut archive = ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+            let start = archive.by_index(0).unwrap().data_start();
+            start
+        };
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[start as usize] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        let node = BundleData::open_ipa(&path).unwrap().into_fs_node();
+        let entry = cached_file(&node, "large.bin");
+        assert_eq!(entry.get_size(), 0);
+        assert_eq!(entry.get_last_modified(), 0);
+        let mut actual = Vec::new();
+        entry.open().read_to_end(&mut actual).unwrap();
+        assert!(actual.is_empty());
+        drop(node);
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// Regression test: IPAs with entries whose local file header is corrupt
     /// used to cause a panic (`InvalidArchive("Invalid local file header")`)

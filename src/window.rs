@@ -338,6 +338,7 @@ pub struct Window {
     splash_image_is_orientation_specific: bool,
     device_family: DeviceFamily,
     device_orientation: DeviceOrientation,
+    screen_coordinates: geometry::ScreenCoordinates,
     controller_ctx: sdl2::GameControllerSubsystem,
     controllers: Vec<sdl2::controller::GameController>,
     dpad_state: DpadState,
@@ -741,6 +742,7 @@ impl Window {
             splash_image_is_orientation_specific,
             device_family,
             device_orientation,
+            screen_coordinates: geometry::ScreenCoordinates::new(options),
             controller_ctx,
             controllers: Vec::new(),
             dpad_state: DpadState {
@@ -991,12 +993,12 @@ impl Window {
                 );
                 [x, y]
             } else {
-                let matrix = window.rotation_matrix().inverse().unwrap();
+                let matrix = window.screen_coordinate_rotation().inverse().unwrap();
                 matrix.transform([x, y])
             };
 
             // back to pixels
-            let (out_w, out_h) = window.size_unrotated_unscaled();
+            let (out_w, out_h) = window.screen_coordinate_size();
             let mut out_x = (x + 0.5) * out_w as f32;
             let mut out_y = (y + 0.5) * out_h as f32;
 
@@ -2199,6 +2201,17 @@ impl Window {
             .unwrap_or_else(|| self.device_family.portrait_size())
     }
 
+    /// UIKit's current screen coordinate space, in logical points.
+    pub fn screen_coordinate_size(&self) -> (u32, u32) {
+        self.screen_coordinates
+            .size(self.screen_size(), self.device_orientation)
+    }
+
+    /// Rotation from the UIKit screen coordinate space to the host display.
+    pub fn screen_coordinate_rotation(&self) -> Matrix<2> {
+        self.screen_coordinates.rotation(self.device_orientation)
+    }
+
     pub fn screen_scale(&self) -> f32 {
         if self.host_screen_size.is_some() {
             1.0
@@ -2283,47 +2296,12 @@ impl Window {
         &self,
         frame: crate::frameworks::core_graphics::CGRect,
     ) -> (i32, i32, i32, i32) {
-        let (vp_x, vp_y, vp_w, vp_h) = self.viewport();
-        let (app_w, app_h) = self.size_unrotated_unscaled();
-        let (app_w, app_h) = (app_w as f32, app_h as f32);
-        if app_w <= 0.0 || app_h <= 0.0 || vp_w == 0 || vp_h == 0 {
-            return (0, 0, 0, 0);
-        }
-        let sx = vp_w as f32 / app_w;
-        let sy = vp_h as f32 / app_h;
-        // Rotate the guest rect into the device orientation, then scale to
-        // viewport pixels (mirrors the composition rotation).
-        let (x, y, w, h) = match self.device_orientation {
-            crate::window::DeviceOrientation::Portrait => (
-                frame.origin.x as f32,
-                frame.origin.y as f32,
-                frame.size.width as f32,
-                frame.size.height as f32,
-            ),
-            crate::window::DeviceOrientation::PortraitUpsideDown => (
-                app_w - frame.origin.x as f32 - frame.size.width as f32,
-                app_h - frame.origin.y as f32 - frame.size.height as f32,
-                frame.size.width as f32,
-                frame.size.height as f32,
-            ),
-            crate::window::DeviceOrientation::LandscapeLeft => (
-                frame.origin.y as f32,
-                app_w - frame.origin.x as f32 - frame.size.width as f32,
-                frame.size.height as f32,
-                frame.size.width as f32,
-            ),
-            crate::window::DeviceOrientation::LandscapeRight => (
-                app_h - frame.origin.y as f32 - frame.size.height as f32,
-                frame.origin.x as f32,
-                frame.size.height as f32,
-                frame.size.width as f32,
-            ),
-        };
-        let px = (vp_x as f32 + x * sx).round() as i32;
-        let py = (vp_y as f32 + y * sy).round() as i32;
-        let pw = (w * sx).round() as i32;
-        let ph = (h * sy).round() as i32;
-        (px, py, pw.max(0), ph.max(0))
+        self.screen_coordinates.frame_to_viewport(
+            frame,
+            self.screen_size(),
+            self.device_orientation,
+            self.viewport(),
+        )
     }
 
     pub fn host_framebuffer(&self) -> u32 {

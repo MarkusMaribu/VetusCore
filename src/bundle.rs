@@ -144,18 +144,30 @@ impl Bundle {
     }
 
     pub fn required_device_capabilities(&self) -> Vec<&str> {
+        self.device_capability_requirements()
+            .into_iter()
+            .filter_map(|(name, required)| required.then_some(name))
+            .collect()
+    }
+
+    /// Arrays require each capability; a dictionary can require or prohibit
+    /// one. Keep the false entries for automatic device-profile selection.
+    /// https://developer.apple.com/library/archive/documentation/DeviceInformation/Reference/iOSDeviceCompatibility/DeviceCompatibilityMatrix/DeviceCompatibilityMatrix.html
+    pub fn device_capability_requirements(&self) -> Vec<(&str, bool)> {
         self.plist
             .get("UIRequiredDeviceCapabilities")
             .map(|v| {
                 if let Some(dict) = v.as_dictionary() {
-                    // TODO: support undesired capabilities
-                    assert!(dict.values().all(|x| x.as_boolean().unwrap()));
-                    dict.keys().map(|o| o.as_str()).collect()
+                    dict.iter()
+                        .filter_map(|(name, value)| {
+                            value.as_boolean().map(|required| (name.as_str(), required))
+                        })
+                        .collect()
                 } else {
                     v.as_array()
                         .unwrap()
                         .iter()
-                        .map(|o| o.as_string().unwrap())
+                        .map(|o| (o.as_string().unwrap(), true))
                         .collect()
                 }
             })
@@ -578,5 +590,34 @@ impl Bundle {
         } else {
             families
         }
+    }
+}
+#[cfg(test)]
+mod capability_requirement_tests {
+    use super::*;
+
+    #[test]
+    fn capability_arrays_require_features_and_dictionary_false_prohibits_them() {
+        // https://developer.apple.com/library/archive/documentation/DeviceInformation/Reference/iOSDeviceCompatibility/DeviceCompatibilityMatrix/DeviceCompatibilityMatrix.html
+        let mut bundle = Bundle::new_fake_bundle();
+        bundle.plist.insert(
+            "UIRequiredDeviceCapabilities".into(),
+            Value::Array(vec![Value::String("gyroscope".into())]),
+        );
+        assert_eq!(
+            bundle.device_capability_requirements(),
+            vec![("gyroscope", true)]
+        );
+        let mut requirements = Dictionary::new();
+        requirements.insert("gyroscope".into(), Value::Boolean(false));
+        requirements.insert("armv7".into(), Value::Boolean(true));
+        bundle.plist.insert(
+            "UIRequiredDeviceCapabilities".into(),
+            Value::Dictionary(requirements),
+        );
+        assert_eq!(bundle.required_device_capabilities(), vec!["armv7"]);
+        let requirements = bundle.device_capability_requirements();
+        assert!(requirements.contains(&("gyroscope", false)));
+        assert!(requirements.contains(&("armv7", true)));
     }
 }

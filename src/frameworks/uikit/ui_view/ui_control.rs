@@ -116,16 +116,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let UIControlHostObject {
-        superclass: _,
-        enabled: _,
-        selected: _,
-        highlighted: _,
-        content_vertical_alignment: _,
-        tracking: _,
-        action_targets: _, // targets are weak references, nothing to do
-        tracked_touch,
-    } = std::mem::take(env.objc.borrow_mut(this));
+    // UIView still owns its backing layer/subviews during [super dealloc].
+    let tracked_touch = std::mem::take(
+        &mut env.objc.borrow_mut::<UIControlHostObject>(this).tracked_touch,
+    );
 
     release(env, tracked_touch);
 

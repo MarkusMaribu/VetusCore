@@ -167,7 +167,6 @@ pub(crate) struct UIViewHostObject {
     delegate: id,
     animation_interval: f64,
     is_animating: bool,
-    clips_to_bounds: bool,
     is_uncontrolled: bool,
     /// Strong refs to attached `UIGestureRecognizer*` instances. Used by
     /// `addGestureRecognizer:` / `removeGestureRecognizer:` /
@@ -224,7 +223,6 @@ impl Default for UIViewHostObject {
             delegate: nil,
             animation_interval: 1.0 / 60.0,
             is_animating: false,
-            clips_to_bounds: false,
             is_uncontrolled: false,
             gesture_recognizers: Vec::new(),
             is_accessibility_element: false,
@@ -980,6 +978,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     let key_hidden = get_static_str(env, "UIHidden");
     let hidden: bool = if msg![env; coder containsValueForKey:key_hidden] { msg![env; coder decodeBoolForKey:key_hidden] } else { false };
 
+    // Interface Builder omits alpha at its default value of 1. Explicit zero
+    // must survive decoding: invisible overlay views otherwise obscure the UI.
+    // https://developer.apple.com/documentation/uikit/uiview/alpha
+    let key_alpha = get_static_str(env, "UIAlpha");
+    let alpha: CGFloat = if msg![env; coder containsValueForKey:key_alpha] {
+        msg![env; coder decodeFloatForKey:key_alpha]
+    } else { 1.0 };
+    let key_clips = get_static_str(env, "UIClipsToBounds");
+    let clips: bool = if msg![env; coder containsValueForKey:key_clips] {
+        msg![env; coder decodeBoolForKey:key_clips]
+    } else { false };
+
     let key_opaque = get_static_str(env, "UIOpaque");
     let opaque: bool = if msg![env; coder containsValueForKey:key_opaque] { msg![env; coder decodeBoolForKey:key_opaque] } else { false };
 
@@ -1032,6 +1042,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     () = msg![env; this setHidden:hidden];
+    () = msg![env; this setAlpha:alpha];
+    () = msg![env; this setClipsToBounds:clips];
     () = msg![env; this setOpaque:opaque];
     if bg_color != nil { () = msg![env; this setBackgroundColor:bg_color]; }
 
@@ -1673,8 +1685,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer setHidden:hidden]
 }
 
-- (bool)clipsToBounds { env.objc.borrow::<UIViewHostObject>(this).clips_to_bounds }
-- (())setClipsToBounds:(bool)clips { env.objc.borrow_mut::<UIViewHostObject>(this).clips_to_bounds = clips; }
+- (bool)clipsToBounds {
+    let layer: id = msg![env; this layer];
+    msg![env; layer masksToBounds]
+}
+- (())setClipsToBounds:(bool)clips {
+    let layer: id = msg![env; this layer];
+    let _: () = msg![env; layer setMasksToBounds:clips];
+}
 
 - (())setStyle:(u32)_style { }
 - (id)context { nil }

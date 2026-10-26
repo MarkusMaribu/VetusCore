@@ -144,7 +144,10 @@ fn json_object_with_data(env: &mut Environment, data: id, opt: NSJSONReadingOpti
             return nil;
         }
     }
-    autorelease(env, result)
+    // parse_value already returns a non-owned object. Autoreleasing it again
+    // would destroy even a caller-retained root when the parsing pool drains.
+    // Apple's ownership rules also apply to JSONObjectWithData:options:error:.
+    result
 }
 
 fn is_valid_json_object_root(env: &mut Environment, obj: id) -> bool {
@@ -454,6 +457,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
+    /// Returns an autoreleased object (or the shared NSNull singleton).
     fn parse_value(
         &mut self,
         env: &mut Environment,
@@ -466,7 +470,8 @@ impl<'a> JsonParser<'a> {
             b'[' => self.parse_array(env, opt),
             b'"' => {
                 let s = self.parse_string()?;
-                Ok(from_rust_string(env, s))
+                let string = from_rust_string(env, s);
+                Ok(autorelease(env, string))
             }
             b't' => {
                 self.expect(b"true")?;

@@ -691,8 +691,8 @@ fn CGContextDrawPath(env: &mut Environment, context: CGContextRef, mode: i32) {
     if context.is_null() || !(0..=4).contains(&mode) { return; }
     let h=env.objc.borrow_mut::<CGContextHostObject>(context);
     let elements=std::mem::take(&mut h.path_elements);
-    let fill=h.rgb_fill_color; let stroke=h.rgb_stroke_color; let alpha=h.alpha;
-    let blend=h.blend_mode!=17; let cap=h.line_cap; let join=h.line_join; let miter=h.miter_limit;
+    let fill=h.rgb_fill_color; let stroke=h.rgb_stroke_color;
+    let cap=h.line_cap; let join=h.line_join; let miter=h.miter_limit;
     // Frobenius norm bounds the largest CTM stretch, including shears.
     let scale=(h.transform.a*h.transform.a+h.transform.b*h.transform.b
         +h.transform.c*h.transform.c+h.transform.d*h.transform.d).sqrt();
@@ -722,8 +722,8 @@ fn CGContextDrawPath(env: &mut Environment, context: CGContextRef, mode: i32) {
                 if do_fill && super::path_geometry::contains(&contours,p,matches!(mode,1|4)) {fc+=1;}
                 if do_stroke && super::path_geometry::on_stroke(&stroke_contours,inverse.apply_to_point(p),pen_width,cap,join,miter) {sc+=1;}
             }
-            if fc>0 {drawer.put_srgba_pixel((x as i32,y as i32),(fill.0,fill.1,fill.2,fill.3*alpha*fc as f32/4.0),blend);}
-            if sc>0 {drawer.put_srgba_pixel((x as i32,y as i32),(stroke.0,stroke.1,stroke.2,stroke.3*alpha*sc as f32/4.0),blend);}
+            if fc>0 {drawer.put_srgba_pixel((x as i32,y as i32),(fill.0,fill.1,fill.2,fill.3*fc as f32/4.0),true);}
+            if sc>0 {drawer.put_srgba_pixel((x as i32,y as i32),(stroke.0,stroke.1,stroke.2,stroke.3*sc as f32/4.0),true);}
         }
     }
 }
@@ -1024,8 +1024,6 @@ pub fn CGContextDrawRadialGradient(
     }
     let host = env.objc.borrow::<CGContextHostObject>(context);
     let transform = host.transform;
-    let alpha = host.alpha;
-    let blend = host.blend_mode != 17; // kCGBlendModeCopy
     let determinant = transform.a * transform.d - transform.b * transform.c;
     if !determinant.is_finite() || determinant == 0.0 { return; }
     let inverse = transform.invert();
@@ -1036,7 +1034,7 @@ pub fn CGContextDrawRadialGradient(
             let point = inverse.apply_to_point(CGPoint { x: x as f32 + 0.5, y: y as f32 + 0.5 });
             if let Some(t) = radial_gradient_parameter(point, start_center, start_radius, end_center, end_radius, options) {
                 let (r, g, b, a) = sample(t);
-                drawer.put_srgba_pixel((x as i32, y as i32), (r, g, b, a * alpha), blend);
+                drawer.put_srgba_pixel((x as i32, y as i32), (r, g, b, a), true);
             }
         }
     }

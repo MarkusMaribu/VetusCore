@@ -28,6 +28,15 @@ extern "C" {
     pub fn stbi_failure_reason() -> *const c_char;
 
     // stb_image_write.h
+    pub fn stbi_write_jpg_to_func(
+        func: Option<unsafe extern "C" fn(context: *mut c_void, data: *mut c_void, size: c_int)>,
+        context: *mut c_void,
+        w: c_int,
+        h: c_int,
+        comp: c_int,
+        data: *const c_void,
+        quality: c_int,
+    ) -> c_int;
     pub fn stbi_write_png_to_func(
         func: Option<unsafe extern "C" fn(context: *mut c_void, data: *mut c_void, size: c_int)>,
         context: *mut c_void,

@@ -687,8 +687,8 @@ impl GuestFile {
                 Ok(GuestFile::File(cloned))
             }
             GuestFile::IpaBundleFile(ipa_file) => {
-                // IpaFile uses Cursor<Rc<[u8]>> — clone shares the data and
-                // copies the seek position.
+                // Clone shares immutable archive backing (memory or scratch
+                // file) and copies the independent seek position.
                 Ok(GuestFile::IpaBundleFile(ipa_file.clone()))
             }
             GuestFile::ResourceFile(_) => {
@@ -1240,6 +1240,19 @@ impl Fs {
     /// Like [Path::exists] but for the guest filesystem.
     pub fn exists(&self, path: &GuestPath) -> bool {
         self.lookup_node(path).is_some()
+    }
+
+    /// Resolve a writable sandbox file for a native library (such as SQLite).
+    /// Create it through the VFS first so mount permissions and the directory
+    /// inventory remain authoritative; never derive a host path from text.
+    pub fn writable_host_path(&mut self, path: &GuestPath) -> Result<PathBuf, ()> {
+        let mut options = GuestOpenOptions::new();
+        options.write().create();
+        drop(self.open_with_options(path, options)?);
+        match self.lookup_node(path) {
+            Some(FsNode::File { location: FileLocation::Path(path), writeable: true }) => Ok(path.clone()),
+            _ => Err(()),
+        }
     }
 
     /// Resolve an existing guest path using the case-insensitive semantics of

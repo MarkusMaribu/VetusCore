@@ -6,7 +6,12 @@
  */
 //! `UITouch`.
 
+#[cfg(test)]
+#[path = "ui_touch_scroll_tests.rs"]
+mod scroll_tests;
+
 use super::ui_event;
+use super::ui_view::ui_scroll_view;
 use super::ui_gesture_recognizer::{
     UIGestureRecognizerHostObject, UIGestureRecognizerStatePossible,
     UIGestureRecognizerStateRecognized, UISwipeGestureRecognizerDirectionDown,
@@ -77,25 +82,10 @@ pub struct State {
 /// Cancel view delivery once a recognizer begins, while continuing to feed
 /// the recognizer itself with movement/end events from these touches.
 pub(super) fn cancel_for_gesture(env: &mut Environment, touches: &[id]) {
-    let mut groups: HashMap<id, Vec<id>> = HashMap::new();
     for &touch in touches {
         if !env.framework_state.uikit.ui_touch.cancelled_by_gesture.insert(touch) { continue; }
-        let view: id = msg![env; touch view];
-        if view != nil { groups.entry(view).or_default().push(touch); }
-    }
-    for (view, touches) in groups {
-        let set: id = msg_class![env; NSMutableSet new];
-        let mut phases = Vec::new();
-        for touch in touches {
-            () = msg![env; set addObject:touch];
-            let old_phase = touch_ivars(env, touch, |v| { let old = v.phase; v.phase = 4; old });
-            phases.push((touch, old_phase));
-        }
-        let event = ui_event::new_event(env, set);
-        () = msg![env; view touchesCancelled:set withEvent:event];
-        for (touch, phase) in phases { touch_ivars(env, touch, |v| v.phase = phase); }
-        release(env, event);
-        release(env, set);
+        cancel_view_touch(env, touch);
+        finish_scroll_touch(env, touch);
     }
 }
 
@@ -167,8 +157,186 @@ pub(super) struct UITouchHostObject {
     start_location: CGPoint,
     /// How many Moved updates this touch has received. Diagnostics only.
     move_count: u32,
+    scroll: Option<ScrollTouch>,
 }
 impl HostObject for UITouchHostObject {}
+
+#[derive(Clone, Copy)]
+struct ScrollTouch {
+    view: id, // retained until the sequence ends
+    timer: id, // retained; invalidation breaks the timer -> touch retain
+    delivered: bool,
+    begin_checked: bool,
+    dragging: bool,
+    rejected: bool,
+    started: f64,
+}
+
+// UIScrollView temporarily intercepts Down before deciding between a tap and
+// scrolling. UITouch.view remains the original hit view throughout the sequence.
+// https://developer.apple.com/documentation/uikit/uiscrollview
+// https://developer.apple.com/documentation/uikit/uiscrollview/delayscontenttouches
+fn prepare_scroll_touch(env: &mut Environment, touch: id, event: id) -> bool {
+    let hit: id = msg![env; touch view];
+    let class = env.objc.get_known_class("UIScrollView", &mut env.mem);
+    let mut candidate = hit;
+    while candidate != nil {
+        if msg![env; candidate isKindOfClass:class] && msg![env; candidate scrollEnabled] {
+            if ui_scroll_view::begin_tracking(env, candidate, touch) {
+                retain(env, candidate);
+                let delays: bool = msg![env; candidate delaysContentTouches];
+                let delayed = delays && candidate != hit;
+                let delivered = if !delayed && candidate != hit {
+                    let set = singleton(env, touch);
+                    let allow = msg![env; candidate touchesShouldBegin:set withEvent:event inContentView:hit];
+                    release(env, set);
+                    allow
+                } else { !delayed };
+                let started: f64 = msg![env; touch timestamp];
+                env.objc.borrow_mut::<UITouchHostObject>(touch).scroll = Some(ScrollTouch {
+                    view: candidate, timer: nil, delivered, begin_checked: !delayed,
+                    dragging: false, rejected: false, started,
+                });
+                if delayed {
+                    let selector = env.objc.lookup_selector("_touchHLE_scrollDelay:").unwrap();
+                    let timer: id = msg_class![env; NSTimer scheduledTimerWithTimeInterval:0.15f64
+                        target:touch selector:selector userInfo:nil repeats:false];
+                    retain(env, timer);
+                    env.objc.borrow_mut::<UITouchHostObject>(touch).scroll.as_mut().unwrap().timer = timer;
+                }
+                return delivered;
+            }
+        }
+        candidate = msg![env; candidate superview];
+    }
+    true
+}
+
+fn stop_scroll_delay(env: &mut Environment, touch: id) {
+    let timer = env.objc.borrow_mut::<UITouchHostObject>(touch).scroll.as_mut()
+        .map(|s| std::mem::replace(&mut s.timer, nil)).unwrap_or(nil);
+    if timer != nil {
+        () = msg![env; timer invalidate];
+        release(env, timer);
+    }
+}
+
+fn finish_scroll_touch(env: &mut Environment, touch: id) {
+    stop_scroll_delay(env, touch);
+    if let Some(scroll) = env.objc.borrow_mut::<UITouchHostObject>(touch).scroll.take() {
+        ui_scroll_view::end_tracking(env, scroll.view, touch);
+        release(env, scroll.view);
+    }
+}
+
+fn singleton(env: &mut Environment, touch: id) -> id {
+    let set: id = msg_class![env; NSMutableSet new];
+    () = msg![env; set addObject:touch];
+    set
+}
+
+fn send_cancel(env: &mut Environment, touch: id, view: id) {
+    let set = singleton(env, touch);
+    let event = ui_event::new_event(env, set);
+    let old_phase = touch_ivars(env, touch, |v| { let old = v.phase; v.phase = 4; old });
+    () = msg![env; view touchesCancelled:set withEvent:event];
+    touch_ivars(env, touch, |v| v.phase = old_phase);
+    release(env, event);
+    release(env, set);
+}
+
+fn cancel_view_touch(env: &mut Environment, touch: id) {
+    let view: id = msg![env; touch view];
+    let scroll = env.objc.borrow::<UITouchHostObject>(touch).scroll;
+    match scroll {
+        Some(s) if s.dragging => send_cancel(env, touch, s.view),
+        Some(s) if !s.delivered => (),
+        _ if view != nil => send_cancel(env, touch, view),
+        _ => (),
+    }
+}
+
+fn deliver_delayed_begin(env: &mut Environment, touch: id) {
+    let Some(scroll) = env.objc.borrow::<UITouchHostObject>(touch).scroll else { return; };
+    if scroll.begin_checked || scroll.dragging || scroll.rejected { return; }
+    stop_scroll_delay(env, touch);
+    let view: id = msg![env; touch view];
+    let set = singleton(env, touch);
+    let event = ui_event::new_event(env, set);
+    let start = env.objc.borrow::<UITouchHostObject>(touch).start_location;
+    let saved = touch_ivars(env, touch, |v| {
+        let saved = (v.phase, v.location, v.previous_location, v.timestamp);
+        v.phase = UITouchPhaseBegan;
+        v.location = start;
+        v.previous_location = start;
+        v.timestamp = scroll.started;
+        saved
+    });
+    let allow: bool = msg![env; (scroll.view) touchesShouldBegin:set withEvent:event inContentView:view];
+    let state = env.objc.borrow_mut::<UITouchHostObject>(touch).scroll.as_mut().unwrap();
+    state.delivered = allow;
+    state.begin_checked = true;
+    if allow { () = msg![env; view touchesBegan:set withEvent:event]; }
+    touch_ivars(env, touch, |v| {
+        (v.phase, v.location, v.previous_location, v.timestamp) = saved;
+    });
+    release(env, event);
+    release(env, set);
+}
+
+fn scroll_delivery_view(env: &mut Environment, touch: id, ended: bool) -> id {
+    let view: id = msg![env; touch view];
+    let Some(mut scroll) = env.objc.borrow::<UITouchHostObject>(touch).scroll else { return view; };
+    if ended {
+        if !scroll.delivered && !scroll.dragging { deliver_delayed_begin(env, touch); }
+        scroll = env.objc.borrow::<UITouchHostObject>(touch).scroll.unwrap();
+    } else if !scroll.dragging && !scroll.rejected {
+        let location: CGPoint = msg![env; touch locationInView:(scroll.view)];
+        let start = env.objc.borrow::<UITouchHostObject>(touch).start_location;
+        let window: id = msg![env; touch window];
+        let start: CGPoint = msg![env; window convertPoint:start fromWindow:nil];
+        let start: CGPoint = msg![env; (scroll.view) convertPoint:start fromView:window];
+        let delta = CGPoint { x: location.x - start.x, y: location.y - start.y };
+        if delta.x.hypot(delta.y) >= 10.0 && ui_scroll_view::can_scroll_in_direction(env, scroll.view, delta) {
+            let allowed = view == scroll.view || !scroll.delivered || (
+                msg![env; (scroll.view) canCancelContentTouches]
+                && msg![env; (scroll.view) touchesShouldCancelInContentView:view]);
+            if allowed {
+                stop_scroll_delay(env, touch);
+                if scroll.delivered && view != scroll.view { send_cancel(env, touch, view); }
+                env.objc.borrow_mut::<UITouchHostObject>(touch).scroll.as_mut().unwrap().dragging = true;
+                scroll.dragging = true;
+                ui_scroll_view::begin_dragging(env, scroll.view, touch);
+            } else {
+                env.objc.borrow_mut::<UITouchHostObject>(touch).scroll.as_mut().unwrap().rejected = true;
+            }
+        }
+    }
+    if scroll.dragging { scroll.view } else if scroll.delivered { view } else { nil }
+}
+
+fn deliver_scroll_filtered(env: &mut Environment, touches: id, event: id, ended: bool) {
+    let array: id = msg![env; touches allObjects];
+    let count: NSUInteger = msg![env; array count];
+    let mut groups: HashMap<id, id> = HashMap::new();
+    for i in 0..count {
+        let touch: id = msg![env; array objectAtIndex:i];
+        let target = scroll_delivery_view(env, touch, ended);
+        if target == nil { continue; }
+        let set = if let Some(&set) = groups.get(&target) { set } else {
+            let set: id = msg_class![env; NSMutableSet new];
+            groups.insert(target, set);
+            set
+        };
+        () = msg![env; set addObject:touch];
+    }
+    for (target, set) in groups {
+        if ended { () = msg![env; target touchesEnded:set withEvent:event]; }
+        else { () = msg![env; target touchesMoved:set withEvent:event]; }
+        touchhle_send_cocos_touch_aliases_to_chain(env, target, if ended { "ended" } else { "moved" }, set, event);
+        release(env, set);
+    }
+}
 
 /// Cancel a touch whose Up/Cancel was lost, exactly like a real cancel, and
 /// drop it from the tracking table. `reason` is shown in the log.
@@ -181,18 +349,10 @@ fn stale_cancel_and_release(env: &mut Environment, finger_id: FingerId, touch: i
         reason,
         n
     );
-    let stale_view: id = touch_ivars(env, touch, |v| v.view);
-    if stale_view != nil {
-        // Phase 4 mirrors `cancel_for_gesture`: not a public phase, so guests
-        // that poll `phase` see the touch as neither began, moved nor ended.
-        touch_ivars(env, touch, |v| v.phase = 4);
-        let stale_set: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
-        () = msg![env; stale_set addObject:touch];
-        let cancel_event = ui_event::new_event(env, stale_set);
-        () = msg![env; stale_view touchesCancelled:stale_set withEvent:cancel_event];
-        release(env, cancel_event);
-        release(env, stale_set);
+    if !env.framework_state.uikit.ui_touch.cancelled_by_gesture.contains(&touch) {
+        cancel_view_touch(env, touch);
     }
+    finish_scroll_touch(env, touch);
     env.framework_state
         .uikit
         .ui_touch
@@ -439,6 +599,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = Box::new(UITouchHostObject {
         start_location: CGPoint { x: 0.0, y: 0.0 },
         move_count: 0,
+        scroll: None,
     });
     // The guest allocation must cover the ivars (see `UITouchIvars`): guest
     // engines bit-copy the whole 0x40-byte object and message the copy.
@@ -462,6 +623,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, view);
     release(env, window);
     env.objc.dealloc_object(this, &mut env.mem)
+}
+
+- (())_touchHLE_scrollDelay:(id)timer {
+    let active = env.objc.borrow::<UITouchHostObject>(this).scroll
+        .map(|s| s.timer == timer).unwrap_or(false);
+    if active { deliver_delayed_begin(env, this); }
 }
 
 - (CGPoint)locationInView:(id)that_view {
@@ -1114,12 +1281,21 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     }
 
     for (view, v_set) in view_touches {
-        let _: () = msg![env;
-            view touchesBegan:v_set withEvent:event];
+        let deliver: id = msg_class![env; NSMutableSet new];
+        let array: id = msg![env; v_set allObjects];
+        let count: NSUInteger = msg![env; array count];
+        for i in 0..count {
+            let touch: id = msg![env; array objectAtIndex:i];
+            if prepare_scroll_touch(env, touch, event) { () = msg![env; deliver addObject:touch]; }
+        }
+        let count: NSUInteger = msg![env; deliver count];
+        if count != 0 {
+            () = msg![env; view touchesBegan:deliver withEvent:event];
+            touchhle_send_cocos_touch_aliases_to_chain(env, view, "began", deliver, event);
+        }
         super::ui_gesture_recognizer::touches_began(env, view, v_set);
-        touchhle_send_cocos_touch_aliases_to_chain(env, view, "began", v_set, event);
-        let count: NSUInteger = msg![env; v_set count];
         log_touch_delivery("TOUCH-DIAG", &TOUCH_BEGAN_DIAGNOSTICS, count as usize);
+        release(env, deliver);
     }
     release(env, pool);
 }
@@ -1206,8 +1382,7 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         let deliver = touches_for_view_delivery(env, v_set);
         let count: NSUInteger = msg![env; deliver count];
         if count != 0 {
-            let _: () = msg![env; view touchesMoved:deliver withEvent:event];
-            touchhle_send_cocos_touch_aliases_to_chain(env, view, "moved", deliver, event);
+            deliver_scroll_filtered(env, deliver, event, false);
         }
         release(env, deliver);
     }
@@ -1377,8 +1552,7 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         let deliver = touches_for_view_delivery(env, v_set);
         let count: NSUInteger = msg![env; deliver count];
         if count != 0 {
-            let _: () = msg![env; view touchesEnded:deliver withEvent:event];
-            touchhle_send_cocos_touch_aliases_to_chain(env, view, "ended", deliver, event);
+            deliver_scroll_filtered(env, deliver, event, true);
             log_touch_delivery("TOUCH-END", &TOUCH_ENDED_DIAGNOSTICS, count as usize);
         }
         release(env, deliver);
@@ -1390,6 +1564,7 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     // addObject:, which retains), so they remain alive until those sets are
     // released when the autorelease pool drains.
     for (finger_id, touch) in touches_to_remove {
+        finish_scroll_touch(env, touch);
         env.framework_state.uikit.ui_touch.cancelled_by_gesture.remove(&touch);
         if let Some(current_touch) = env
             .framework_state

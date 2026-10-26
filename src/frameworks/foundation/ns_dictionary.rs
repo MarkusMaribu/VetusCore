@@ -513,6 +513,21 @@ fn all_keys_common(env: &mut Environment, this: id) -> id {
     autorelease(env, res)
 }
 
+/// Allocate a custom class-cluster subclass as NSObject would. In particular,
+/// preserve its isa, guest ivars and Objective-C++ constructors instead of
+/// replacing the object with one of our concrete dictionary implementations.
+/// https://developer.apple.com/documentation/foundation/nsdictionary?language=objc
+/// Upstream touchHLE leaves this path unimplemented in +allocWithZone:.
+fn alloc_dictionary_subclass(env: &mut Environment, class: Class) -> id {
+    let object = env.objc.alloc_object(
+        class,
+        Box::new(crate::objc::TrivialHostObject),
+        &mut env.mem,
+    );
+    super::ns_object::invoke_cxx_constructors(env, object);
+    object
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -528,16 +543,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation NSDictionary: NSObject
 
 + (id)allocWithZone:(NSZonePtr)zone {
-    // NSDictionary might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. We don't currently support that; warn and
-    // fall back to the bridged subclass instead of crashing the host.
     let ns_dict_class = env.objc.get_known_class("NSDictionary", &mut env.mem);
     if this != ns_dict_class {
-        log!(
-            "Warning: +[NSDictionary allocWithZone:] called on subclass {:?}; \
-             treating as NSDictionary.",
-            this
-        );
+        return alloc_dictionary_subclass(env, this);
     }
     msg_class![env; _touchHLE_NSDictionary allocWithZone:zone]
 }
@@ -604,14 +612,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    // NSDictionary is abstract; calling -init on the base class is unusual but
-    // some buggy apps may still do it. Fall back to an empty mutable dict-
-    // backed host object so the receiver remains usable instead of panicking.
-    log!(
-        "Warning: -[NSDictionary init] called on the abstract base class; \
-         returning empty dictionary."
-    );
-    *env.objc.borrow_mut(this) = <DictionaryHostObject as Default>::default();
+    // Custom subclasses own their storage and may call [super init]. The
+    // concrete cluster classes initialize DictionaryHostObject themselves.
     this
 }
 
@@ -1080,14 +1082,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation NSMutableDictionary: NSDictionary
 
 + (id)allocWithZone:(NSZonePtr)zone {
-    // NSMutableDictionary might be subclassed; warn but don't crash.
     let mutable_class = env.objc.get_known_class("NSMutableDictionary", &mut env.mem);
     if this != mutable_class {
-        log!(
-            "Warning: +[NSMutableDictionary allocWithZone:] called on subclass {:?}; \
-             treating as NSMutableDictionary.",
-            this
-        );
+        return alloc_dictionary_subclass(env, this);
     }
     msg_class![env; _touchHLE_NSMutableDictionary allocWithZone:zone]
 }

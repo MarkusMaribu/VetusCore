@@ -528,6 +528,9 @@ mod imp {
     pub fn populate_jni_cache() {}
 
     pub fn has_camera(_front: bool) -> bool {
+        #[cfg(all(target_os = "android", feature = "embedded"))]
+        return crate::embed::camera_available(_front);
+        #[cfg(not(all(target_os = "android", feature = "embedded")))]
         false
     }
     pub fn take_photo(_front: bool) -> Option<Vec<u8>> {
@@ -562,9 +565,14 @@ mod imp {
 pub use imp::populate_jni_cache;
 
 pub fn has_camera(front: bool) -> bool {
-    #[cfg(feature = "embedded")]
-    if !crate::embed::camera_allowed() { return false; }
     imp::has_camera(front)
+}
+
+pub fn has_flash(front: bool) -> bool {
+    #[cfg(all(target_os = "android", feature = "embedded"))]
+    return crate::embed::camera_flash_available(front);
+    #[cfg(not(all(target_os = "android", feature = "embedded")))]
+    { let _ = front; false }
 }
 
 pub fn take_photo(front: bool) -> Option<Vec<u8>> {

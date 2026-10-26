@@ -892,6 +892,27 @@ fn find_app_delegate_class(env: &Environment) -> id {
     nil
 }
 
+/// Complete the main nib's initial window setup before launching the delegate.
+/// Nib visibility and key status are separate: don't reveal hidden windows or
+/// replace a key window explicitly selected by an awakeFromNib implementation.
+/// See Apple's launch/window setup and nib-loading descriptions:
+/// https://developer.apple.com/library/archive/documentation/WindowsViews/Conceptual/WindowAndScreenGuide/WindowScreenRolesinApp/WindowScreenRolesinApp.html
+/// https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/LoadingResources/CocoaNibs/CocoaNibs.html
+fn activate_main_nib_window(env: &mut Environment, top_level: id) {
+    if top_level == nil || env.framework_state.uikit.ui_view.ui_window.key_window.is_some() {
+        return;
+    }
+    let window_class: id = msg_class![env; UIWindow class];
+    let count: NSUInteger = msg![env; top_level count];
+    for index in 0..count {
+        let object: id = msg![env; top_level objectAtIndex:index];
+        if msg![env; object isKindOfClass:window_class] && !msg![env; object isHidden] {
+            () = msg![env; object makeKeyWindow];
+            return;
+        }
+    }
+}
+
 /// `UIApplicationMain`, the entry point of the application.
 pub(super) fn UIApplicationMain(
     env: &mut Environment,
@@ -900,6 +921,7 @@ pub(super) fn UIApplicationMain(
     principal_class_name: id, // NSString*
     delegate_class_name: id,  // NSString*
 ) {
+    env.framework_state.uikit.ui_view.ui_window.defer_autorotation = true;
     let ui_application = {
         let pool: id = msg_class![env; NSAutoreleasePool new];
 
@@ -924,8 +946,9 @@ pub(super) fn UIApplicationMain(
             if res != nil {
                 let nib: id = msg_class![env; UINib nibWithNibName:ns_main_nib_filename bundle:nil];
                 release(env, ns_main_nib_filename);
-                let _: id = msg![env; nib instantiateWithOwner:ui_application
+                let top_level: id = msg![env; nib instantiateWithOwner:ui_application
                                                options:nil];
+                activate_main_nib_window(env, top_level);
             } else {
                 log!("Warning: couldn't load main nib file.");
             }
@@ -1070,6 +1093,8 @@ pub(super) fn UIApplicationMain(
 
         let _: () = msg![env; pool drain];
     }
+
+    super::ui_view::ui_window::finish_launch_autorotation(env);
 
     let views = env.framework_state.uikit.ui_view.views.clone();
     for view in views {
@@ -1461,3 +1486,81 @@ pub const CONSTANTS: ConstantExports = &[
     ),
 ];
 pub const FUNCTIONS: FunctionExports = &[export_c_func!(UIApplicationMain(_, _, _, _))];
+
+#[cfg(test)]
+mod main_nib_window_tests {
+    use super::*;
+    use crate::frameworks::core_graphics::{CGPoint, CGSize};
+
+    fn window(env: &mut Environment) -> id {
+        let frame = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize { width: 100.0, height: 100.0 },
+        };
+        let window: id = msg_class![env; UIWindow alloc];
+        msg![env; window initWithFrame:frame]
+    }
+
+    // Regression: a nib-created visible main window was displayed but never
+    // became key. Attaching an app's movie overlay through keyWindow therefore
+    // sent addSubview: to nil, leaving its own skip controls unreachable.
+    // Compare upstream's nib visibility-only setup:
+    // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_nib.rs
+    #[test]
+    fn main_nib_window_accepts_an_overlay_via_application_key_window() {
+        let mut env = crate::environment::touch_test_environment();
+        let env = &mut env;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let app: id = msg_class![env; UIApplication new];
+        let hidden = window(env);
+        let main = window(env);
+        () = msg![env; main setHidden:false];
+        let top_level = ns_array::from_vec(env, vec![hidden, main]);
+        let before: id = msg![env; app keyWindow];
+        assert_eq!(before, nil);
+
+        activate_main_nib_window(env, top_level);
+        let key: id = msg![env; app keyWindow];
+        assert_eq!(key, main);
+        assert!(msg![env; main isKeyWindow]);
+        assert!(msg![env; hidden isHidden]);
+
+        let bounds: CGRect = msg![env; key bounds];
+        let overlay: id = msg_class![env; UIButton alloc];
+        let overlay: id = msg![env; overlay initWithFrame:bounds];
+        () = msg![env; key addSubview:overlay];
+        let parent: id = msg![env; overlay superview];
+        assert_eq!(parent, main);
+        let point = CGPoint { x: 50.0, y: 50.0 };
+        let hit: id = msg![env; key hitTest:point withEvent:nil];
+        assert_eq!(hit, overlay);
+        release(env, overlay);
+        release(env, top_level);
+        release(env, pool);
+    }
+
+    #[test]
+    fn main_nib_preserves_hidden_windows_and_an_explicit_key_window() {
+        let mut env = crate::environment::touch_test_environment();
+        let env = &mut env;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let app: id = msg_class![env; UIApplication new];
+        let main = window(env);
+        let top_level = ns_array::from_vec(env, vec![main]);
+        activate_main_nib_window(env, top_level);
+        let key: id = msg![env; app keyWindow];
+        assert_eq!(key, nil, "A hidden nib window must stay hidden and non-key");
+        assert!(msg![env; main isHidden]);
+
+        let selected = window(env);
+        () = msg![env; selected makeKeyWindow];
+        () = msg![env; selected setHidden:false];
+        () = msg![env; main setHidden:false];
+        activate_main_nib_window(env, top_level);
+        let key: id = msg![env; app keyWindow];
+        assert_eq!(key, selected, "Nib activation must preserve an explicit key choice");
+        release(env, selected);
+        release(env, top_level);
+        release(env, pool);
+    }
+}

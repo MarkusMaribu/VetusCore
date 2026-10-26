@@ -20,8 +20,9 @@ use crate::frameworks::audio_toolbox::audio_file::{
     AudioFileHostObject, AudioFileID, AudioFileOpenURL, AudioFileReadPackets, AudioFileWriteBytes,
 };
 use crate::frameworks::audio_toolbox::audio_queue::{
-    decode_buffer, kAudioQueueParam_Pan, kAudioQueueParam_Volume, AudioQueueAllocateBuffer,
-    AudioQueueBufferRef, AudioQueueDispose, AudioQueueEnqueueBuffer, AudioQueueGetParameter,
+    decode_buffer, kAudioQueueParam_Pan, kAudioQueueParam_Volume, kAudioQueueProperty_IsRunning,
+    AudioQueueAddPropertyListener, AudioQueueAllocateBuffer, AudioQueueBufferRef, AudioQueueDispose,
+    AudioQueueEnqueueBuffer, AudioQueueGetCurrentTime, AudioQueueGetParameter, AudioQueueGetProperty,
     AudioQueueNewOutput, AudioQueueOutputCallback, AudioQueuePause, AudioQueueRef,
     AudioQueueSetParameter, AudioQueueStart, AudioQueueStop,
 };
@@ -29,6 +30,7 @@ use crate::frameworks::carbon_core::eofErr;
 use crate::frameworks::core_audio_types::{
     fourcc, kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked,
     kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM, AudioStreamBasicDescription,
+    AudioTimeStamp,
 };
 use crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopCommonModes;
 use crate::frameworks::foundation::ns_error::NSOSStatusErrorDomain;
@@ -78,6 +80,11 @@ struct AVAudioPlayerHostObject {
     /// Range -1.0 (full left) … 1.0 (full right). Default 0.0.
     pan: f32,
     is_playing: bool,
+    /// EOF is a decoder position; playback completes only when its queue drains.
+    read_eof: bool,
+    needs_priming: bool,
+    /// A decoder repeat permits the playback clock to wrap at the file end.
+    has_looped: bool,
     num_of_loops: NSInteger,
     delegate: id,
     metering_enabled: bool,
@@ -233,6 +240,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         volume: 1.0,
         pan: 0.0,
         is_playing: false,
+        read_eof: false,
+        needs_priming: false,
+        has_looped: false,
         num_of_loops: 0,
         delegate: nil,
         metering_enabled: false,
@@ -438,6 +448,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     assert_eq!(status, 0);
     let aq_ref = env.mem.read(aq_ref_ptr);
     env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_queue = Some(aq_ref);
+    let finished: HostFunction =
+        &(_touchHLE_AVAudioPlayerQueueStateChanged as fn(&mut Environment, _, _, _) -> _);
+    let finished = env.dyld.create_guest_function(
+        &mut env.mem, "__touchHLE_AVAudioPlayerQueueStateChanged", finished,
+    );
+    AudioQueueAddPropertyListener(
+        env, aq_ref, kAudioQueueProperty_IsRunning, finished, this.cast(),
+    );
 
     let volume = env.objc.borrow::<AVAudioPlayerHostObject>(this).volume;
     () = msg![env; this setVolume:volume];
@@ -453,20 +471,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     assert_eq!(status, 0);
     assert_eq!(size, env.mem.read(tmp_size_ptr));
     let prop_size = env.mem.read(prop_size_ptr);
+    env.mem.free(prop_size_ptr.cast());
 
     let (buffer_byte_size, num_packets_to_read) = derive_buffer_size(audio_desc, prop_size, 0.5);
     env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).num_packets_to_read = num_packets_to_read;
     let buffers: MutPtr<AudioQueueBufferRef> = env.mem.alloc(kNumberBuffers as GuestUSize * guest_size_of::<AudioQueueBufferRef>()).cast();
     env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_queue_buffers = Some(buffers);
 
-    env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).is_playing = true;
     for i in 0..kNumberBuffers {
         let status = AudioQueueAllocateBuffer(env, aq_ref, buffer_byte_size, buffers + i as u32);
         assert_eq!(status, 0);
-
-        _touchHLE_AVAudioPlayerOutputBufferHelper(env, this.cast(), aq_ref, env.mem.read(buffers + i as u32));
     }
-    env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).is_playing = false;
+    prime_player_buffers(env, this);
 
     env.mem.free(tmp_size_ptr.cast());
     env.mem.free(aq_ref_ptr.cast());
@@ -480,6 +496,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)play {
     log!("[(AVAudioPlayer*){:?} play]", this);
     () = msg![env; this prepareToPlay];
+    if env.objc.borrow::<AVAudioPlayerHostObject>(this).is_playing {
+        return true;
+    }
     // If `prepareToPlay` couldn't set up an audio queue (e.g. because the
     // player was already deallocated and the host object is now missing,
     // making every borrow_mut return a phantom AVAudioPlayerHostObject
@@ -494,6 +513,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         return false;
     };
+    if env.objc.borrow::<AVAudioPlayerHostObject>(this).needs_priming {
+        prime_player_buffers(env, this);
+    }
     env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).is_playing = true;
     let status = AudioQueueStart(env, aq_ref, Ptr::null());
     if status != 0 {
@@ -503,6 +525,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).is_playing = false;
         return false;
+    }
+    if env.objc.borrow::<AVAudioPlayerHostObject>(this).read_eof {
+        AudioQueueStop(env, aq_ref, false);
     }
     true
 }
@@ -523,6 +548,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     if audio_queue.is_none() {
         return;
     }
+    // Disposal stops the queue too; an explicit stop is not natural EOF.
+    let host = env.objc.borrow_mut::<AVAudioPlayerHostObject>(this);
+    host.is_playing = false;
+    host.read_eof = false;
     AudioQueueDispose(env, audio_queue.unwrap(), true);
     env.mem.free(audio_queue_buffers.unwrap().cast());
     let &AVAudioPlayerHostObject { audio_file_url, output_callback, num_of_loops, audio_file_id, delegate, metering_enabled, .. } = env.objc.borrow(this);
@@ -540,6 +569,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         volume: 1.0,
         pan: 0.0,
         is_playing: false,
+        read_eof: false,
+        needs_priming: false,
+        has_looped: false,
         delegate,
         metering_enabled,
         average_power: Vec::new(),
@@ -563,13 +595,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSTimeInterval)currentTime {
-    let host_object = env.objc.borrow::<AVAudioPlayerHostObject>(this);
-    let current_time = if let Some(audio_desc) = host_object.audio_desc {
-        let current_frame = (host_object.current_packet as f64) * (audio_desc.frames_per_packet as f64);
-        current_frame / audio_desc.sample_rate
-    } else {
-        0.0
+    // Playback position is consumed samples, not the decoder's read-ahead.
+    // https://developer.apple.com/documentation/avfaudio/avaudioplayer/currenttime
+    let (queue, desc, offset, has_looped) = {
+        let host = env.objc.borrow::<AVAudioPlayerHostObject>(this);
+        (host.audio_queue, host.audio_desc, host.set_current_time, host.has_looped)
     };
+    let mut current_time = offset;
+    if let (Some(queue), Some(desc)) = (queue, desc) {
+        let timestamp = env.mem.alloc(guest_size_of::<AudioTimeStamp>()).cast();
+        if AudioQueueGetCurrentTime(env, queue, Ptr::null(), timestamp, Ptr::null()) == 0 {
+            let timestamp: AudioTimeStamp = env.mem.read(timestamp);
+            current_time += timestamp.sample_time / desc.sample_rate;
+        }
+        env.mem.free(timestamp.cast());
+        let duration: NSTimeInterval = msg![env; this duration];
+        current_time = playback_time_within_file(current_time, duration, has_looped);
+    }
     log_dbg!("[(AVAudioPlayer *) {:?} currentTime] -> {:?}", this, current_time);
     current_time
 }
@@ -582,8 +624,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setCurrentTime:(NSTimeInterval)currentTime {
+    let was_playing = env.objc.borrow::<AVAudioPlayerHostObject>(this).is_playing;
     let host_object = env.objc.borrow_mut::<AVAudioPlayerHostObject>(this);
-    host_object.set_current_time = currentTime;
+    host_object.set_current_time = if currentTime.is_finite() { currentTime.max(0.0) } else { 0.0 };
+    host_object.read_eof = false;
+    host_object.has_looped = false;
     if let (Some(audio_desc), Some(audio_file_id)) = (host_object.audio_desc, host_object.audio_file_id) {
 
         let target_host_obj = audio_file::State::get(&mut env.framework_state)
@@ -601,11 +646,27 @@ pub const CLASSES: ClassExports = objc_classes! {
         };
 
         let total_frames = total_packets * audio_desc.frames_per_packet as u64;
-        let new_current_frame = audio_desc.sample_rate * currentTime;
+        let new_current_frame = audio_desc.sample_rate * host_object.set_current_time;
         if new_current_frame < 0.0 || new_current_frame > total_frames as f64 {
             host_object.current_packet = 0;
+            host_object.set_current_time = 0.0;
         } else {
             host_object.current_packet = (new_current_frame / (audio_desc.frames_per_packet as f64)) as i64;
+        }
+    }
+    let (queue, buffers) = {
+        let host = env.objc.borrow::<AVAudioPlayerHostObject>(this);
+        (host.audio_queue, host.audio_queue_buffers)
+    };
+    if let (Some(queue), Some(_)) = (queue, buffers) {
+        // Discard old queued PCM before refilling from the new packet position.
+        AudioQueueStop(env, queue, true);
+        prime_player_buffers(env, this);
+        if was_playing {
+            AudioQueueStart(env, queue, Ptr::null());
+            if env.objc.borrow::<AVAudioPlayerHostObject>(this).read_eof {
+                AudioQueueStop(env, queue, false);
+            }
         }
     }
     log_dbg!("[(AVAudioPlayer *) {:?} setCurrentTime: {}]", this, currentTime);
@@ -1089,6 +1150,81 @@ fn derive_buffer_size(
     (out_buffer_size, out_num_packets_to_read)
 }
 
+/// Clamp fractional seek/packet rounding at EOF; only repeated audio wraps.
+fn playback_time_within_file(
+    time: NSTimeInterval,
+    duration: NSTimeInterval,
+    has_looped: bool,
+) -> NSTimeInterval {
+    if duration > 0.0 && time > duration {
+        if has_looped {
+            time % duration
+        } else {
+            duration
+        }
+    } else {
+        time
+    }
+}
+
+/// Prime buffers without changing whether the player is publicly playing.
+fn prime_player_buffers(env: &mut Environment, player: id) {
+    let (queue, buffers, was_playing) = {
+        let host = env.objc.borrow_mut::<AVAudioPlayerHostObject>(player);
+        host.needs_priming = false;
+        (host.audio_queue, host.audio_queue_buffers, host.is_playing)
+    };
+    let (Some(queue), Some(buffers)) = (queue, buffers) else {
+        return;
+    };
+    env.objc.borrow_mut::<AVAudioPlayerHostObject>(player).is_playing = true;
+    for i in 0..kNumberBuffers {
+        let buffer = env.mem.read(buffers + i as u32);
+        _touchHLE_AVAudioPlayerOutputBufferHelper(env, player.cast(), queue, buffer);
+    }
+    env.objc.borrow_mut::<AVAudioPlayerHostObject>(player).is_playing = was_playing;
+}
+
+/// AudioFile EOF may be reached a second before the buffered audio plays.
+/// Apple's completion delegate is for the latter, not the decoder's EOF.
+/// https://developer.apple.com/documentation/avfaudio/avaudioplayerdelegate/audioplayerdidfinishplaying(_:successfully:)
+fn _touchHLE_AVAudioPlayerQueueStateChanged(
+    env: &mut Environment,
+    user_data: MutVoidPtr,
+    queue: AudioQueueRef,
+    _property: u32,
+) {
+    let player: id = user_data.cast();
+    let host = env.objc.borrow::<AVAudioPlayerHostObject>(player);
+    if host.audio_queue != Some(queue) || !host.read_eof || !host.is_playing {
+        return;
+    }
+    let running = env.mem.alloc_and_write(0u32);
+    let size = env.mem.alloc_and_write(guest_size_of::<u32>());
+    let status = AudioQueueGetProperty(
+        env, queue, kAudioQueueProperty_IsRunning, running.cast(), size,
+    );
+    let stopped = status == 0 && env.mem.read(running) == 0;
+    env.mem.free(running.cast());
+    env.mem.free(size.cast());
+    if !stopped {
+        return;
+    }
+    let host = env.objc.borrow_mut::<AVAudioPlayerHostObject>(player);
+    host.is_playing = false;
+    host.read_eof = false;
+    host.needs_priming = true;
+    host.has_looped = false;
+    host.current_packet = 0;
+    host.set_current_time = 0.0;
+    let delegate = host.delegate;
+    if delegate != nil && env.objc.object_has_method_named(
+        &env.mem, delegate, "audioPlayerDidFinishPlaying:successfully:",
+    ) {
+        () = msg![env; delegate audioPlayerDidFinishPlaying:player successfully:true];
+    }
+}
+
 fn _touchHLE_AVAudioPlayerOutputBufferHelper(
     env: &mut Environment,
     in_user_data: MutVoidPtr,
@@ -1188,7 +1324,7 @@ fn _touchHLE_AVAudioPlayerOutputBufferHelper(
         return;
     }
 
-    if !is_playing {
+    if !is_playing || env.objc.borrow::<AVAudioPlayerHostObject>(av_audio_player).read_eof {
         return;
     }
 
@@ -1280,27 +1416,13 @@ fn _touchHLE_AVAudioPlayerOutputBufferHelper(
             .borrow::<AVAudioPlayerHostObject>(av_audio_player)
             .num_of_loops;
         if number_of_loops == 0 {
+            env.objc.borrow_mut::<AVAudioPlayerHostObject>(av_audio_player).read_eof = true;
             let stop_status = AudioQueueStop(env, aq, false);
             if stop_status != 0 {
                 log!("Warning: AudioQueueStop failed with status {}", stop_status);
             }
-            env.objc
-                .borrow_mut::<AVAudioPlayerHostObject>(av_audio_player)
-                .is_playing = false;
-            let delegate = env
-                .objc
-                .borrow::<AVAudioPlayerHostObject>(av_audio_player)
-                .delegate;
-            if delegate != nil {
-                let successfully: bool = true;
-                () = msg![
-                    env;
-                    delegate
-                    audioPlayerDidFinishPlaying:av_audio_player
-                    successfully:successfully
-                ];
-            }
         } else {
+            env.objc.borrow_mut::<AVAudioPlayerHostObject>(av_audio_player).has_looped = true;
             if number_of_loops > 0 {
                 env.objc
                     .borrow_mut::<AVAudioPlayerHostObject>(av_audio_player)
@@ -1324,7 +1446,18 @@ fn _touchHLE_AVAudioPlayerOutputBufferHelper(
 
 #[cfg(test)]
 mod meter_tests {
-    use super::pcm_meter_levels;
+    use super::{pcm_meter_levels, playback_time_within_file};
+
+    #[test]
+    fn playback_time_only_wraps_after_a_repeat() {
+        // Seeking floors the packet position but preserves the requested
+        // fractional offset. At the end that can add a fraction of a sample;
+        // it must not make a non-looping player's clock jump back to zero.
+        assert_eq!(playback_time_within_file(1.000_01, 1.0, false), 1.0);
+        assert_eq!(playback_time_within_file(2.25, 1.0, true), 0.25);
+        assert_eq!(playback_time_within_file(0.5, 1.0, true), 0.5);
+        assert_eq!(playback_time_within_file(1.0, 1.0, false), 1.0);
+    }
 
     #[test]
     fn meter_normalizes_peak_and_rms_to_dbfs() {

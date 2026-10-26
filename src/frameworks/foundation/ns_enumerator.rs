@@ -16,7 +16,7 @@
 //! - The GCC documentation's [Fast Enumeration Protocol section](https://gcc.gnu.org/onlinedocs/gcc/Fast-enumeration-protocol.html)
 
 use crate::mem::{MutPtr, MutVoidPtr, SafeRead};
-use crate::objc::{id, msg, nil, objc_classes, ClassExports};
+use crate::objc::{autorelease, id, msg, nil, objc_classes, retain, ClassExports};
 use crate::Environment;
 
 use super::NSUInteger;
@@ -37,6 +37,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 // Abstract class. Subclass must implement:
 // - (id)nextObject;
 @implementation NSEnumerator: NSObject
+
+// Apple's allObjects consumes only the remaining objects, in the order
+// supplied by nextObject. Implement on the abstract base so array, dictionary,
+// directory, and application-defined enumerators all receive the same behavior.
+// https://developer.apple.com/documentation/foundation/nsenumerator/allobjects
+- (id)allObjects {
+    let mut objects = Vec::new();
+    loop {
+        let object: id = msg![env; this nextObject];
+        if object == nil { break; }
+        retain(env, object);
+        objects.push(object);
+    }
+    let result = super::ns_array::from_vec(env, objects);
+    autorelease(env, result)
+}
 
 // NSFastEnumeration (convenience) implementation
 - (NSUInteger)countByEnumeratingWithState:(MutPtr<NSFastEnumerationState>)state

@@ -388,7 +388,15 @@ pub const CLASSES: ClassExports = objc_classes! {
             selector,
             event_mask,
         );
-        () = msg![env; source addTarget:destination action:action forControlEvents:event_mask];
+        let bar_item = env.objc.get_known_class("UIBarButtonItem", &mut env.mem);
+        if msg![env; source isKindOfClass:bar_item] {
+            // UIBarButtonItem is a target/action object, not a UIControl.
+            // Archived bar actions have no UIControl event mask.
+            () = msg![env; source setTarget:destination];
+            () = msg![env; source setAction:action];
+        } else {
+            () = msg![env; source addTarget:destination action:action forControlEvents:event_mask];
+        }
     } else {
         log!(
             "Warning: UIRuntimeEventConnection skipping connect — source={:?} destination={:?} label={:?}",
@@ -410,7 +418,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    env.objc.dealloc_object(this, &mut env.mem)
+    msg_super![env; this dealloc]
 }
 
 @end
@@ -496,6 +504,59 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+#[cfg(test)]
+mod bar_action_tests {
+    use super::*;
+
+    // A nib's bar-item action connection has no UIControl event mask.
+    // https://developer.apple.com/documentation/uikit/uibarbuttonitem/action
+    #[test]
+    fn bar_action_connection_sets_properties_and_releases_its_objects() {
+        let mut env = crate::environment::touch_test_environment();
+        let env = &mut env;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let item: id = msg_class![env; UIBarButtonItem new];
+        let receiver: id = msg_class![env; UIView new];
+        let label = get_static_str(env, "setTag:");
+        let connection: id = msg_class![env; UIRuntimeEventConnection alloc];
+        for object in [item, receiver, label] { retain(env, object); }
+        let host = env.objc.borrow_mut::<UIRuntimeConnectionHostObject>(connection);
+        host.source = item;
+        host.destination = receiver;
+        host.label = label;
+        () = msg![env; connection connect];
+        let target: id = msg![env; item target];
+        let action: crate::objc::SEL = msg![env; item action];
+        assert_eq!(target, receiver);
+        assert!(action.name_eq(&env.mem, b"setTag:"));
+        let _application: id = msg_class![env; UIApplication new];
+        let frame = crate::frameworks::core_graphics::CGRect {
+            origin: Default::default(),
+            size: crate::frameworks::core_graphics::CGSize { width: 100.0, height: 100.0 },
+        };
+        let window: id = msg_class![env; UIWindow alloc];
+        let window: id = msg![env; window initWithFrame:frame];
+        let toolbar: id = msg_class![env; UIToolbar alloc];
+        let toolbar: id = msg![env; toolbar initWithFrame:frame];
+        () = msg![env; item setWidth:44.0f32];
+        let items: id = msg_class![env; NSArray arrayWithObject:item];
+        () = msg![env; toolbar setItems:items];
+        () = msg![env; window addSubview:toolbar];
+        () = msg![env; window setHidden:false];
+        let point = || std::collections::HashMap::from([(crate::window::FingerId::Mouse, (20.0, 20.0))]);
+        super::super::ui_touch::handle_event(env, crate::window::Event::TouchesDown(point()));
+        super::super::ui_touch::handle_event(env, crate::window::Event::TouchesUp(point()));
+        let received: crate::frameworks::foundation::NSInteger = msg![env; receiver tag];
+        assert_eq!(received, item.to_bits() as i32);
+        let item_refs = env.objc.get_refcount(item).get();
+        release(env, connection);
+        assert_eq!(env.objc.get_refcount(item).get(), item_refs - 1);
+        assert_eq!(env.objc.get_refcount(receiver).get(), 1);
+        () = msg![env; toolbar setItems:nil];
+        for object in [window, toolbar, item, receiver, pool] { release(env, object); }
+    }
+}
 
 fn load_nib_file(env: &mut Environment, ui_nib: id, path: GuestPathBuf) -> Result<id, ()> {
     let path_str = ns_string::from_rust_string(env, path.as_str().to_string());

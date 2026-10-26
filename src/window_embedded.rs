@@ -80,6 +80,7 @@ pub struct Window {
     high_priority_event: Option<Event>,
     last_polled: Instant,
     scale_hack: NonZeroU32,
+    preserve_aspect_ratio: bool,
     host_screen_size: Option<(u32, u32)>,
     drawable: (u32, u32),
     internal_gl_ins: Option<Box<dyn GLESContext>>,
@@ -89,6 +90,7 @@ pub struct Window {
     splash_image_is_orientation_specific: bool,
     device_family: DeviceFamily,
     device_orientation: DeviceOrientation,
+    screen_coordinates: geometry::ScreenCoordinates,
     screen_saver_enabled: bool,
     text_input_active: Cell<bool>,
     share_with_current: Cell<bool>,
@@ -140,10 +142,11 @@ impl Window {
     ) -> Result<Window, String> {
         let mut egl = Egl::new(!options.gles_native)?;
         let scale_hack = options.scale_hack;
-        let host_screen_size = options
-            .host_screen_size
-            .map(normalize_portrait_size)
-            .or_else(crate::embed::host_screen);
+        // The host surface is the presentation target, not the guest display.
+        // Auto selection already resolves it into options.host_screen_size in
+        // Environment::new. A fixed device profile must keep its point size
+        // and Retina scale, just like the SDL backend does.
+        let host_screen_size = options.host_screen_size.map(normalize_portrait_size);
         let device_family = options.device_family.unwrap_or(DeviceFamily::iPhone);
         let device_orientation = options.initial_orientation;
         let (splash_image, splash_image_is_orientation_specific) = launch_image
@@ -155,6 +158,7 @@ impl Window {
             high_priority_event: None,
             last_polled: Instant::now() - Duration::from_secs(1),
             scale_hack,
+            preserve_aspect_ratio: options.preserve_aspect_ratio,
             host_screen_size,
             drawable,
             internal_gl_ins: None,
@@ -164,6 +168,7 @@ impl Window {
             splash_image_is_orientation_specific,
             device_family,
             device_orientation,
+            screen_coordinates: geometry::ScreenCoordinates::new(options),
             screen_saver_enabled: true,
             text_input_active: Cell::new(false),
             share_with_current: Cell::new(false),
@@ -463,9 +468,9 @@ impl Window {
         {
             [x, y]
         } else {
-            self.rotation_matrix().inverse().unwrap().transform([x, y])
+            self.screen_coordinate_rotation().inverse().unwrap().transform([x, y])
         };
-        let (out_w, out_h) = self.size_unrotated_unscaled();
+        let (out_w, out_h) = self.screen_coordinate_size();
         let out_x = ((x + 0.5) * out_w as f32).clamp(0.0, out_w.saturating_sub(1) as f32);
         let out_y = ((y + 0.5) * out_h as f32).clamp(0.0, out_h.saturating_sub(1) as f32);
         (out_x.round(), out_y.round())
@@ -703,6 +708,17 @@ impl Window {
             .unwrap_or_else(|| self.device_family.portrait_size())
     }
 
+    /// UIKit's current screen coordinate space, in logical points.
+    pub fn screen_coordinate_size(&self) -> (u32, u32) {
+        self.screen_coordinates
+            .size(self.screen_size(), self.device_orientation)
+    }
+
+    /// Rotation from the UIKit screen coordinate space to the host display.
+    pub fn screen_coordinate_rotation(&self) -> Matrix<2> {
+        self.screen_coordinates.rotation(self.device_orientation)
+    }
+
     pub fn screen_scale(&self) -> f32 {
         if self.host_screen_size.is_some() {
             1.0
@@ -734,52 +750,18 @@ impl Window {
         } else {
             self.drawable
         };
-        geometry::fit_viewport(app, screen)
+        geometry::display_viewport(app, screen, self.preserve_aspect_ratio)
     }
 
     pub fn guest_frame_to_window_px(
         &self,
         frame: crate::frameworks::core_graphics::CGRect,
     ) -> (i32, i32, i32, i32) {
-        let (vp_x, vp_y, vp_w, vp_h) = self.viewport();
-        let (app_w, app_h) = self.size_unrotated_unscaled();
-        let (app_w, app_h) = (app_w as f32, app_h as f32);
-        if app_w <= 0.0 || app_h <= 0.0 || vp_w == 0 || vp_h == 0 {
-            return (0, 0, 0, 0);
-        }
-        let sx = vp_w as f32 / app_w;
-        let sy = vp_h as f32 / app_h;
-        let (x, y, w, h) = match self.device_orientation {
-            DeviceOrientation::Portrait => (
-                frame.origin.x as f32,
-                frame.origin.y as f32,
-                frame.size.width as f32,
-                frame.size.height as f32,
-            ),
-            DeviceOrientation::PortraitUpsideDown => (
-                app_w - frame.origin.x as f32 - frame.size.width as f32,
-                app_h - frame.origin.y as f32 - frame.size.height as f32,
-                frame.size.width as f32,
-                frame.size.height as f32,
-            ),
-            DeviceOrientation::LandscapeLeft => (
-                frame.origin.y as f32,
-                app_w - frame.origin.x as f32 - frame.size.width as f32,
-                frame.size.height as f32,
-                frame.size.width as f32,
-            ),
-            DeviceOrientation::LandscapeRight => (
-                app_h - frame.origin.y as f32 - frame.size.height as f32,
-                frame.origin.x as f32,
-                frame.size.height as f32,
-                frame.size.width as f32,
-            ),
-        };
-        (
-            (vp_x as f32 + x * sx).round() as i32,
-            (vp_y as f32 + y * sy).round() as i32,
-            (w * sx).round().max(0.0) as i32,
-            (h * sy).round().max(0.0) as i32,
+        self.screen_coordinates.frame_to_viewport(
+            frame,
+            self.screen_size(),
+            self.device_orientation,
+            self.viewport(),
         )
     }
 

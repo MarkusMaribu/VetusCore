@@ -74,8 +74,15 @@ extern NSString *const NSDefaultRunLoopMode;
 int test_NSHashTable_copy_is_independent(void);
 int test_NSHashTable_copy_owns_members(void);
 int test_NSHashTable_copy_empty(void);
+int test_NSRegularExpression_copy_survives_pool(void);
+int test_dictionary_subclasses_preserve_identity_and_storage(void);
 int test_NSData_base64_data(void);
+int test_NSJSONSerialization_retained_result_survives_pool(void);
 int test_CGFont_bbox_struct_return_preserves_font(void);
+int test_CGContext_image_fill_alpha_and_blending(void);
+int test_CoreData_attributes_fetch_and_sqlite_reopen(void);
+int test_NSPredicate_typed_comparisons_and_compounds(void);
+int test_NSEnumerator_allObjects_consumes_remaining(void);
 int test_UIWebView_frame_and_navigation_veto(void);
 int test_UIView_layout_deferred_and_coalesced(void);
 int test_UIView_layout_dirty_descendants(void);
@@ -84,6 +91,18 @@ int test_UIView_layout_preserves_autoresizing_geometry(void);
 int test_UIView_flip_keeps_removed_layers_alive(void);
 int test_UIView_block_interpolates_layer_transform(void);
 int test_UIView_EAGL_retina_is_opt_in(void);
+int test_UIViewController_replacing_window_root_view(void);
+int test_UIViewController_unmounted_view_stays_unmounted(void);
+int test_UITextField_programmatic_text_does_not_notify(void);
+int test_UITextField_keyboard_hide_can_end_editing_again(void);
+int test_UIImagePicker_controller_state_and_sources(void);
+int test_UIGraphics_transparent_images_preserve_background(void);
+int test_UIView_nib_opacity_and_clipping(void);
+int test_UINavigation_nib_items_and_controls(void);
+int test_UIImage_JPEG_representation(void);
+int test_UIImage_save_completion_is_deferred_and_reports_failure(void);
+int test_UIActionSheet_selection_and_variadic_buttons(void);
+int test_CALayer_mask_and_view_clipping(void);
 int test_UIView_flip_preserves_nested_removed_layers(void);
 int test_sqlite_cursor_bindings_and_metadata(void);
 int test_sqlite_pragma_schema_enumeration_terminates(void);
@@ -613,6 +632,43 @@ int test_scheduled_invocation_timer_default_mode(void) {
   return check_scheduled_timer_default_mode(YES);
 }
 
+// Timers added by a callback must affect the next run-loop wakeup.
+// Doodle Jump 1.24 chains its update and presentation this way. Sleeping
+// for the polling interval after each callback halves its frame rate.
+// https://developer.apple.com/documentation/foundation/runloop
+@interface ChainedTimerProbe : NSObject {
+@public
+  int calls;
+  NSTimer *pending;
+}
+- (void)tick:(NSTimer *)timer;
+@end
+
+@implementation ChainedTimerProbe
+- (void)tick:(NSTimer *)timer {
+  pending = nil;
+  calls++;
+  if (calls < 24) {
+    pending = [NSTimer scheduledTimerWithTimeInterval:0.001 target:self
+        selector:@selector(tick:) userInfo:nil repeats:NO];
+  }
+}
+@end
+
+int test_runloop_chained_timer_deadlines(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  ChainedTimerProbe *probe = [[ChainedTimerProbe alloc] init];
+  [probe tick:nil];
+  // Allow ample scheduler slack for 23 one-millisecond timers. With the
+  // stale timer snapshot, the chain takes at least 23 * 16 ms instead.
+  CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.2, false);
+  int result = probe->calls == 24 ? 0 : -1;
+  [probe->pending invalidate];
+  [probe release];
+  [pool drain];
+  return result;
+}
+
 extern void dispatch_after_f(dispatch_time_t when, dispatch_queue_t queue,
                              void *context, void (*work)(void *));
 static void scheduled_dispatch_function(void *context) {
@@ -660,6 +716,8 @@ int test_dispatch_after_common_mode(void) {
   return check_dispatch_after_source(NO, YES);
 }
 extern int test_audio_queue_timeline(void);
+extern int test_AVAudioPlayer_playback_clock_and_seek(void);
+extern int test_AVAudioPlayer_finish_waits_for_drain(void);
 extern int test_runloop_audio_queue(void);
 extern int test_runloop_audio_queue_null(void);
 extern int test_runloop_audio_unit_independent(void);
@@ -2901,6 +2959,38 @@ int test_pthread_mutex_normal() {
   if (normal_unlock_res != 0)
     return -9;
 
+  return 0;
+}
+
+// Darwin's NORMAL mutex lock waits even when the caller already owns it.
+// Another thread can release the gate, as in test_pthread_mutex_normal above.
+// https://github.com/apple-oss-distributions/libpthread/blob/main/src/pthread_mutex.c
+// See _pthread_mutex_lock_handle_options: NORMAL skips EDEADLK checking.
+static volatile int normal_gate_released;
+static int normal_gate_unlock_result;
+
+static void *normal_gate_unlocker(void *arg) {
+  usleep(20000);
+  normal_gate_released = 1;
+  normal_gate_unlock_result = pthread_mutex_unlock(&normal_mutex);
+  return NULL;
+}
+
+int test_pthread_mutex_normal_relock_waits_for_release() {
+  normal_gate_released = 0;
+  normal_gate_unlock_result = -1;
+  if (pthread_mutex_init(&normal_mutex, NULL) != 0) return -1;
+  if (pthread_mutex_lock(&normal_mutex) != 0) return -2;
+  pthread_t worker;
+  if (pthread_create(&worker, NULL, normal_gate_unlocker, NULL) != 0) return -3;
+  int lock_result = pthread_mutex_lock(&normal_mutex);
+  int released_before_lock_returned = normal_gate_released;
+  pthread_join(worker, NULL);
+  int unlock_result = pthread_mutex_unlock(&normal_mutex);
+  int destroy_result = pthread_mutex_destroy(&normal_mutex);
+  if (lock_result != 0 || normal_gate_unlock_result != 0) return -4;
+  if (!released_before_lock_returned) return -5;
+  if (unlock_result != 0 || destroy_result != 0) return -6;
   return 0;
 }
 
@@ -7594,6 +7684,57 @@ static int test_GL_generation_without_context(void) {
     return 0;
 }
 
+// Prefix parsing is required by packed configuration values such as UE3's
+// "MaxLODSize=4096,LODBias=0". A conversion must stop at the delimiter.
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/wcstol.3.html
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/wcstod.3.html
+static int test_wide_numeric_prefixes(void) {
+    wchar_t *end;
+    const wchar_t *text = L"4096,LODBias=0";
+    errno = 17;
+    if (wcstoul(text, &end, 10) != 4096 || end != text + 4 || errno != 17) return -1;
+    text = L" \t-077rest";
+    if (wcstol(text, &end, 0) != -63 || end != text + 6) return -2;
+    text = L"+0XfFz";
+    if (wcstoul(text, &end, 0) != 255 || end != text + 5) return -3;
+    text = L"0xg";
+    if (wcstoul(text, &end, 0) != 0 || end != text + 1) return -4;
+    text = L"  +suffix";
+    if (wcstol(text, &end, 10) != 0 || end != text) return -5;
+    text = L"1012";
+    if (wcstoul(text, &end, 2) != 5 || end != text + 3) return -6;
+    text = L"-1,";
+    if (wcstoul(text, &end, 10) != ULONG_MAX || end != text + 2) return -7;
+    text = L"184467440737095516160tail";
+    errno = 0;
+    if (wcstoul(text, &end, 10) != ULONG_MAX || errno != ERANGE || end != text + 21) return -8;
+    text = sizeof(long) == 4 ? L"-2147483648," : L"-9223372036854775808,";
+    errno = 0;
+    if (wcstol(text, &end, 10) != LONG_MIN || *end != L',' || errno != 0) return -9;
+    text = L" -0.5,Next=1";
+    if (wcstod(text, &end) != -0.5 || end != text + 5) return -12;
+    text = L"1.25e+2tail";
+    if (wcstod(text, &end) != 125.0 || end != text + 7) return -13;
+    text = L"1e+oops";
+    if (wcstod(text, &end) != 1.0 || end != text + 1) return -14;
+    text = L"0x1.8p+2suffix";
+    if (wcstod(text, &end) != 6.0 || end != text + 8) return -15;
+    text = L".suffix";
+    if (wcstod(text, &end) != 0.0 || end != text) return -16;
+    text = L"1.5\u03a9";
+    if (wcstof(text, &end) != 1.5f || end != text + 3) return -17;
+    text = L"1e9999,";
+    errno = 0;
+    if (!isinf(wcstod(text, &end)) || errno != ERANGE || end != text + 6) return -18;
+    text = L"1e-9999,";
+    errno = 0;
+    if (wcstod(text, &end) != 0.0 || errno != ERANGE || end != text + 7) return -19;
+    text = L"1e100,";
+    errno = 0;
+    if (!isinf(wcstof(text, &end)) || errno != ERANGE || end != text + 5) return -20;
+    return 0;
+}
+
 #define FUNC_DEF(func)                                                         \
   { &func, #func }
 struct {
@@ -7610,6 +7751,11 @@ struct {
     FUNC_DEF(test_cpp_virtual_inheritance),
 #endif
     FUNC_DEF(test_qsort),
+    FUNC_DEF(test_wide_numeric_prefixes),
+    FUNC_DEF(test_CGContext_image_fill_alpha_and_blending),
+    FUNC_DEF(test_CoreData_attributes_fetch_and_sqlite_reopen),
+    FUNC_DEF(test_NSPredicate_typed_comparisons_and_compounds),
+    FUNC_DEF(test_NSEnumerator_allObjects_consumes_remaining),
     FUNC_DEF(test_vsnprintf),
     FUNC_DEF(test_sscanf),
     FUNC_DEF(test_sscanf_integer_overflow),
@@ -7666,6 +7812,7 @@ struct {
     FUNC_DEF(test_cond_timedwait_flag_not_sticky),
     FUNC_DEF(test_cond_timedwait_sibling_not_dropped),
     FUNC_DEF(test_pthread_mutex_normal),
+    FUNC_DEF(test_pthread_mutex_normal_relock_waits_for_release),
     FUNC_DEF(test_pthread_mutex_recursive_trylock),
     FUNC_DEF(test_CFMutableDictionary_NullCallbacks),
     FUNC_DEF(test_CFMutableDictionary_NullValue),
@@ -7738,6 +7885,19 @@ struct {
     FUNC_DEF(test_UIView_flip_keeps_removed_layers_alive),
     FUNC_DEF(test_UIView_block_interpolates_layer_transform),
     FUNC_DEF(test_UIView_EAGL_retina_is_opt_in),
+    FUNC_DEF(test_UIViewController_replacing_window_root_view),
+    FUNC_DEF(test_UIViewController_unmounted_view_stays_unmounted),
+    FUNC_DEF(test_UITextField_programmatic_text_does_not_notify),
+    FUNC_DEF(test_UITextField_keyboard_hide_can_end_editing_again),
+    FUNC_DEF(test_UIImagePicker_controller_state_and_sources),
+    FUNC_DEF(test_UIGraphics_transparent_images_preserve_background),
+    FUNC_DEF(test_UIView_nib_opacity_and_clipping),
+    FUNC_DEF(test_UINavigation_nib_items_and_controls),
+    FUNC_DEF(test_UIImage_JPEG_representation),
+    FUNC_DEF(test_UIImage_save_completion_is_deferred_and_reports_failure),
+    FUNC_DEF(test_UIActionSheet_selection_and_variadic_buttons),
+    FUNC_DEF(test_NSJSONSerialization_retained_result_survives_pool),
+    FUNC_DEF(test_CALayer_mask_and_view_clipping),
     FUNC_DEF(test_UIView_flip_preserves_nested_removed_layers),
     FUNC_DEF(test_sqlite_cursor_bindings_and_metadata),
     FUNC_DEF(test_sqlite_pragma_schema_enumeration_terminates),
@@ -7746,12 +7906,15 @@ struct {
     FUNC_DEF(test_dispatch_after_f_default_mode),
     FUNC_DEF(test_dispatch_after_common_mode),
     FUNC_DEF(test_audio_queue_timeline),
+    FUNC_DEF(test_AVAudioPlayer_playback_clock_and_seek),
+    FUNC_DEF(test_AVAudioPlayer_finish_waits_for_drain),
     FUNC_DEF(test_GL_generation_without_context),
     FUNC_DEF(test_runloop_audio_queue),
     FUNC_DEF(test_runloop_audio_queue_null),
     FUNC_DEF(test_runloop_audio_unit_independent),
     FUNC_DEF(test_remote_io_recording_callback),
     FUNC_DEF(test_runloop_timer_waits_until_deadline),
+    FUNC_DEF(test_runloop_chained_timer_deadlines),
     FUNC_DEF(test_runloop_nil_date_polls),
     FUNC_DEF(test_runloop_common_is_not_a_run_mode),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
@@ -7759,6 +7922,8 @@ struct {
     FUNC_DEF(test_NSHashTable_copy_is_independent),
     FUNC_DEF(test_NSHashTable_copy_owns_members),
     FUNC_DEF(test_NSHashTable_copy_empty),
+    FUNC_DEF(test_NSRegularExpression_copy_survives_pool),
+    FUNC_DEF(test_dictionary_subclasses_preserve_identity_and_storage),
     FUNC_DEF(test_NSData_base64_data),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     FUNC_DEF(test_NSBundle_qualified_resource_stays_in_requested_directory),

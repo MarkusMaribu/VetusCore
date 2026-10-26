@@ -26,9 +26,22 @@ pub struct HostFns {
     pub open_url: fn(&str) -> bool,
     pub alert: fn(&str, &str, &[&str]) -> i32,
     pub crash: fn(&str),
+    pub photo_picker: fn(u32) -> bool,
+    pub save_image: fn(&str) -> bool,
+    pub camera_available: fn(bool) -> bool,
+    pub camera_flash_available: fn(bool) -> bool,
+    pub camera_start: fn(bool, i32) -> bool,
+    pub camera_stop: fn(),
+    pub camera_frame: fn() -> Option<Vec<u8>>,
+    pub camera_capture: fn(u32) -> bool,
 }
 
 fn noop_i32(_: i32) {}
+fn noop_photo_picker(_: u32) -> bool { false }
+fn noop_camera_query(_: bool) -> bool { false }
+fn noop_camera_start(_: bool, _: i32) -> bool { false }
+fn noop_camera_stop() {}
+fn noop_camera_frame() -> Option<Vec<u8>> { None }
 fn noop_bool(_: bool) {}
 fn noop_keyboard(_: bool, _: &str) {}
 fn noop_url(_: &str) -> bool {
@@ -49,6 +62,14 @@ const NOOP_HOST: HostFns = HostFns {
     open_url: noop_url,
     alert: noop_alert,
     crash: noop_crash,
+    photo_picker: noop_photo_picker,
+    save_image: noop_url,
+    camera_available: noop_camera_query,
+    camera_flash_available: noop_camera_query,
+    camera_start: noop_camera_start,
+    camera_stop: noop_camera_stop,
+    camera_frame: noop_camera_frame,
+    camera_capture: noop_photo_picker,
 };
 
 fn host() -> &'static Mutex<HostFns> {
@@ -99,6 +120,112 @@ pub fn alert(title: &str, message: &str, buttons: &[&str]) -> i32 {
 
 pub fn report_crash(message: &str) {
     (host().lock().unwrap().crash)(message);
+}
+
+type PhotoPickerResult = (u32, Option<Vec<u8>>);
+#[derive(Default)]
+struct PhotoPickerMailbox {
+    request: Option<u32>,
+    result: Option<PhotoPickerResult>,
+}
+impl PhotoPickerMailbox {
+    fn begin(&mut self, request: u32) {
+        self.request = Some(request);
+        self.result = None;
+    }
+    fn post(&mut self, request: u32, bytes: Option<Vec<u8>>) {
+        if self.request == Some(request) && self.result.is_none() {
+            self.result = Some((request, bytes));
+        }
+    }
+    fn take(&mut self) -> Option<PhotoPickerResult> {
+        let result = self.result.take()?;
+        self.request = None;
+        Some(result)
+    }
+}
+static PHOTO_PICKER_RESULT: Mutex<PhotoPickerMailbox> = Mutex::new(PhotoPickerMailbox {
+    request: None, result: None,
+});
+
+/// Start asynchronously: the emulation thread must keep servicing surfaces
+/// while the host picker owns the screen.
+pub fn request_photo_picker(request: u32) {
+    PHOTO_PICKER_RESULT.lock().unwrap().begin(request);
+    let callback = host().lock().unwrap().photo_picker;
+    let allowed = camera_roll_allowed();
+    let accepted = allowed && callback(request);
+    log!("Photo picker request {request}: camera_roll_allowed={allowed}, host_accepted={accepted}");
+    if !accepted {
+        post_photo_picker_result(request, None);
+    }
+}
+
+pub fn post_photo_picker_result(request: u32, bytes: Option<Vec<u8>>) {
+    PHOTO_PICKER_RESULT.lock().unwrap().post(request, bytes);
+}
+
+pub fn take_photo_picker_result() -> Option<PhotoPickerResult> {
+    PHOTO_PICKER_RESULT.lock().unwrap().take()
+}
+
+static CAMERA_RESULT: Mutex<PhotoPickerMailbox> = Mutex::new(PhotoPickerMailbox {
+    request: None, result: None,
+});
+
+/// Hardware discovery does not open the camera or request permission.
+pub fn camera_available(front: bool) -> bool {
+    let callback = host().lock().unwrap().camera_available;
+    callback(front)
+}
+pub fn camera_flash_available(front: bool) -> bool {
+    let callback = host().lock().unwrap().camera_flash_available;
+    callback(front)
+}
+pub fn start_camera(front: bool, flash: i32) -> bool {
+    let callback = host().lock().unwrap().camera_start;
+    camera_allowed() && callback(front, flash)
+}
+pub fn stop_camera() {
+    *CAMERA_RESULT.lock().unwrap() = PhotoPickerMailbox::default();
+    let callback = host().lock().unwrap().camera_stop;
+    callback();
+}
+/// The host replaces its latest preview rather than accumulating queued frames.
+pub fn take_camera_frame() -> Option<Vec<u8>> {
+    if !camera_allowed() { return None; }
+    let callback = host().lock().unwrap().camera_frame;
+    callback()
+}
+pub fn request_camera_photo(request: u32) {
+    CAMERA_RESULT.lock().unwrap().begin(request);
+    let callback = host().lock().unwrap().camera_capture;
+    if !camera_allowed() || !callback(request) {
+        post_camera_photo_result(request, None);
+    }
+}
+pub fn post_camera_photo_result(request: u32, bytes: Option<Vec<u8>>) {
+    CAMERA_RESULT.lock().unwrap().post(request, bytes);
+}
+pub fn take_camera_photo_result() -> Option<PhotoPickerResult> {
+    CAMERA_RESULT.lock().unwrap().take()
+}
+
+/// Export through a temporary file so large photos never cross Binder as bytes.
+/// The host only adds the guest's own image; it does not read the photo library.
+pub fn save_image(png: &[u8]) -> bool {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let directory = user_data_path().join("photo_exports");
+    if std::fs::create_dir_all(&directory).is_err() { return false; }
+    let path = directory.join(format!("image-{}.png", NEXT.fetch_add(1, Ordering::Relaxed)));
+    if std::fs::write(&path, png).is_err() {
+        let _ = std::fs::remove_file(path);
+        return false;
+    }
+    let callback = host().lock().unwrap().save_image;
+    let saved = callback(&path.to_string_lossy());
+    let _ = std::fs::remove_file(path);
+    saved
 }
 
 fn path_slot() -> &'static Mutex<PathBuf> {
@@ -440,6 +567,9 @@ static MEMORY_LIMIT_BYTES: AtomicU64 = AtomicU64::new(0);
 static MEMORY_LIMIT_HIT: AtomicBool = AtomicBool::new(false);
 static CAMERA_ALLOWED: AtomicBool = AtomicBool::new(false);
 static MICROPHONE_ALLOWED: AtomicBool = AtomicBool::new(false);
+static CAMERA_ROLL_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+pub fn camera_roll_allowed() -> bool { CAMERA_ROLL_ALLOWED.load(Ordering::Relaxed) }
 
 pub fn camera_allowed() -> bool { CAMERA_ALLOWED.load(Ordering::Relaxed) }
 pub fn microphone_allowed() -> bool { MICROPHONE_ALLOWED.load(Ordering::Relaxed) }
@@ -514,6 +644,7 @@ fn apply_screen_from_json(json: &str) {
     let (camera, microphone) = media_permissions(json);
     CAMERA_ALLOWED.store(camera, Ordering::Relaxed);
     MICROPHONE_ALLOWED.store(microphone, Ordering::Relaxed);
+    CAMERA_ROLL_ALLOWED.store(json_bool(json, "cameraRollAccess"), Ordering::Relaxed);
     MEMORY_LIMIT_HIT.store(false, Ordering::Relaxed);
     MEMORY_LIMIT_BYTES.store(
         u64::from(json_u32(json, "memoryLimitMb").unwrap_or(0)) * 1024 * 1024,
@@ -529,6 +660,8 @@ fn session_args(ipa: &Path, json: &str) -> Vec<String> {
         "vetus".to_string(),
         ipa.to_string_lossy().into_owned(),
         "--fullscreen".to_string(),
+        // Embedded sessions fit the guest display unless the host opts into stretching.
+        "--preserve-aspect-ratio".to_string(),
     ];
     if let Some(family) = json_string(json, "deviceFamily") {
         args.push(format!("--device-family={family}"));
@@ -806,5 +939,40 @@ mod tests {
         assert_eq!(media_permissions("{\"cameraAccess\":true}"), (true, false));
         assert_eq!(media_permissions("{\"microphoneAccess\":true}"), (false, true));
         assert_eq!(media_permissions("{\"cameraAccess\":false,\"microphoneAccess\":false}"), (false, false));
+    }
+
+    #[test]
+    fn photo_picker_ignores_late_and_duplicate_results() {
+        let mut mailbox = PhotoPickerMailbox::default();
+        mailbox.begin(1);
+        assert!(mailbox.take().is_none());
+        mailbox.begin(2);
+        mailbox.post(1, None);
+        assert!(mailbox.take().is_none());
+        mailbox.post(2, Some(vec![1, 2, 3]));
+        mailbox.post(2, None);
+        assert_eq!(mailbox.take(), Some((2, Some(vec![1, 2, 3]))));
+        mailbox.post(2, Some(vec![4]));
+        assert!(mailbox.take().is_none());
+        mailbox.begin(3);
+        mailbox.post(3, None);
+        assert_eq!(mailbox.take(), Some((3, None)));
+    }
+
+    #[test]
+    fn embedded_display_fits_by_default_and_stretch_overrides_it() {
+        for stretch in [false, true] {
+            let json = if stretch {
+                "{\"extraArgs\":\"--allow-network-access --no-preserve-aspect-ratio\"}"
+            } else {
+                "{}"
+            };
+            let mut options = crate::options::Options::default();
+            for arg in session_args(Path::new("/tmp/game.ipa"), json).iter().skip(2) {
+                assert!(options.parse_argument(arg).unwrap());
+            }
+            assert_eq!(options.preserve_aspect_ratio, !stretch);
+            assert_eq!(options.network_access, stretch);
+        }
     }
 }

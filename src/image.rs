@@ -252,6 +252,59 @@ impl Image {
         }
     }
 
+    /// Encode JPEG using the already bundled stb writer. JPEG has no alpha;
+    /// unpremultiply into RGB so translucent source pixels retain their color.
+    /// https://github.com/nothings/stb/blob/master/stb_image_write.h
+    pub fn jpeg_data(&self, quality: f32) -> Option<Vec<u8>> {
+        let (width, height) = self.dimensions;
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return None;
+        }
+        let mut rgb = Vec::with_capacity(self.pixels().len() / 4 * 3);
+        for pixel in self.pixels().chunks_exact(4) {
+            for &channel in &pixel[..3] {
+                rgb.push(if pixel[3] == 0 {
+                    0
+                } else {
+                    ((channel as u32 * 255 + pixel[3] as u32 / 2) / pixel[3] as u32).min(255) as u8
+                });
+            }
+        }
+        unsafe extern "C" fn write(
+            context: *mut std::ffi::c_void,
+            data: *mut std::ffi::c_void,
+            size: c_int,
+        ) {
+            if size > 0 {
+                let output = &mut *context.cast::<Vec<u8>>();
+                output.extend_from_slice(std::slice::from_raw_parts(
+                    data.cast::<u8>(),
+                    size as usize,
+                ));
+            }
+        }
+        // stb interprets zero as its default, so map UIKit's lowest quality to 1.
+        let quality = if quality.is_finite() {
+            quality.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let quality = (quality * 99.0).round() as i32 + 1;
+        let mut output = Vec::new();
+        let success = unsafe {
+            stbi_write_jpg_to_func(
+                Some(write),
+                (&mut output as *mut Vec<u8>).cast(),
+                width as i32,
+                height as i32,
+                3,
+                rgb.as_ptr().cast(),
+                quality,
+            )
+        };
+        (success != 0).then_some(output)
+    }
+
     /// Writes an RGBA image to a PNG file using stb_image_write_png_to_func
     /// This is used by `UIImageWriteToSavedPhotosAlbum` to save images
     ///
@@ -411,6 +464,20 @@ pub fn decode_pvrtc_with_alpha(
 #[cfg(test)]
 mod tests {
     use super::{decode_pvrtc_with_alpha, icon_corner_radius};
+
+    #[test]
+    fn jpeg_encoding_unpremultiplies_color_and_drops_alpha() {
+        let image = super::Image::from_pixels(8, 8, [100, 50, 25, 128].repeat(64));
+        let bytes = image.jpeg_data(1.0).unwrap();
+        assert!(bytes.starts_with(&[0xff, 0xd8]));
+        let decoded = super::Image::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.dimensions(), (8, 8));
+        let pixel = &decoded.pixels()[..4];
+        for (&actual, expected) in pixel.iter().zip([199i16, 100, 50, 255]) {
+            assert!((i16::from(actual) - expected).abs() <= 3, "{pixel:?}");
+        }
+        assert!(super::Image::default().jpeg_data(1.0).is_none());
+    }
 
     #[test]
     fn icon_corner_radius_scales_with_resolution() {

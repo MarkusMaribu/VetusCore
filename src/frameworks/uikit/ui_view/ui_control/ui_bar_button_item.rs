@@ -7,6 +7,10 @@
 //!
 //! `UIBarButtonItem`.
 
+#[cfg(test)]
+#[path = "ui_bar_button_item_tests.rs"]
+mod tests;
+
 use crate::abi::{GuestArg, GuestRet};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str, to_rust_string};
@@ -179,10 +183,13 @@ struct UIBarButtonItemHostObject {
     title: id,
     pub image: id,
     style: UIBarButtonItemStyle,
+    // Target-action does not retain its target (avoids controller/item cycles).
+    // https://developer.apple.com/documentation/uikit/uibarbuttonitem/target
     target: id,
     action: Option<SEL>,
     system_item: UIBarButtonSystemItem,
     pub label: id,
+    image_view: id, // internal decoration; never exposed as customView
     custom_view: id, // <-- Добавлено хранилище для customView
     width: CGFloat,
 }
@@ -200,6 +207,7 @@ impl Default for UIBarButtonItemHostObject {
             action: None,
             system_item: UIBarButtonSystemItem::Done,
             label: nil,
+            image_view: nil,
             custom_view: nil, // <-- Инициализируем нулем
             width: 0.0,
         }
@@ -228,6 +236,20 @@ fn make_title_label(env: &mut crate::Environment, title: id) -> id {
     let layer: id = msg![env; title_label layer];
     () = msg![env; layer setCornerRadius:(10.0 as CGFloat)];
     title_label
+}
+
+// A bar item has one target/action pair, independent of UIControl event masks.
+// This emulator uses a UIControl as its backing view; keep that bridge in sync
+// when code or a nib changes either property. A nil target uses the responder
+// chain, and a nil action removes the bridge.
+// https://developer.apple.com/documentation/uikit/uibarbuttonitem/target
+// https://developer.apple.com/documentation/uikit/uibarbuttonitem/action
+fn sync_action(env: &mut crate::Environment, item: id) {
+    let host = env.objc.borrow_mut::<UIBarButtonItemHostObject>(item);
+    host.superclass.action_targets.retain(|&(_, _, events)| events & UIControlEventTouchUpInside == 0);
+    if let Some(action) = host.action.filter(|action| !action.is_null()) {
+        host.superclass.action_targets.push((host.target, action, UIControlEventTouchUpInside));
+    }
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -289,11 +311,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     if title != nil {
         retain(env, title);
     }
-    retain(env, target);
 
-    if target != nil {
-        () = msg![env; this addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
-    }
+    sync_action(env, this);
 
     let this: id = msg_super![env; this initWithFrame:frame];
     if title_label != nil {
@@ -325,7 +344,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     let image_view: id = if image != nil {
         let iv: id = msg_class![env; UIImageView alloc];
         let iv: id = msg![env; iv initWithImage:image];
-        autorelease(env, iv);
         iv
     } else {
         nil
@@ -338,21 +356,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     host.action = Some(action);
     host.system_item = UIBarButtonSystemItem::Done;
 
-    // ХАК АРХИТЕКТУРЫ: Пишем image_view в custom_view.
-    // Твои методы sizeThatFits: и layoutSubviews: автоматически
-    // подхватят этот виджет, рассчитают размер и отрисуют его!
-    host.custom_view = image_view;
+    // The toolbar must mount the item, not its noninteractive decoration.
+    // https://developer.apple.com/documentation/uikit/uibarbuttonitem/init(image:style:target:action:)
+    host.image_view = image_view;
 
     if image != nil {
         retain(env, image);
     }
-    if image_view != nil {
-        retain(env, image_view);
-    }
-    if target != nil {
-        retain(env, target);
-        () = msg![env; this addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
-    }
+    sync_action(env, this);
 
     let this: id = msg_super![env; this initWithFrame:frame];
 
@@ -413,10 +424,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     host.action = Some(action);
     host.label = label;
 
-    if target != nil {
-        retain(env, target);
-        () = msg![env; this addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
-    }
+    sync_action(env, this);
 
     let this: id = msg_super![env; this initWithFrame:frame];
     if label != nil {
@@ -441,7 +449,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     let width: f32 = msg![env; coder decodeFloatForKey:width_key];
     let is_system_key = get_static_str(env, "UIIsSystemItem");
     let is_system: bool = msg![env; coder decodeBoolForKey:is_system_key];
-    let system_item_key = get_static_str(env, "UISystemItemIdentifier");
+    // Legacy UIKit NIB archives use UISystemItem (including fixed/flexible
+    // spacers). Keep the Identifier spelling accepted by the older decoder.
+    let system_item_key = get_static_str(env, "UISystemItem");
+    let has_system_item: bool = msg![env; coder containsValueForKey:system_item_key];
+    let system_item_key = if has_system_item {
+        system_item_key
+    } else {
+        get_static_str(env, "UISystemItemIdentifier")
+    };
     let system_item: i32 = msg![env; coder decodeIntForKey:system_item_key];
     let enabled_key = get_static_str(env, "UIEnabled");
     let has_enabled: bool = msg![env; coder containsValueForKey:enabled_key];
@@ -486,7 +502,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.system_item = system_item;
         host.width = width;
         host.label = label;
-        host.custom_view = if custom_view != nil { custom_view } else { image_view };
+        host.image_view = image_view;
+        host.custom_view = custom_view;
     }
     if label != nil {
         () = msg![env; this addSubview:label];
@@ -506,20 +523,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())addTarget:(id)target
          action:(SEL)action
 forControlEvents:(UIControlEvents)events {
-    let events = if events == 0 {
-        if target != nil {
-            retain(env, target);
-        }
-        let old_target = env.objc.borrow::<UIBarButtonItemHostObject>(this).target;
-        release(env, old_target);
+    if events == 0 {
         let host = env.objc.borrow_mut::<UIBarButtonItemHostObject>(this);
         host.target = target;
         host.action = Some(action);
-        UIControlEventTouchUpInside
+        sync_action(env, this);
     } else {
-        events
-    };
-    msg_super![env; this addTarget:target action:action forControlEvents:events]
+        msg_super![env; this addTarget:target action:action forControlEvents:events]
+    }
 }
 
 // MARK: - НОВЫЙ МЕТОД: initWithCustomView:
@@ -568,8 +579,8 @@ forControlEvents:(UIControlEvents)events {
 
 - (())setCustomView:(id)custom_view {
     let old = env.objc.borrow::<UIBarButtonItemHostObject>(this).custom_view;
-    release(env, old);
     retain(env, custom_view);
+    release(env, old);
     env.objc.borrow_mut::<UIBarButtonItemHostObject>(this).custom_view = custom_view;
 }
 
@@ -587,9 +598,19 @@ forControlEvents:(UIControlEvents)events {
 
 - (())setImage:(id)image {
     let old = env.objc.borrow::<UIBarButtonItemHostObject>(this).image;
-    release(env, old);
     retain(env, image);
+    release(env, old);
     env.objc.borrow_mut::<UIBarButtonItemHostObject>(this).image = image;
+    let image_view = env.objc.borrow::<UIBarButtonItemHostObject>(this).image_view;
+    if image_view != nil {
+        () = msg![env; image_view setImage:image];
+    } else if image != nil {
+        let image_view: id = msg_class![env; UIImageView alloc];
+        let image_view: id = msg![env; image_view initWithImage:image];
+        env.objc.borrow_mut::<UIBarButtonItemHostObject>(this).image_view = image_view;
+        () = msg![env; this addSubview:image_view];
+    }
+    () = msg![env; this layoutSubviews];
 }
 
 - (())setTitle:(id)title {
@@ -620,6 +641,7 @@ forControlEvents:(UIControlEvents)events {
 
 - (())setTarget:(id)target {
     env.objc.borrow_mut::<UIBarButtonItemHostObject>(this).target = target;
+    sync_action(env, this);
 }
 
 - (CGFloat)width {
@@ -633,9 +655,9 @@ forControlEvents:(UIControlEvents)events {
 - (CGSize)sizeThatFits:(CGSize)size {
     // 1. Сначала извлекаем нужные переменные в отдельной области видимости
     //    чтобы сбросить неизменяемое заимствование (immutable borrow).
-    let (custom_view, label) = {
+    let (custom_view, label, image) = {
         let host = env.objc.borrow::<UIBarButtonItemHostObject>(this);
-        (host.custom_view, host.label)
+        (host.custom_view, host.label, host.image)
     };
 
     // Если есть custom_view, берём размеры от него
@@ -651,6 +673,12 @@ forControlEvents:(UIControlEvents)events {
             width: cv_frame.size.width + 16.0,
             height: size.height,
         }
+    } else if image != nil {
+        let image_size: CGSize = msg![env; image size];
+        let scale = if image_size.height > 0.0 {
+            ((size.height - 8.0).max(0.0) / image_size.height).min(1.0)
+        } else { 1.0 };
+        CGSize { width: (image_size.width * scale + 16.0).max(44.0), height: size.height }
     } else if label != nil {
         () = msg![env; label sizeToFit];
         let label_frame: CGRect = msg![env; label frame];
@@ -665,9 +693,9 @@ forControlEvents:(UIControlEvents)events {
 
 - (())layoutSubviews {
     // 1. Опять же, ограничиваем scope неизменяемого заимствования.
-    let (custom_view, label) = {
+    let (custom_view, label, image_view, image) = {
         let host = env.objc.borrow::<UIBarButtonItemHostObject>(this);
-        (host.custom_view, host.label)
+        (host.custom_view, host.label, host.image_view, host.image)
     };
 
     // 2. Теперь мы можем безопасно вызывать msg!, потому что
@@ -694,23 +722,29 @@ forControlEvents:(UIControlEvents)events {
             size: CGSize { width, height },
         };
         () = msg![env; custom_view setFrame:frame];
+    } else if image_view != nil && image != nil {
+        let natural: CGSize = msg![env; image size];
+        let scale = if natural.width > 0.0 && natural.height > 0.0 {
+            (bounds.size.width / natural.width).min(bounds.size.height / natural.height).min(1.0)
+        } else { 1.0 };
+        let size = CGSize { width: natural.width * scale, height: natural.height * scale };
+        let frame = CGRect { origin: CGPoint {
+            x: (bounds.size.width - size.width) / 2.0,
+            y: (bounds.size.height - size.height) / 2.0,
+        }, size };
+        () = msg![env; image_view setFrame:frame];
     } else if label != nil {
         () = msg![env; label setFrame:bounds];
     }
 }
 
 - (SEL)action {
-    match env.objc.borrow::<UIBarButtonItemHostObject>(this).action {
-        Some(sel) => sel,
-        None => {
-            log!("Warning: UIBarButtonItem has no action set!");
-            env.objc.lookup_selector("undefinedSelector").unwrap()
-        }
-    }
+    env.objc.borrow::<UIBarButtonItemHostObject>(this).action.unwrap_or(SEL::null())
 }
 
 - (())setAction:(SEL)action {
     env.objc.borrow_mut::<UIBarButtonItemHostObject>(this).action = Some(action);
+    sync_action(env, this);
 }
 
 - (UIBarButtonSystemItem)systemItem {
@@ -720,7 +754,7 @@ forControlEvents:(UIControlEvents)events {
 - (())dealloc {
     // Деструктурируем объект, чтобы извлечь custom_view
     let UIBarButtonItemHostObject {
-        superclass: _,
+        superclass,
         title,
         image,
         style: _,
@@ -728,16 +762,18 @@ forControlEvents:(UIControlEvents)events {
         action: _,
         system_item: _,
         label,
+        image_view,
         custom_view,
         width: _,
     } = std::mem::take(env.objc.borrow_mut(this));
 
+    env.objc.borrow_mut::<UIBarButtonItemHostObject>(this).superclass = superclass;
     log_dbg!("dealloc [(UIBarButtonItem*){:?} title {:?}, target {:?}, label {:?}, custom_view {:?}]", this, title, target, label, custom_view);
 
     release(env, title);
     release(env, image);
-    release(env, target);
     release(env, label);
+    release(env, image_view);
     // Не забываем очистить кастомный виджет
     release(env, custom_view);
 

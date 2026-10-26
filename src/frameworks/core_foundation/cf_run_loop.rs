@@ -182,8 +182,8 @@ fn CFRunLoopContainsTimer(
     false
 }
 
-fn CFRunLoopIsWaiting(_env: &mut Environment, _rl: CFRunLoopRef) -> bool {
-    false
+fn CFRunLoopIsWaiting(env: &mut Environment, rl: CFRunLoopRef) -> bool {
+    ns_run_loop::is_waiting(env, rl)
 }
 
 // MARK: - Run
@@ -222,8 +222,8 @@ fn CFRunLoopStop(env: &mut Environment, rl: CFRunLoopRef) {
     ns_run_loop::stop(env, rl);
 }
 
-fn CFRunLoopWakeUp(_env: &mut Environment, _rl: CFRunLoopRef) {
-    log_dbg!("CFRunLoopWakeUp: stubbed");
+fn CFRunLoopWakeUp(env: &mut Environment, rl: CFRunLoopRef) {
+    ns_run_loop::wake_up(env, rl);
 }
 
 // MARK: - Sources

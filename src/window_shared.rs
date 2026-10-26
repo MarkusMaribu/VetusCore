@@ -34,6 +34,46 @@ impl std::fmt::Display for DeviceFamily {
     }
 }
 impl DeviceFamily {
+    /// Select within the requested device class using Info.plist's hardware
+    /// requirements. Concrete user-selected models bypass this selection.
+    pub fn model_for_capabilities(self, requirements: &[(&str, bool)]) -> Option<Self> {
+        let compatible = |model: Self| {
+            requirements.iter().all(|&(name, required)| {
+                model
+                    .hardware_capability(name)
+                    .is_none_or(|present| present == required)
+            })
+        };
+        if compatible(self) {
+            return Some(self);
+        }
+        Self::ALL_SELECTABLE.iter().copied().find(|candidate| {
+            candidate.is_ipad() == self.is_ipad()
+                && candidate.is_ipod_touch() == self.is_ipod_touch()
+                && compatible(*candidate)
+        })
+    }
+
+    /// Known model-dependent hardware from Apple's device compatibility
+    /// tables. Other requirements may describe host-backed services, so they
+    /// do not constrain model selection until their hardware is modelled.
+    fn hardware_capability(self, name: &str) -> Option<bool> {
+        use DeviceFamily::*;
+        let armv7 = !matches!(self, iPhone | iPhone3G | iPodTouch | iPodTouch2);
+        let gyro = !matches!(
+            self,
+            iPhone | iPhone3G | iPhone3GS | iPad | iPodTouch | iPodTouch2 | iPodTouch3
+        );
+        let arm64 = matches!(self, iPad5 | iPadMini2 | iPadMini3);
+        Some(match name {
+            "armv6" | "accelerometer" | "opengles-1" => true,
+            "armv7" | "opengles-2" => armv7,
+            "arm64" | "opengles-3" | "metal" => arm64,
+            "gyroscope" | "front-facing-camera" => gyro,
+            _ => return None,
+        })
+    }
+
     pub fn display_name(&self) -> &'static str {
         match self {
             DeviceFamily::iPhone => "iPhone",
@@ -321,6 +361,49 @@ impl TryFrom<&str> for DeviceFamily {
             "ipod-touch-5" | "ipod5,1" => Ok(DeviceFamily::iPodTouch5),
             _ => Err(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod device_capability_tests {
+    use super::DeviceFamily;
+
+    #[test]
+    fn generic_phone_selection_honors_required_and_prohibited_hardware() {
+        // UIRequiredDeviceCapabilities arrays require each named feature;
+        // dictionary false entries prohibit it. Apple's device tables place
+        // the first phone gyroscope/front camera in iPhone 4.
+        // https://developer.apple.com/library/archive/documentation/DeviceInformation/Reference/iOSDeviceCompatibility/DeviceCompatibilityMatrix/DeviceCompatibilityMatrix.html
+        let default = DeviceFamily::iPhone3GS;
+        assert_eq!(default.model_for_capabilities(&[]), Some(default));
+        assert_eq!(
+            default.model_for_capabilities(&[("armv7", true), ("opengles-2", true)]),
+            Some(default)
+        );
+        assert_eq!(
+            default.model_for_capabilities(&[("gyroscope", true)]),
+            Some(DeviceFamily::iPhone4)
+        );
+        assert_eq!(
+            default.model_for_capabilities(&[("front-facing-camera", true)]),
+            Some(DeviceFamily::iPhone4)
+        );
+        assert_eq!(
+            DeviceFamily::iPhone4.model_for_capabilities(&[("gyroscope", false)]),
+            Some(DeviceFamily::iPhone)
+        );
+        assert_eq!(
+            DeviceFamily::iPad2.model_for_capabilities(&[("gyroscope", false)]),
+            Some(DeviceFamily::iPad)
+        );
+        assert_eq!(
+            default.model_for_capabilities(&[("armv7", true), ("opengles-2", false)]),
+            None
+        );
+        assert_eq!(
+            default.model_for_capabilities(&[("future-host-feature", true)]),
+            Some(default)
+        );
     }
 }
 

@@ -70,6 +70,8 @@ pub mod ns_object;
 pub mod ns_operation;
 pub mod ns_ordered_set;
 pub mod ns_persistent_store_coordinator;
+mod core_data_model;
+mod core_data_store;
 pub mod ns_pointer_array;
 pub mod ns_port;
 pub mod ns_predicate;

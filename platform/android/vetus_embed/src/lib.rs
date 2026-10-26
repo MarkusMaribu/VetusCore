@@ -24,6 +24,7 @@ const NEW_GLOBAL_REF: usize = 21;
 const DELETE_LOCAL_REF: usize = 23;
 const GET_STATIC_METHOD_ID: usize = 113;
 const CALL_STATIC_INT_METHOD_A: usize = 131;
+const CALL_STATIC_OBJECT_METHOD_A: usize = 116;
 const CALL_STATIC_BOOLEAN_METHOD_A: usize = 119;
 const CALL_STATIC_VOID_METHOD_A: usize = 143;
 const NEW_STRING: usize = 163;
@@ -49,6 +50,14 @@ struct Cache {
     open_url: *mut c_void,
     alert: *mut c_void,
     crash: *mut c_void,
+    photo_picker: *mut c_void,
+    save_image: *mut c_void,
+    camera_available: *mut c_void,
+    camera_flash_available: *mut c_void,
+    camera_start: *mut c_void,
+    camera_stop: *mut c_void,
+    camera_frame: *mut c_void,
+    camera_capture: *mut c_void,
 }
 
 unsafe impl Send for Cache {}
@@ -133,6 +142,7 @@ fn with_env<T>(f: impl FnOnce(*mut c_void) -> T) -> Option<T> {
 }
 
 fn attach(vm: *mut c_void) -> Option<*mut c_void> {
+    if vm.is_null() { return None; }
     let table = unsafe { *(vm as *mut *mut c_void) };
     if table.is_null() {
         return None;
@@ -208,6 +218,14 @@ fn ensure_cache(env: *mut c_void) -> Option<&'static Cache> {
         open_url: method("onOpenUrl", "(Ljava/lang/String;)Z"),
         alert: method("onAlert", "(Ljava/lang/String;Ljava/lang/String;)I"),
         crash: method("onCrash", "(Ljava/lang/String;)V"),
+        photo_picker: method("onPickImage", "(I)Z"),
+        save_image: method("onSaveImage", "(Ljava/lang/String;)Z"),
+        camera_available: method("onCameraAvailable", "(Z)Z"),
+        camera_flash_available: method("onCameraFlashAvailable", "(Z)Z"),
+        camera_start: method("onCameraStart", "(ZI)Z"),
+        camera_stop: method("onCameraStop", "()V"),
+        camera_frame: method("onCameraFrame", "()[B"),
+        camera_capture: method("onCameraCapture", "(I)Z"),
     };
     let _ = CACHE.set(cache);
     CACHE.get()
@@ -232,18 +250,130 @@ fn call_void(method: fn(&Cache) -> *mut c_void, args: &[JValue]) {
     });
 }
 
+// Marshal complete callbacks, including all JNI local-reference work, onto
+// a persistent OS stack. Guest coroutines must never enter ART directly.
 fn host_orientation(code: i32) {
+    let _ = touchHLE::android_jni::on_native_stack(move || host_orientation_on_java(code));
+}
+fn host_status_bar(hidden: bool) {
+    let _ = touchHLE::android_jni::on_native_stack(move || host_status_bar_on_java(hidden));
+}
+fn host_keyboard(show: bool, snapshot: &str) {
+    let snapshot = snapshot.to_owned();
+    let _ = touchHLE::android_jni::on_native_stack(move || host_keyboard_on_java(show, &snapshot));
+}
+fn host_idle(enabled: bool) {
+    let _ = touchHLE::android_jni::on_native_stack(move || host_idle_on_java(enabled));
+}
+fn host_open_url(url: &str) -> bool {
+    let url = url.to_owned();
+    touchHLE::android_jni::on_native_stack(move || host_open_url_on_java(&url)).unwrap_or(false)
+}
+fn host_alert(title: &str, message: &str, _buttons: &[&str]) -> i32 {
+    let title = title.to_owned();
+    let message = message.to_owned();
+    touchHLE::android_jni::on_native_stack(move || host_alert_on_java(&title, &message, &[])).unwrap_or(0)
+}
+fn host_crash(message: &str) {
+    let message = message.to_owned();
+    let _ = touchHLE::android_jni::on_native_stack(move || host_crash_on_java(&message));
+}
+fn host_photo_picker(request: u32) -> bool {
+    touchHLE::android_jni::on_native_stack(move || host_photo_picker_on_java(request)).unwrap_or(false)
+}
+
+enum CameraArg { Boolean(bool), Integer(i32) }
+fn camera_bool(method: fn(&Cache) -> *mut c_void, args: Vec<CameraArg>) -> bool {
+    touchHLE::android_jni::on_native_stack(move || {
+        let args: Vec<JValue> = args.into_iter().map(|arg| match arg {
+            CameraArg::Boolean(value) => JValue { z: value as u8 },
+            CameraArg::Integer(value) => JValue { i: value },
+        }).collect();
+        with_env(|env| {
+            let cache = ensure_cache(env)?;
+            let method = method(cache);
+            if method.is_null() { return None; }
+            let call: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const JValue) -> u8 =
+                unsafe { touchHLE::android_jni::table_fn(env, CALL_STATIC_BOOLEAN_METHOD_A)? };
+            let result = unsafe { call(env, cache.class, method, args.as_ptr()) };
+            clear_exception(env);
+            Some(result != 0)
+        }).flatten().unwrap_or(false)
+    }).unwrap_or(false)
+}
+fn host_camera_available(front: bool) -> bool {
+    camera_bool(|c| c.camera_available, vec![CameraArg::Boolean(front)])
+}
+fn host_camera_flash_available(front: bool) -> bool {
+    camera_bool(|c| c.camera_flash_available, vec![CameraArg::Boolean(front)])
+}
+fn host_camera_start(front: bool, flash: i32) -> bool {
+    camera_bool(|c| c.camera_start, vec![CameraArg::Boolean(front), CameraArg::Integer(flash)])
+}
+fn host_camera_capture(request: u32) -> bool {
+    camera_bool(|c| c.camera_capture, vec![CameraArg::Integer(request as i32)])
+}
+fn host_camera_stop() {
+    let _ = touchHLE::android_jni::on_native_stack(|| call_void(|c| c.camera_stop, &[]));
+}
+fn byte_array(env: *mut c_void, array: *mut c_void, limit: usize) -> Option<Vec<u8>> {
+    if array.is_null() { return None; }
+    let length: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
+        unsafe { touchHLE::android_jni::table_fn(env, 171)? };
+    let read: unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, c_int, *mut u8) =
+        unsafe { touchHLE::android_jni::table_fn(env, 200)? };
+    let length = unsafe { length(env, array) };
+    if length <= 0 || length as usize > limit { return None; }
+    let mut bytes = vec![0; length as usize];
+    unsafe { read(env, array, 0, length, bytes.as_mut_ptr()); }
+    clear_exception(env);
+    Some(bytes)
+}
+fn host_camera_frame() -> Option<Vec<u8>> {
+    touchHLE::android_jni::on_native_stack(|| {
+        with_env(|env| {
+            let cache = ensure_cache(env)?;
+            if cache.camera_frame.is_null() { return None; }
+            let call: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const JValue) -> *mut c_void =
+                unsafe { touchHLE::android_jni::table_fn(env, CALL_STATIC_OBJECT_METHOD_A)? };
+            let array = unsafe { call(env, cache.class, cache.camera_frame, std::ptr::null()) };
+            clear_exception(env);
+            let bytes = byte_array(env, array, 2 * 1024 * 1024);
+            delete_local(env, array);
+            bytes
+        }).flatten()
+    }).flatten()
+}
+
+fn host_save_image(path: &str) -> bool {
+    let path = path.to_owned();
+    touchHLE::android_jni::on_native_stack(move || {
+        with_env(|env| {
+            let cache = ensure_cache(env)?;
+            if cache.save_image.is_null() { return None; }
+            let call: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const JValue) -> u8 =
+                unsafe { touchHLE::android_jni::table_fn(env, CALL_STATIC_BOOLEAN_METHOD_A)? };
+            let text = java_string(env, &path);
+            let result = unsafe { call(env, cache.class, cache.save_image, [JValue { l: text }].as_ptr()) };
+            delete_local(env, text);
+            clear_exception(env);
+            Some(result != 0)
+        }).flatten().unwrap_or(false)
+    }).unwrap_or(false)
+}
+
+fn host_orientation_on_java(code: i32) {
     call_void(|cache| cache.orientation, &[JValue { i: code }]);
 }
 
-fn host_status_bar(hidden: bool) {
+fn host_status_bar_on_java(hidden: bool) {
     call_void(
         |cache| cache.status_bar,
         &[JValue { z: u8::from(hidden) }],
     );
 }
 
-fn host_keyboard(show: bool, snapshot: &str) {
+fn host_keyboard_on_java(show: bool, snapshot: &str) {
     let _ = with_env(|env| {
         let snapshot = java_string(env, snapshot);
         call_void(|cache| cache.keyboard, &[JValue { z: u8::from(show) }, JValue { l: snapshot }]);
@@ -251,14 +381,14 @@ fn host_keyboard(show: bool, snapshot: &str) {
     });
 }
 
-fn host_idle(enabled: bool) {
+fn host_idle_on_java(enabled: bool) {
     call_void(
         |cache| cache.idle_timer,
         &[JValue { z: u8::from(enabled) }],
     );
 }
 
-fn host_open_url(url: &str) -> bool {
+fn host_open_url_on_java(url: &str) -> bool {
     with_env(|env| {
         let Some(cache) = ensure_cache(env) else {
             return false;
@@ -283,7 +413,7 @@ fn host_open_url(url: &str) -> bool {
     .unwrap_or(false)
 }
 
-fn host_alert(title: &str, message: &str, _buttons: &[&str]) -> i32 {
+fn host_alert_on_java(title: &str, message: &str, _buttons: &[&str]) -> i32 {
     with_env(|env| {
         let Some(cache) = ensure_cache(env) else {
             return 0;
@@ -311,7 +441,7 @@ fn host_alert(title: &str, message: &str, _buttons: &[&str]) -> i32 {
     .unwrap_or(0)
 }
 
-fn host_crash(message: &str) {
+fn host_crash_on_java(message: &str) {
     with_env(|env| {
         let Some(cache) = ensure_cache(env) else {
             return;
@@ -342,12 +472,79 @@ fn install_host() {
         open_url: host_open_url,
         alert: host_alert,
         crash: host_crash,
+        photo_picker: host_photo_picker,
+        save_image: host_save_image,
+        camera_available: host_camera_available,
+        camera_flash_available: host_camera_flash_available,
+        camera_start: host_camera_start,
+        camera_stop: host_camera_stop,
+        camera_frame: host_camera_frame,
+        camera_capture: host_camera_capture,
     });
     touchHLE::embed::set_resource_reader(read_asset);
     let _ = std::panic::take_hook();
     std::panic::set_hook(Box::new(|info| {
         touchHLE::embed::report_crash(&info.to_string());
     }));
+}
+
+fn host_photo_picker_on_java(request: u32) -> bool {
+    let Some(env) = attach(vm()) else {
+        log_picker("Could not attach emulator thread to Java VM");
+        return false;
+    };
+    let Some(cache) = ensure_cache(env) else {
+        log_picker("JNI callback cache unavailable");
+        return false;
+    };
+    if cache.photo_picker.is_null() {
+        log_picker("VetusCore.onPickImage JNI method unavailable");
+        return false;
+    }
+    (|| {
+        let call: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const JValue) -> u8 =
+            unsafe { touchHLE::android_jni::table_fn(env, CALL_STATIC_BOOLEAN_METHOD_A)? };
+        let result = unsafe { call(env, cache.class, cache.photo_picker, [JValue { i: request as i32 }].as_ptr()) };
+        let describe: Option<unsafe extern "C" fn(*mut c_void)> = unsafe {
+            touchHLE::android_jni::table_fn(env, 16)
+        };
+        if let Some(describe) = describe {
+            unsafe { describe(env); }
+        }
+        clear_exception(env);
+        Some(result != 0)
+    })().unwrap_or(false)
+}
+
+fn log_picker(message: &str) {
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(priority: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+    let tag = c"VetusPhotoPicker";
+    if let Ok(message) = CString::new(message) {
+        unsafe { __android_log_write(5, tag.as_ptr(), message.as_ptr()); }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_markusmaribu_alpinelauncher_vetus_VetusCore_nativePhotoPickerResult(
+    env: *mut c_void, _class: *mut c_void, request: c_int, path: *mut c_void,
+) {
+    let bytes = rust_string(env, path).and_then(|path| {
+        let bytes = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(path);
+        bytes
+    });
+    touchHLE::embed::post_photo_picker_result(request as u32, bytes);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_markusmaribu_alpinelauncher_vetus_VetusCore_nativeCameraPhotoResult(
+    env: *mut c_void, _class: *mut c_void, request: c_int, array: *mut c_void,
+) {
+    let bytes = byte_array(env, array, 16 * 1024 * 1024);
+    touchHLE::embed::post_camera_photo_result(request as u32, bytes);
 }
 
 fn read_asset(path: &str) -> Option<Vec<u8>> {

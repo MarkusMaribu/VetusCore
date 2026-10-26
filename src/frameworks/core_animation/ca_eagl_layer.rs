@@ -11,7 +11,8 @@ use crate::frameworks::core_graphics::cg_affine_transform::{
 };
 use crate::frameworks::core_graphics::{CGPoint, CGRect};
 use crate::frameworks::foundation::ns_string;
-use crate::objc::{id, msg, msg_class, nil, objc_classes, release, Class, ClassExports};
+use crate::matrix::Matrix;
+use crate::objc::{id, msg, msg_class, nil, objc_classes, release, Class, ClassExports, ObjC};
 use crate::Environment;
 
 // MARK: - EAGLDrawable property key constants
@@ -199,6 +200,60 @@ fn layer_subtree_may_draw_pixels(env: &Environment, layer: id, depth: usize) -> 
 // =========================================================================
 // MARK: - find_fullscreen_eagl_layer
 // =========================================================================
+
+/// Texture-coordinate transform equivalent to compositing this drawable's
+/// current layer hierarchy and then presenting the composited screen.
+///
+/// Apple's CAEAGLLayer documentation specifies that layer effects also apply
+/// to its OpenGL contents:
+/// https://developer.apple.com/documentation/quartzcore/caeagllayer
+/// Unlike a device-family heuristic or a global autorotation flag, this only
+/// sees transforms on the drawable and its ancestors. A previous movie view
+/// cannot change the orientation of an unrelated game layer.
+pub fn drawable_present_rotation(
+    objc: &ObjC,
+    mut layer: id,
+    device_rotation: Matrix<2>,
+) -> Option<Matrix<2>> {
+    let size = objc.borrow::<CALayerHostObject>(layer).bounds.size;
+    let mut layer_to_screen = CGAffineTransformIdentity;
+    while layer != nil {
+        let host = objc.borrow::<CALayerHostObject>(layer);
+        layer_to_screen = layer_to_screen.concat(host.superlayer_to_layer_transform());
+        layer = host.superlayer;
+    }
+    presentation_texture_rotation(device_rotation, layer_to_screen, size)
+}
+
+fn presentation_texture_rotation(
+    device_rotation: Matrix<2>,
+    layer_to_screen: CGAffineTransform,
+    size: crate::frameworks::core_graphics::CGSize,
+) -> Option<Matrix<2>> {
+    let CGAffineTransform { a, b, c, d, .. } = layer_to_screen;
+    // Direct presentation fits the drawable's transformed frame to the host
+    // viewport. Normalize in each coordinate space so a rotated rectangular
+    // renderbuffer is not stretched by its portrait/landscape aspect ratio.
+    let width = a.abs() * size.width + c.abs() * size.height;
+    let height = b.abs() * size.width + d.abs() * size.height;
+    if !(width > 0.0 && height > 0.0 && width.is_finite() && height.is_finite()) {
+        return None;
+    }
+    let normalized = Matrix::from_columns([
+        [a * size.width / width, b * size.width / height],
+        [c * size.height / width, d * size.height / height],
+    ]);
+    let screen_to_layer = normalized.inverse()?;
+    // CALayer geometry is top-down; renderbuffer texture coordinates are
+    // bottom-up. Sample through the inverse layer transform between the two
+    // Y flips, after the window's screen-to-display texture rotation.
+    Some(
+        device_rotation
+            .multiply(&Matrix::y_flip())
+            .multiply(&screen_to_layer)
+            .multiply(&Matrix::y_flip()),
+    )
+}
 
 /// Layer transforms that can still be presented directly to the host window.
 /// The only non-identity transform UIKit applies to a fullscreen app view in
@@ -446,6 +501,134 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
 }
 
 #[cfg(test)]
+mod presentation_rotation_tests {
+    use super::*;
+    use crate::frameworks::core_graphics::CGSize;
+    use std::f32::consts::{FRAC_PI_2, PI};
+
+    fn assert_maps(rotation: Matrix<2>, point: [f32; 2], expected: [f32; 2]) {
+        let actual = rotation.transform(point);
+        for i in 0..2 {
+            assert!(
+                (actual[i] - expected[i]).abs() < 1.0e-5,
+                "{actual:?} != {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn untransformed_drawable_keeps_device_rotation_in_both_landscape_directions() {
+        let size = CGSize {
+            width: 768.0,
+            height: 1024.0,
+        };
+        for (angle, expected) in [(FRAC_PI_2, [0.0, 1.0]), (-FRAC_PI_2, [0.0, -1.0])] {
+            let rotation = presentation_texture_rotation(
+                Matrix::z_rotation(angle),
+                CGAffineTransformIdentity,
+                size,
+            )
+            .unwrap();
+            assert_maps(rotation, [1.0, 0.0], expected);
+        }
+    }
+
+    #[test]
+    fn autorotated_landscape_renderbuffer_matches_composition() {
+        // CAEAGLLayer contents participate in the layer hierarchy:
+        // https://developer.apple.com/documentation/quartzcore/caeagllayer
+        // A landscape layer rotated into a portrait UIKit screen must cancel
+        // the window's quarter-turn, not receive a guessed extra half-turn.
+        let size = CGSize {
+            width: 1024.0,
+            height: 768.0,
+        };
+        for angle in [FRAC_PI_2, -FRAC_PI_2, PI] {
+            let rotation = presentation_texture_rotation(
+                Matrix::z_rotation(angle),
+                CGAffineTransform::make_rotation(-angle),
+                size,
+            )
+            .unwrap();
+            for corner in [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]] {
+                assert_maps(rotation, corner, corner);
+            }
+        }
+    }
+
+    #[test]
+    fn drawable_ancestors_determine_rotation_and_movie_siblings_do_not() {
+        let mut mem = crate::mem::Mem::new();
+        mem.set_null_segment_size(crate::mem::PAGE_SIZE);
+        let mut objc = ObjC::new();
+        let bounds = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: 1024.0,
+                height: 768.0,
+            },
+        };
+        let mut alloc_layer = |superlayer, affine_transform| {
+            let mut host = CALayerHostObject::default();
+            host.bounds = bounds;
+            host.superlayer = superlayer;
+            host.affine_transform = affine_transform;
+            objc.alloc_static_object(nil, Box::new(host), &mut mem)
+        };
+        let root = alloc_layer(nil, CGAffineTransformIdentity);
+        let drawable = alloc_layer(root, CGAffineTransformIdentity);
+        let _movie = alloc_layer(root, CGAffineTransform::make_rotation(-FRAC_PI_2));
+        let device = Matrix::z_rotation(FRAC_PI_2);
+        assert_maps(
+            drawable_present_rotation(&objc, drawable, device).unwrap(),
+            [1.0, 0.0],
+            [0.0, 1.0],
+        );
+        // The same EAGL child now inherits its parent's live rotation.
+        objc.borrow_mut::<CALayerHostObject>(root).affine_transform =
+            CGAffineTransform::make_rotation(-FRAC_PI_2);
+        assert_maps(
+            drawable_present_rotation(&objc, drawable, device).unwrap(),
+            [1.0, 0.0],
+            [1.0, 0.0],
+        );
+        // Removing that parent also removes its rotation; no sticky flag.
+        objc.borrow_mut::<CALayerHostObject>(drawable).superlayer = nil;
+        assert_maps(
+            drawable_present_rotation(&objc, drawable, device).unwrap(),
+            [1.0, 0.0],
+            [0.0, 1.0],
+        );
+    }
+
+    #[test]
+    fn portrait_and_upside_down_frames_do_not_get_an_ipad_half_turn() {
+        let size = CGSize {
+            width: 320.0,
+            height: 480.0,
+        };
+        for (angle, expected) in [(0.0, [1.0, 0.0]), (PI, [-1.0, 0.0])] {
+            assert_maps(
+                presentation_texture_rotation(
+                    Matrix::z_rotation(angle),
+                    CGAffineTransformIdentity,
+                    size,
+                )
+                .unwrap(),
+                [1.0, 0.0],
+                expected,
+            );
+        }
+        assert!(presentation_texture_rotation(
+            Matrix::identity(),
+            CGAffineTransform::make_scale(0.0, 1.0),
+            size,
+        )
+        .is_none());
+    }
+}
+
+#[cfg(test)]
 mod fullscreen_layer_tests {
     use super::*;
     use crate::window::DeviceOrientation;
@@ -659,9 +842,64 @@ pub fn clear_presented_pixels(env: &mut Environment, layer: id) {
 /// Records that `EAGLContext presentRenderbuffer:` presented this layer's
 /// drawable directly to the window, bypassing `presented_pixels`.
 pub fn mark_presented_directly(env: &mut Environment, layer: id) {
-    env.objc
-        .borrow_mut::<CALayerHostObject>(layer)
-        .presented_directly = true;
+    let host = env.objc.borrow_mut::<CALayerHostObject>(layer);
+    // Retire the old readback when presentation changes back to the GPU.
+    // Otherwise run-loop composition keeps swapping the cached frame over
+    // the newer direct frames, including stale text and control state.
+    host.presented_pixels = None;
+    host.presented_directly = true;
+}
+
+/// Whether the drawable is already on screen without Core Animation.
+pub(super) fn is_presented_directly(objc: &ObjC, layer: id) -> bool {
+    let host = objc.borrow::<CALayerHostObject>(layer);
+    host.presented_directly && host.presented_pixels.is_none()
+}
+
+#[cfg(test)]
+mod cached_frame_tests {
+    use super::*;
+    use crate::frameworks::core_graphics::{cg_bitmap_context, CGSize};
+    use crate::objc::retain;
+
+    // CAEAGLLayer contents still participate in Core Animation composition.
+    // A cached GL frame cannot suppress later UIKit updates (Doodle Jump's
+    // game-over name field), even after a direct-to-readback fallback.
+    // https://developer.apple.com/documentation/quartzcore/caeagllayer
+    #[test]
+    fn cached_gl_frame_keeps_text_field_updates_visible() {
+        let mut env = crate::environment::touch_test_environment();
+        let env = &mut env;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let drawable: id = msg_class![env; CAEAGLLayer layer];
+        let field: id = msg_class![env; UITextField alloc];
+        let field: id = msg![env; field initWithFrame:(CGRect {
+            origin: CGPoint::default(),
+            size: CGSize { width: 132.0, height: 26.0 },
+        })];
+        let subviews: id = msg![env; field subviews];
+        let label: id = msg![env; subviews objectAtIndex:0u32];
+        let layer: id = msg![env; label layer];
+        retain(env, drawable);
+        mark_presented_directly(env, drawable);
+        present_pixels(env, drawable, vec![255; 16], 2, 2);
+        crate::frameworks::uikit::ui_responder::handle_host_edit(env, field, "Test".into());
+        let _: () = msg![env; field layoutIfNeeded];
+        assert!(!is_presented_directly(&env.objc, drawable),
+            "a cached frame must keep the compositor delivering UI edits");
+        super::super::composition::display_layers(env, layer);
+        let context = env.objc.borrow::<CALayerHostObject>(layer).cg_context
+            .expect("the text label should have been rasterized");
+        let (width, height, data) = cg_bitmap_context::get_data(&env.objc, context);
+        let pixels = env.mem.bytes_at(data.cast(), width * height * 4);
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        mark_presented_directly(env, drawable);
+        assert!(is_presented_directly(&env.objc, drawable),
+            "returning to GPU presentation must retire the cached readback frame");
+        release(env, drawable);
+        release(env, field);
+        release(env, pool);
+    }
 }
 
 /// Stores the new rendered frame in the layer and marks the GLES texture as

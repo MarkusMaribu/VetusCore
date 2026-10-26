@@ -209,6 +209,35 @@ impl ClassHostObject {
 }
 
 impl ObjC {
+    /// Read declared property metadata without manufacturing an accessor.
+    pub fn declared_property_attributes(&self, mut class: Class, name: &str, mem: &Mem) -> Option<String> {
+        while class != nil {
+            let host = self.borrow::<ClassHostObject>(class);
+            if let Some(property) = host.properties.get(name) {
+                let fields: ConstPtr<ConstPtr<u8>> = property.cast();
+                let attributes = mem.read(fields + 1);
+                return mem.cstr_at_utf8(attributes).ok().map(str::to_owned);
+            }
+            class = host.superclass;
+        }
+        None
+    }
+
+    /// Install a model/runtime-generated method only when neither the class
+    /// nor its superclasses already implement it. This preserves user code.
+    pub fn add_host_method_if_absent(
+        &mut self, class: Class, name: &str, method: &'static dyn HostIMP, mem: &mut Mem,
+    ) {
+        let selector = self.register_host_selector(name.to_owned(), mem);
+        let mut ancestor = class;
+        while ancestor != nil {
+            let host = self.borrow::<ClassHostObject>(ancestor);
+            if host.methods.contains_key(&selector) { return; }
+            ancestor = host.superclass;
+        }
+        self.borrow_mut::<ClassHostObject>(class).methods.insert(selector, IMP::Host(method));
+    }
+
     /// Checks if the provided class has a method in its class chain
     /// (that is to say, objects of the given class respond to a
     /// selector).

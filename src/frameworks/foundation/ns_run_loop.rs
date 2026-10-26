@@ -11,7 +11,7 @@
 use super::{ns_port, ns_string, ns_timer, NSTimeInterval};
 use crate::abi::CallFromHost;
 use crate::dyld::{ConstantExports, HostConstant};
-use crate::environment::ThreadId;
+use crate::environment::{ThreadBlock, ThreadId};
 use crate::frameworks::audio_toolbox::audio_queue::{handle_audio_queue, AudioQueueRef};
 use crate::frameworks::audio_toolbox::audio_services::tick_system_sound_completions;
 use crate::frameworks::audio_toolbox::audio_unit::{render_audio_unit, AudioUnit};
@@ -54,6 +54,7 @@ pub struct ThreadLocalState {
 
 #[derive(Default)]
 pub(crate) struct NSRunLoopHostObject {
+    waiting: bool,
     selector_objects: VecDeque<ObjectSelectorSource>,
     next_perform_sequence: u64,
     audio_units: Vec<AudioUnit>,
@@ -147,6 +148,12 @@ fn is_common_mode(state: &NSRunLoopHostObject, mode: &str) -> bool {
 }
 
 fn mode_has_work(env: &Environment, run_loop: id, mode: &str) -> bool {
+    if env.current_thread == 0
+        && (mode == NSDefaultRunLoopMode || mode == "UITrackingRunLoopMode")
+        && uikit::ui_image::has_pending_save_completions(env)
+    {
+        return true;
+    }
     let ui_source = env.current_thread == 0
         && env.window.is_some()
         && (mode == NSDefaultRunLoopMode || mode == "UITrackingRunLoopMode");
@@ -235,7 +242,41 @@ pub(crate) fn add_perform_request(
         sequence,
         modes,
     });
+    // A cross-thread selector is an input source: wake its sleeping run loop
+    // and let that thread run, instead of draining an entire HLE image worker
+    // before the next instruction-count scheduling quantum.
+    // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/RunLoopManagement/RunLoopManagement.html
+    if let Some(owner) = wake_up(env, run_loop) {
+        if owner != env.current_thread {
+            env.yield_thread(ThreadBlock::NotBlocked);
+        }
+    }
     semaphore
+}
+
+pub(crate) fn is_waiting(env: &Environment, run_loop: id) -> bool {
+    run_loop != nil && env.objc.borrow::<NSRunLoopHostObject>(run_loop).waiting
+}
+
+/// Interrupt only a run-loop wait, never an explicit NSThread sleep or a
+/// mutex/semaphore wait inside a callback.
+pub(crate) fn wake_up(env: &mut Environment, run_loop: id) -> Option<ThreadId> {
+    if !is_waiting(env, run_loop) {
+        return None;
+    }
+    let owner = env.threads.iter().position(|t| {
+        t.thread_local_framework_state
+            .foundation
+            .ns_run_loop
+            .run_loop
+            == run_loop
+    })?;
+    if matches!(env.threads[owner].blocked_by, ThreadBlock::Sleeping(_)) {
+        env.threads[owner].blocked_by = ThreadBlock::NotBlocked;
+        Some(owner)
+    } else {
+        None
+    }
 }
 
 fn request_matches_mode(
@@ -732,10 +773,7 @@ fn run_loop_body(
         }
 
         for timer in timers_tmp.drain(..) {
-            let next_due = ns_timer::handle_timer(env, timer);
-            // Timer deadlines are virtual; audio/UI deadlines remain real.
-            let host_due = next_due.map(|due| env.guest_clock.host_deadline(due));
-            limit_sleep_time(&mut sleep_until, host_due);
+            ns_timer::handle_timer(env, timer);
             release(env, timer);
         }
 
@@ -879,10 +917,34 @@ fn run_loop_body(
         if !keep_alive && !mode_has_work(env, run_loop, mode) {
             return RunResult::Finished;
         }
+        // Callbacks can add, invalidate or move timers, including timers that
+        // were not in timers_tmp. Use the live set after all callouts so a
+        // chain of one-shot timers does not incur a polling delay per link.
+        // Do not fire them here: delivery belongs to the next iteration, and
+        // a nested run loop must not re-enter an active timer callback.
+        let state = env.objc.borrow::<NSRunLoopHostObject>(run_loop);
+        let next_timer_due = state
+            .timers
+            .iter()
+            .filter(|&&timer| matches_mode(state, timer, mode))
+            .filter_map(|&timer| {
+                let timer = env.objc.borrow::<ns_timer::NSTimerHostObject>(timer);
+                if timer.is_running_callback {
+                    None
+                } else {
+                    timer.due_by
+                }
+            })
+            .min();
+        // Timer deadlines are virtual; audio/UI deadlines remain real.
+        let host_due = next_timer_due.map(|due| env.guest_clock.host_deadline(due));
+        limit_sleep_time(&mut sleep_until, host_due);
         let limit = Duration::from_millis(1000 / 60);
+        env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop).waiting = true;
         env.sleep(sleep_until.map_or(limit, |i| {
             i.saturating_duration_since(Instant::now()).min(limit)
         }));
+        env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop).waiting = false;
         // The host app picker uses a paced UI pump. CFRunLoopRunInMode(0)
         // uses the deadline path above and never sleeps here.
         if single_iteration {
@@ -892,6 +954,37 @@ fn run_loop_body(
 }
 
 /// Helper method for `mainRunLoop` and `currentRunLoop` NSThread class methods
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    #[test]
+    fn selector_source_wakes_run_loop_without_interrupting_explicit_sleep() {
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
+        let target: id = msg_class![env; NSObject new];
+        let selector = env
+            .objc
+            .register_host_selector("description".into(), &mut env.mem);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        env.threads[0].blocked_by = ThreadBlock::Sleeping(deadline);
+        // An explicit sleep inside a callback is not a run-loop wait.
+        add_perform_request(env, run_loop, target, selector, nil, false, nil);
+        assert!(matches!(
+            env.threads[0].blocked_by,
+            ThreadBlock::Sleeping(_)
+        ));
+        env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop).waiting = true;
+        add_perform_request(env, run_loop, target, selector, nil, false, nil);
+        assert!(matches!(env.threads[0].blocked_by, ThreadBlock::NotBlocked));
+        env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop).waiting = false;
+        assert!(handle_perform_requests(env, run_loop, NSDefaultRunLoopMode));
+        assert_eq!(env.objc.get_refcount(target).get(), 1);
+        release(env, target);
+    }
+}
+
 pub(crate) fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id: ThreadId) -> id {
     if env.threads[thread_id]
         .thread_local_framework_state
@@ -901,6 +994,7 @@ pub(crate) fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id:
         == nil
     {
         let host_object = Box::new(NSRunLoopHostObject {
+            waiting: false,
             selector_objects: VecDeque::new(),
             next_perform_sequence: 0,
             audio_units: Vec::new(),

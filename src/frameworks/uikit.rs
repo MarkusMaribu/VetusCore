@@ -1024,6 +1024,7 @@ pub struct State {
     ui_geometry: ui_geometry::State,
     ui_graphics: ui_graphics::State,
     ui_image: ui_image::State,
+    ui_image_picker: ui_image_picker_controller::State,
     ui_keyboard: ui_keyboard::State,
     ui_launch_delegate: ui_launch_delegate::State,
     ui_screen: ui_screen::State,
@@ -1046,15 +1047,17 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
     use crate::window::Event;
     use crate::window::TextInputEvent;
 
+    let saved_image = ui_image::poll_save_completions(env);
+
     // In headless mode there is no window to pull events from. This used to be
     // assumed unreachable without a window, but an app that fully finishes
     // launching enters the main run loop, which calls this unconditionally —
     // so guard explicitly instead of unwrapping the absent window and panicking.
     if env.window.is_none() {
-        return (None, false);
+        return (None, saved_image);
     }
 
-    let mut handled = false;
+    let mut handled = saved_image | ui_image_picker_controller::poll(env);
     loop {
         let Some(event) = env.window_mut().pop_event() else {
             break;

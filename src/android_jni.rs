@@ -32,6 +32,72 @@
 
 use std::os::raw::c_void;
 
+/// ART checks Java calls against the pthread's stack bounds. Guest coroutines
+/// use separate stacks, so calling Java from one can raise StackOverflowError
+/// before Java code runs. All embedded host callbacks use this real OS thread.
+/// JNI locals are created and consumed inside each job, never sent across threads.
+pub fn on_native_stack<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    use std::cell::Cell;
+    use std::sync::{mpsc, OnceLock};
+    type Job = Box<dyn FnOnce() + Send>;
+    static WORKER: OnceLock<Option<mpsc::Sender<Job>>> = OnceLock::new();
+    thread_local! { static IS_WORKER: Cell<bool> = const { Cell::new(false) }; }
+    if IS_WORKER.with(Cell::get) { return Some(job()); }
+    let worker = WORKER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<Job>();
+        std::thread::Builder::new().name("vetus-jni".to_string()).spawn(move || {
+            IS_WORKER.with(|flag| flag.set(true));
+            for job in receiver { job(); }
+        }).ok().map(|_| sender)
+    }).as_ref()?;
+    let (reply, result) = mpsc::sync_channel(1);
+    worker.send(Box::new(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        let _ = reply.send(outcome);
+    })).ok()?;
+    match result.recv().ok()? {
+        Ok(value) => Some(value),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+#[cfg(test)]
+mod callback_thread_tests {
+    use super::on_native_stack;
+
+    #[test]
+    fn callbacks_use_one_real_thread_and_support_reentry() {
+        let caller = std::thread::current().id();
+        let worker = on_native_stack(|| std::thread::current().id()).unwrap();
+        assert_ne!(caller, worker);
+        assert_eq!(on_native_stack(|| std::thread::current().id()), Some(worker));
+        assert_eq!(on_native_stack(|| on_native_stack(|| std::thread::current().id())), Some(Some(worker)));
+    }
+
+    #[test]
+    fn coroutine_callbacks_leave_the_coroutine_stack() {
+        let caller = std::thread::current().id();
+        let mut coroutine = corosensei::Coroutine::new(|_, (): ()| {
+            on_native_stack(|| std::thread::current().id()).unwrap()
+        });
+        match coroutine.resume(()) {
+            corosensei::CoroutineResult::Return(worker) => assert_ne!(caller, worker),
+            corosensei::CoroutineResult::Yield(()) => panic!("unexpected yield"),
+        }
+    }
+
+    #[test]
+    fn callback_panics_propagate_to_the_caller() {
+        let result = std::panic::catch_unwind(|| {
+            on_native_stack(|| panic!("callback failure"));
+        });
+        assert!(result.is_err());
+        assert_eq!(on_native_stack(|| 42), Some(42));
+    }
+}
+
 /// Resolve the raw function pointer held in slot `index` of the JNI function
 /// table (`struct JNINativeInterface_`) reachable from `env`.
 ///

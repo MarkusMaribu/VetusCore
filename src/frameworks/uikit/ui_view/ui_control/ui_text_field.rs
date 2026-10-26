@@ -232,9 +232,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setText:(id)text {
     let text_label = env.objc.borrow::<UITextFieldHostObject>(this).text_label;
     let _: () = msg![env; text_label setText:text];
-    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
-    let name = ns_string::get_static_str(env, UITextFieldTextDidChangeNotification);
-    let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
 }
 
 - (id)attributedText {
@@ -471,17 +468,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         if msg![env; delegate respondsToSelector:sel] && !msg![env; delegate textFieldShouldEndEditing:this] { return false; }
     }
 
+    // Resign before notifying observers. A keyboard-will-hide observer may
+    // ask the same field to end editing again; it must see the committed state
+    // rather than recursively beginning another keyboard dismissal.
+    env.objc.borrow_mut::<UITextFieldHostObject>(this).editing = false;
+    env.framework_state.uikit.ui_responder.first_responder = nil;
+
     let center: id = msg_class![env; NSNotificationCenter defaultCenter];
     let name = ns_string::get_static_str(env, UIKeyboardWillHideNotification);
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
 
-    env.framework_state.uikit.ui_responder.first_responder = nil;
     crate::frameworks::uikit::ui_keyboard::stop_text_input(env);
 
     let name = ns_string::get_static_str(env, UIKeyboardDidHideNotification);
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
-
-    env.objc.borrow_mut::<UITextFieldHostObject>(this).editing = false;
 
     let name = ns_string::get_static_str(env, UITextFieldTextDidEndEditingNotification);
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
@@ -526,6 +526,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
+// Only accepted user edits post this notification. Programmatic setters must
+// remain silent so observers can normalize the text without recursive edits.
+fn post_text_change(env: &mut Environment, field: id) {
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let name = ns_string::get_static_str(env, UITextFieldTextDidChangeNotification);
+    () = msg![env; center postNotificationName:name object:field userInfo:nil];
+}
+
 // Host IMEs report complete editing values (selection replacement, composing
 // text and autocorrection), while UIKit delegates receive a UTF-16 NSRange.
 // https://developer.apple.com/documentation/uikit/uitextfielddelegate/textfield(_:shouldchangecharactersin:replacementstring:)
@@ -545,6 +553,7 @@ pub fn handle_edit(env: &mut Environment, field: id, text: String) {
     if accepted {
         let value = ns_string::from_rust_string(env, text);
         let _: () = msg![env; field setText:value];
+        post_text_change(env, field);
         let _: () = msg![env; field setNeedsDisplay];
         release(env, value);
     }
@@ -600,13 +609,8 @@ pub fn handle_text(env: &mut Environment, text_field: id, text: String) {
 
     if should {
         let new_text: id = msg![env; curr_text stringByAppendingString:txt];
-        // Route through `setText:` on the text field (not directly on the
-        // text label) so that `UITextFieldTextDidChangeNotification` is
-        // posted. Some apps (e.g. the Minecraft PE 0.6.1 iOS port's
-        // `ShowKeyboardView`) drive their input loop entirely from this
-        // notification, so skipping it makes typing on the soft keyboard
-        // appear to do nothing.
         let _: () = msg![env; text_field setText:new_text];
+        post_text_change(env, text_field);
         let _: () = msg![env; text_field setNeedsDisplay];
         release(env, new_text);
     }
@@ -650,9 +654,8 @@ pub fn handle_backspace(env: &mut Environment, text_field: id) {
 
     if should {
         let new_text: id = msg![env; curr_text substringToIndex:(len - 1)];
-        // See `handle_text` above: go through `setText:` so that the
-        // `UITextFieldTextDidChangeNotification` observer is notified.
         let _: () = msg![env; text_field setText:new_text];
+        post_text_change(env, text_field);
         let _: () = msg![env; text_field setNeedsDisplay];
     }
 }
@@ -678,6 +681,116 @@ pub fn handle_return(env: &mut Environment, text_field: id) {
 #[cfg(test)]
 mod editing_tests {
     use super::*;
+
+    thread_local! {
+        static CHANGE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static HIDE_STATES: std::cell::RefCell<Vec<(bool, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn resign_during_keyboard_hide(env: &mut Environment, _: id, _: SEL, notification: id) {
+        let field: id = msg![env; notification object];
+        let editing: bool = msg![env; field isEditing];
+        let first: bool = msg![env; field isFirstResponder];
+        let count = HIDE_STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            states.push((editing, first));
+            states.len()
+        });
+        if count <= 3 {
+            let _: bool = msg![env; field resignFirstResponder];
+        }
+    }
+
+    #[test]
+    fn keyboard_hide_observer_can_end_editing_again_without_recursion() {
+        // Resignation precedes keyboard hiding; an observer ending editing
+        // again sees a field which has already resigned and cannot restart it.
+        // https://developer.apple.com/documentation/uikit/uitextfielddelegate
+        // https://developer.apple.com/documentation/uikit/uiresponder/resignfirstresponder()
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let field: id = msg_class![env; UITextField alloc];
+        let field: id = msg![env; field initWithFrame:(CGRect::default())];
+        let observer: id = msg_class![env; NSObject new];
+        let class: crate::objc::Class = msg_class![env; NSObject class];
+        let selector = env.objc.register_host_selector("editingTestWillHide:".into(), &mut env.mem);
+        type Callback = fn(&mut Environment, id, SEL, id);
+        let imp = env.dyld.create_guest_function(
+            &mut env.mem, "[keyboard hiding observer]", &(resign_during_keyboard_hide as Callback));
+        let types = env.mem.alloc_and_write_cstr(b"v@:@");
+        crate::objc::class_replaceMethod(env, class, selector, imp.to_ptr(), types.cast_const());
+        let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+        let name = ns_string::get_static_str(env, UIKeyboardWillHideNotification);
+        () = msg![env; center addObserver:observer selector:selector name:name object:field];
+        assert!(msg![env; field becomeFirstResponder]);
+        HIDE_STATES.with(|states| states.borrow_mut().clear());
+        assert!(msg![env; field resignFirstResponder]);
+        HIDE_STATES.with(|states| assert_eq!(*states.borrow(), vec![(false, false)]));
+        assert!(msg![env; field resignFirstResponder]);
+        HIDE_STATES.with(|states| assert_eq!(states.borrow().len(), 1));
+        () = msg![env; center removeObserver:observer];
+        release(env, observer);
+        release(env, field);
+        release(env, pool);
+    }
+
+    fn normalize_text(env: &mut Environment, _: id, _: SEL, notification: id) {
+        let count = CHANGE_COUNT.with(|count| {
+            count.set(count.get() + 1);
+            count.get()
+        });
+        // Bound the red test without hiding recursive notifications.
+        if count <= 3 {
+            let field: id = msg![env; notification object];
+            let normalized = ns_string::get_static_str(env, "30");
+            () = msg![env; field setText:normalized];
+        }
+    }
+
+    #[test]
+    fn programmatic_text_is_silent_and_user_edits_notify_once() {
+        // Notifications describe user editing; an observer may normalize text
+        // with setText: without recursively starting another editing event.
+        // https://developer.apple.com/documentation/uikit/uitextfielddelegate
+        // https://developer.apple.com/documentation/uikit/uitextfield/textdidchangenotification
+        // Upstream's setter explicitly left notification semantics as TODO:
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view/ui_control/ui_text_field.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let field: id = msg_class![env; UITextField alloc];
+        let field: id = msg![env; field initWithFrame:(CGRect::default())];
+        let observer: id = msg_class![env; NSObject new];
+        let class: crate::objc::Class = msg_class![env; NSObject class];
+        let selector = env.objc.register_host_selector("editingTestChanged:".into(), &mut env.mem);
+        type Callback = fn(&mut Environment, id, SEL, id);
+        let imp = env.dyld.create_guest_function(
+            &mut env.mem, "[text editing observer]", &(normalize_text as Callback));
+        let types = env.mem.alloc_and_write_cstr(b"v@:@");
+        crate::objc::class_replaceMethod(env, class, selector, imp.to_ptr(), types.cast_const());
+        let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+        let name = ns_string::get_static_str(env, UITextFieldTextDidChangeNotification);
+        () = msg![env; center addObserver:observer selector:selector name:name object:field];
+        CHANGE_COUNT.with(|count| count.set(0));
+        let value = ns_string::get_static_str(env, "20");
+        () = msg![env; field setText:value];
+        assert_eq!(CHANGE_COUNT.with(|count| count.get()), 0, "setText: emitted an editing notification");
+        handle_text(env, field, "1".into());
+        assert_eq!(CHANGE_COUNT.with(|count| count.get()), 1);
+        handle_backspace(env, field);
+        assert_eq!(CHANGE_COUNT.with(|count| count.get()), 2);
+        handle_edit(env, field, "45".into());
+        assert_eq!(CHANGE_COUNT.with(|count| count.get()), 3);
+        handle_edit(env, field, "30".into());
+        assert_eq!(CHANGE_COUNT.with(|count| count.get()), 3, "unchanged host value emitted a notification");
+        let actual: id = msg![env; field text];
+        assert_eq!(ns_string::to_rust_string(env, actual), "30");
+        () = msg![env; center removeObserver:observer];
+        release(env, observer);
+        release(env, field);
+        release(env, pool);
+    }
 
     #[test]
     fn host_edits_replace_selections_and_report_utf16_ranges() {

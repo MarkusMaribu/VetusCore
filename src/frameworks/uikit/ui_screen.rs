@@ -22,13 +22,20 @@ pub struct State {
     wants_software_dimming: bool,
 }
 
-/// Return the main screen's physical pixel size for the current orientation.
+/// Return the main screen's physical pixel size in fixed portrait coordinates.
 /// UIKit `bounds` is expressed in logical points; `nativeBounds` and
 /// `UIScreenMode.size` are expressed in pixels.
-fn screen_pixel_size_for_current_orientation(env: &mut crate::Environment) -> (CGFloat, CGFloat) {
-    let (width, height) = screen_size_for_current_orientation(env);
+fn native_pixel_size(env: &mut crate::Environment) -> CGSize {
+    let (width, height) = env.window().screen_size();
     let scale = env.window().screen_scale() as CGFloat;
-    (width as CGFloat * scale, height as CGFloat * scale)
+    native_pixel_size_from_points((width, height), scale)
+}
+
+fn native_pixel_size_from_points((width, height): (u32, u32), scale: CGFloat) -> CGSize {
+    CGSize {
+        width: width as CGFloat * scale,
+        height: height as CGFloat * scale,
+    }
 }
 
 fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u32) {
@@ -38,29 +45,7 @@ fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u3
     // Previously this read `device_family().portrait_size()` directly, so a
     // custom/auto resolution was stored but never actually exposed to the guest
     // — the app kept rendering at the device's native point size.
-    let portrait_size = env.window().screen_size();
-    let orientation = env.window().current_rotation();
-    let landscape_bounds = crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
-    screen_size_for_orientation(portrait_size, orientation, landscape_bounds)
-}
-
-fn screen_size_for_orientation(
-    portrait_size: (u32, u32),
-    orientation: crate::window::DeviceOrientation,
-    landscape_bounds: bool,
-) -> (u32, u32) {
-    let (portrait_width, portrait_height) = portrait_size;
-    if landscape_bounds
-        && matches!(
-            orientation,
-            crate::window::DeviceOrientation::LandscapeLeft
-                | crate::window::DeviceOrientation::LandscapeRight
-        )
-    {
-        (portrait_height, portrait_width)
-    } else {
-        (portrait_width, portrait_height)
-    }
+    env.window().screen_coordinate_size()
 }
 
 /// Per Apple documentation for `-setBrightness:`, values are clamped to the
@@ -214,18 +199,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (CGRect)nativeBounds {
-    // Same as bounds at scale 1 — we don't model the physical pixel grid.
-    // nativeBounds is the physical screen in pixels (bounds.size * scale);
-    // aliasing it to point-sized bounds made games render at half resolution
-    // on Retina device profiles.
-    let bounds: CGRect = msg![env; this bounds];
-    let scale = env.window().screen_scale() as CGFloat;
+    // Physical pixels stay portrait-up even when logical bounds rotate.
+    // https://developer.apple.com/documentation/uikit/uiscreen/nativebounds
     CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
-        size: CGSize {
-            width:  bounds.size.width as CGFloat * scale,
-            height: bounds.size.height as CGFloat * scale,
-        },
+        size: native_pixel_size(env),
     }
 }
 
@@ -287,22 +265,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Display mode / overscan
 
 - (id)currentMode {
-    // `UIScreenMode.size` is in *pixels*, not points (it is the size of the
-    // framebuffer the screen is currently rendering at). On a real device
-    // this is `bounds.size * scale` — e.g. 640x960 on a Retina iPhone 4
-    // whose `bounds` are 320x480 points. We used to report the point size,
-    // which made engines that size their renderbuffer/projection from
-    // `currentMode.size` (Gameloft's Dust engine — N.O.V.A. 3, Firemint,
-    // …) allocate a viewport of half (or quarter) the EAGL renderbuffer
-    // area and draw the scene into a corner of the screen on Retina
-    // device profiles.
-    let (width, height) = screen_size_for_current_orientation(env);
-    let scale = env.window().screen_scale() as CGFloat;
-    let size = CGSize {
-        width:  width  as CGFloat * scale,
-        height: height as CGFloat * scale,
-    };
-
+    // The underlying display buffer's pixels, independent of the logical
+    // interface-oriented drawing space exposed by bounds.
+    // https://developer.apple.com/documentation/uikit/uiscreenmode/size
+    let size = native_pixel_size(env);
     crate::frameworks::uikit::ui_screen_mode::from_size(env, size, 1.0)
 }
 
@@ -425,37 +391,29 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 #[cfg(test)]
 mod tests {
-    use super::screen_size_for_orientation;
-    use crate::window::{DeviceFamily, DeviceOrientation};
+    use super::native_pixel_size_from_points;
+    use crate::frameworks::core_graphics::CGSize;
+    use crate::window::DeviceFamily;
 
     #[test]
-    fn iphone_5_screen_bounds_follow_landscape_orientation() {
-        for device_family in [DeviceFamily::iPhone5, DeviceFamily::iPhone5c] {
-            let portrait_size = device_family.portrait_size();
+    fn native_screen_pixels_use_fixed_portrait_dimensions_and_retina_scale() {
+        // Physical bounds never follow interface rotations.
+        // https://developer.apple.com/documentation/uikit/uiscreen/nativebounds
+        for family in [DeviceFamily::iPhone5, DeviceFamily::iPhone5c] {
             assert_eq!(
-                screen_size_for_orientation(portrait_size, DeviceOrientation::LandscapeLeft, true,),
-                (568, 320)
-            );
-            assert_eq!(
-                screen_size_for_orientation(portrait_size, DeviceOrientation::LandscapeRight, true,),
-                (568, 320)
-            );
-            assert_eq!(
-                screen_size_for_orientation(portrait_size, DeviceOrientation::Portrait, true,),
-                (320, 568)
-            );
-            assert_eq!(
-                screen_size_for_orientation(
-                    portrait_size,
-                    DeviceOrientation::PortraitUpsideDown,
-                    true,
-                ),
-                (320, 568)
-            );
-            assert_eq!(
-                screen_size_for_orientation(portrait_size, DeviceOrientation::LandscapeLeft, false,),
-                (320, 568)
+                native_pixel_size_from_points(family.portrait_size(), family.scale_factor()),
+                CGSize {
+                    width: 640.0,
+                    height: 1136.0
+                }
             );
         }
+        assert_eq!(
+            native_pixel_size_from_points((412, 915), 1.0),
+            CGSize {
+                width: 412.0,
+                height: 915.0
+            }
+        );
     }
 }

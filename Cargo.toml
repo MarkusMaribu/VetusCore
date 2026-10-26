@@ -176,3 +176,6 @@ lto = "fat"
 # vendor/symphonia-codec-aac turns that into a recoverable decode error.
 [patch.crates-io]
 symphonia-codec-aac = { path = "vendor/symphonia-codec-aac" }
+# QuickTime v0/v1 PCM sample tables use a nominal sample size of 1; the
+# reader must use the sound description's full frame size to read the data.
+symphonia-format-isomp4 = { path = "vendor/symphonia-format-isomp4" }

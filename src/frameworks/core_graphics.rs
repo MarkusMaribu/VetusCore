@@ -21,6 +21,7 @@ pub mod cg_image;
 pub mod cg_layer;
 pub mod cg_path;
 pub mod cg_pattern;
+mod bitmap_blend;
 
 pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     path: "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",

@@ -48,7 +48,7 @@ pub(crate) struct CALayerHostObject {
     pub(crate) metal_framebuffer_only: bool,
     delegate: id,
     pub(super) sublayers: Vec<id>,
-    superlayer: id,
+    pub(super) superlayer: id,
     pub(super) bounds: CGRect,
     pub(super) position: CGPoint,
     pub(super) z_position: CGFloat, // <-- ДОБАВЛЕНО СВОЙСТВО Z-POSITION
@@ -94,6 +94,7 @@ pub(crate) struct CALayerHostObject {
     pub(super) anonymous_animations: HashSet<id>,
     pub(super) name: Option<String>,
     pub(super) mask: id,
+    pub(super) masks_to_bounds: bool,
     /// `contentsGravity` — one of the `kCAGravity*` strings. Defaults to
     /// `"resize"` per Apple's CALayer documentation:
     /// <https://developer.apple.com/documentation/quartzcore/calayer/1410933-contentsgravity>
@@ -271,6 +272,19 @@ pub(super) fn release_transition_tree(env: &mut Environment, tree: TransitionTre
 }
 
 impl CALayerHostObject {
+    pub(super) fn bounds_mask(bounds: CGRect, radius: CGFloat) -> Self {
+        Self {
+            bounds,
+            position: CGPoint { x: bounds.origin.x + bounds.size.width * 0.5,
+                y: bounds.origin.y + bounds.size.height * 0.5 },
+            anchor_point: CGPoint { x: 0.5, y: 0.5 },
+            transform_3d: CATransform3DIdentity,
+            opacity: 1.0, corner_radius: radius,
+            background_color: Some(CGColorHostObject { r:1.0,g:1.0,b:1.0,a:1.0, ..Default::default() }),
+            ..Default::default()
+        }
+    }
+
     pub(super) fn delegate_for_debug(&self) -> id {
         self.delegate
     }
@@ -575,6 +589,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         anonymous_animations: HashSet::new(),
         name: None,
         mask: nil,
+        masks_to_bounds: false,
         contents_gravity: kCAGravityResize.to_owned(),
         contents_rect: CGRect {
             origin: CGPoint { x: 0.0, y: 0.0 },
@@ -1090,12 +1105,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<CALayerHostObject>(this).name = name_str;
 }
 
+// https://developer.apple.com/documentation/quartzcore/calayer/maskstobounds
+- (bool)masksToBounds { env.objc.borrow::<CALayerHostObject>(this).masks_to_bounds }
+- (())setMasksToBounds:(bool)clip {
+    env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds = clip;
+}
+
 - (id)mask { env.objc.borrow::<CALayerHostObject>(this).mask }
 
 - (())setMask:(id)mask {
     let old_mask = env.objc.borrow::<CALayerHostObject>(this).mask;
     if mask != old_mask {
-        if mask != nil { retain(env, mask); }
+        if mask != nil {
+            retain(env, mask);
+            let _: () = msg![env; mask removeFromSuperlayer];
+        }
         env.objc.borrow_mut::<CALayerHostObject>(this).mask = mask;
         if old_mask != nil { release(env, old_mask); }
     }

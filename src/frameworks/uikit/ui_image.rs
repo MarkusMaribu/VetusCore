@@ -26,6 +26,32 @@ const CACHE_SIZE: usize = 60;
 #[derive(Default)]
 pub struct State {
     cached_images: HashMap<String, id>,
+    save_completions: Vec<SaveCompletion>,
+}
+
+struct SaveCompletion {
+    image: id,
+    target: id,
+    selector: SEL,
+    error: id,
+    context: MutVoidPtr,
+}
+
+pub fn has_pending_save_completions(env: &Environment) -> bool {
+    !State::get(env).save_completions.is_empty()
+}
+
+/// Photo-album save callbacks are deferred to the guest main run loop.
+pub fn poll_save_completions(env: &mut Environment) -> bool {
+    let completions = std::mem::take(&mut State::get_mut(env).save_completions);
+    let handled = !completions.is_empty();
+    for result in completions {
+        invoke_save_completion(env, result.target, result.selector, result.image, result.error, result.context);
+        release(env, result.image);
+        release(env, result.target);
+        release(env, result.error);
+    }
+    handled
 }
 
 impl State {
@@ -498,9 +524,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 /// <https://developer.apple.com/documentation/uikit/1619125-uiimagewritetosavedphotosalbum>
 ///
 /// Adds the specified image to the user's Camera Roll album. In the emulator
-/// we persist the PNG data into the app's sandboxed Documents directory (since
-/// there is no real photo library). After saving, the optional completion
-/// callback is invoked with a nil error to signal success.
+/// the embedded host publishes PNG data into its photo library. Desktop hosts
+/// keep the sandbox Documents fallback. Completion is delivered on the next
+/// main-loop iteration with an error if publication failed.
 ///
 /// The completion selector signature expected by Apple is:
 /// `- (void)image:(UIImage *)image didFinishSavingWithError:(NSError *)error
@@ -512,19 +538,6 @@ fn UIImageWriteToSavedPhotosAlbum(
     completion_selector: SEL,
     context_info: MutVoidPtr,
 ) {
-    if image == nil {
-        log!("UIImageWriteToSavedPhotosAlbum: nil image, ignoring.");
-        // Still invoke callback if requested, with nil error
-        invoke_save_completion(
-            env,
-            completion_target,
-            completion_selector,
-            image,
-            nil,
-            context_info,
-        );
-        return;
-    }
 
     // Get the CGImage backing the UIImage
     let cg_image_ref: CGImageRef = msg![env; image CGImage];
@@ -540,37 +553,16 @@ fn UIImageWriteToSavedPhotosAlbum(
         let ok = img.write_png_image(ctx_ptr, w as i32, h as i32, rgba, stride as i32);
 
         if ok != 0 && !png_data.is_empty() {
-            // Generate a unique filename based on timestamp
-            let filename = format!(
-                "SavedPhoto_{}.png",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0)
-            );
-
-            // Save to the app's Documents directory
-            let docs_path = format!("/Documents/{}", filename);
-            let guest_path = GuestPath::new(&docs_path);
-            match env.fs.write(guest_path, &png_data) {
-                Ok(()) => {
-                    log!(
-                        "UIImageWriteToSavedPhotosAlbum: saved {}x{} image to {}",
-                        w,
-                        h,
-                        docs_path
-                    );
-                    true
-                }
-                Err(e) => {
-                    log!(
-                        "UIImageWriteToSavedPhotosAlbum: failed to write {}: {:?}",
-                        docs_path,
-                        e
-                    );
-                    false
-                }
-            }
+            #[cfg(feature = "embedded")]
+            let saved = crate::embed::save_image(&png_data);
+            #[cfg(not(feature = "embedded"))]
+            let saved = {
+                let filename = format!("/Documents/SavedPhoto_{}.png", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+                env.fs.write(GuestPath::new(&filename), &png_data).is_ok()
+            };
+            log!("UIImageWriteToSavedPhotosAlbum: {}x{} image saved={}", w, h, saved);
+            saved
         } else {
             log!("UIImageWriteToSavedPhotosAlbum: PNG encoding failed.");
             false
@@ -592,14 +584,14 @@ fn UIImageWriteToSavedPhotosAlbum(
                                                        userInfo:nil];
         error
     };
-    invoke_save_completion(
-        env,
-        completion_target,
-        completion_selector,
-        image,
-        error,
-        context_info,
-    );
+    if completion_target != nil && !completion_selector.is_null() {
+        retain(env, image);
+        retain(env, completion_target);
+        retain(env, error);
+        State::get_mut(env).save_completions.push(SaveCompletion {
+            image, target: completion_target, selector: completion_selector, error, context: context_info,
+        });
+    }
 }
 
 /// Invokes the `UIImageWriteToSavedPhotosAlbum` completion callback. Per
@@ -652,10 +644,21 @@ fn UIImagePNGRepresentation(env: &mut Environment, image: id) -> id {
 fn UIImageJPEGRepresentation(
     env: &mut Environment,
     image: id,
-    _compression_quality: CGFloat,
+    compression_quality: CGFloat,
 ) -> id {
-    // В эмуляторе пока фоллбек на PNG, если нет JPEG энкодера
-    UIImagePNGRepresentation(env, image)
+    // Returns JPEG data and honors the documented 0..1 quality range.
+    // https://developer.apple.com/documentation/uikit/uiimage/jpegdata(compressionquality:)
+    // Upstream touchHLE has no implementation of this export yet.
+    if image == nil { return nil; }
+    let cg_image: CGImageRef = msg![env; image CGImage];
+    if cg_image.is_null() { return nil; }
+    let Some(bytes) = cg_image::borrow_image(&env.objc, cg_image).jpeg_data(compression_quality) else {
+        return nil;
+    };
+    let length = bytes.len() as u32;
+    let buffer = env.mem.alloc(length);
+    env.mem.bytes_at_mut(buffer.cast(), length).copy_from_slice(&bytes);
+    msg_class![env; NSData dataWithBytesNoCopy:buffer length:length]
 }
 
 pub const FUNCTIONS: FunctionExports = &[

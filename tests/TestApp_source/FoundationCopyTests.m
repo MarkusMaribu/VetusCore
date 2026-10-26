@@ -24,8 +24,64 @@
 - (NSUInteger)length;
 - (const void *)bytes;
 @end
+@interface NSJSONSerialization : NSObject
++ (id)JSONObjectWithData:(NSData *)data options:(NSUInteger)options error:(id *)error;
+@end
+@interface NSRegularExpression : NSObject
++ (id)regularExpressionWithPattern:(id)pattern options:(NSUInteger)options error:(id *)error;
+- (NSUInteger)numberOfMatchesInString:(id)string options:(NSUInteger)options range:(NSRange)range;
+@end
 #endif
 #include <string.h>
+
+// An immutable NSCopying result is owned by the caller and remains usable
+// after the original expression's autorelease pool drains.
+// https://developer.apple.com/documentation/foundation/nsregularexpression?language=objc
+// https://developer.apple.com/documentation/foundation/nscopying?language=objc
+int test_NSRegularExpression_copy_survives_pool(void) {
+  NSAutoreleasePool *outer = [[NSAutoreleasePool alloc] init];
+  NSAutoreleasePool *inner = [[NSAutoreleasePool alloc] init];
+  NSRegularExpression *source = [NSRegularExpression regularExpressionWithPattern:@"cat"
+      options:0 error:NULL];
+  NSRegularExpression *copy = [source copy];
+  [inner drain];
+  int result = 0;
+  if (copy == nil) result = -1;
+  else if ([copy numberOfMatchesInString:@"cat dog cat" options:0
+                                   range:NSMakeRange(0, 11)] != 2) result = -2;
+  [copy release];
+  [outer drain];
+  return result;
+}
+
+// A retained result must survive draining the pool that performed the parse.
+// https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/MemoryMgmt/Articles/mmRules.html
+int test_NSJSONSerialization_retained_result_survives_pool(void) {
+  const char *inputs[] = {"{}", "[]", "{\"part\":{\"name\":\"Body\"}}",
+                          "[\"Body\",{\"name\":\"Slide\"}]"};
+  NSAutoreleasePool *outer = [[NSAutoreleasePool alloc] init];
+  int result = 0;
+  for (unsigned options = 0; options <= 1 && !result; options++) {
+    for (unsigned i = 0; i < 4 && !result; i++) {
+      NSAutoreleasePool *inner = [[NSAutoreleasePool alloc] init];
+      NSData *data = [NSData dataWithBytes:inputs[i] length:strlen(inputs[i])];
+      id root = [[NSJSONSerialization JSONObjectWithData:data options:options
+                                                   error:NULL] retain];
+      [inner drain];
+      unsigned expected = i < 2 ? 0 : i == 2 ? 1 : 2;
+      if (root == nil || [root count] != expected) result = -(int)(1 + i + options * 4);
+      if (!result && i == 2 &&
+          ![[[root objectForKey:@"part"] objectForKey:@"name"] isEqual:@"Body"])
+        result = -10;
+      if (!result && i == 3 &&
+          ![[[root objectAtIndex:1] objectForKey:@"name"] isEqual:@"Slide"])
+        result = -11;
+      [root release];
+    }
+  }
+  [outer drain];
+  return result;
+}
 
 static int copy_members_freed;
 @interface HashTableCopyMember : NSObject

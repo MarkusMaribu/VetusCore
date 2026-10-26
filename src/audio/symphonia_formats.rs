@@ -280,3 +280,98 @@ impl FrameDecoder {
         }
     }
 }
+
+#[cfg(test)]
+mod quicktime_pcm_tests {
+    use super::*;
+
+    fn atom(kind: &[u8; 4], data: Vec<u8>) -> Vec<u8> {
+        [
+            ((data.len() + 8) as u32).to_be_bytes().as_slice(),
+            kind,
+            &data,
+        ]
+        .concat()
+    }
+
+    fn words(values: &[u32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_be_bytes())
+            .collect()
+    }
+
+    // Authored PCM-only QuickTime movie, with two chunks separated by unrelated
+    // media bytes. No game assets are used. QuickTime v0/v1 sample conventions:
+    // https://developer.apple.com/documentation/quicktime-file-format/sound_sample_description_version_1
+    fn movie(version: u16, sample_size: u32) -> (Vec<u8>, Vec<u8>) {
+        let pcm: Vec<u8> = [1000i16, -1000, 2000, -2000, 3000, -3000, 4000, -4000]
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let ftyp = atom(b"ftyp", [b"qt  ".as_slice(), &[0; 4], b"qt  "].concat());
+        let first_chunk = (ftyp.len() + 8) as u32;
+        let mdat = atom(b"mdat", [&pcm[..8], &[0x55; 12], &pcm[8..]].concat());
+        let mut sound = vec![0; 6];
+        sound.extend_from_slice(&1u16.to_be_bytes()); // data reference
+        sound.extend_from_slice(&version.to_be_bytes());
+        sound.extend_from_slice(&0u16.to_be_bytes()); // revision
+        sound.extend_from_slice(&0u32.to_be_bytes()); // vendor
+        sound.extend_from_slice(&2u16.to_be_bytes()); // stereo
+        sound.extend_from_slice(&16u16.to_be_bytes());
+        let compression_id = if version == 1 { u16::MAX } else { 0 };
+        sound.extend_from_slice(&compression_id.to_be_bytes());
+        sound.extend_from_slice(&0u16.to_be_bytes()); // packet size
+        sound.extend_from_slice(&(48000u32 << 16).to_be_bytes());
+        if version == 1 {
+            sound.extend_from_slice(&words(&[1, 2, 4, 2]));
+        }
+        let stsd = atom(b"stsd", [words(&[0, 1]), atom(b"sowt", sound)].concat());
+        let stbl = atom(
+            b"stbl",
+            [
+                stsd,
+                atom(b"stts", words(&[0, 1, 4, 1])),
+                atom(b"stsc", words(&[0, 1, 1, 2, 1])),
+                atom(b"stsz", words(&[0, sample_size, 4])),
+                atom(b"stco", words(&[0, 2, first_chunk, first_chunk + 20])),
+            ]
+            .concat(),
+        );
+        let mdhd = atom(b"mdhd", [words(&[0, 0, 0, 48000, 4]), vec![0; 4]].concat());
+        let hdlr = atom(
+            b"hdlr",
+            [words(&[0, 0]), b"soun".to_vec(), vec![0; 13]].concat(),
+        );
+        let minf = atom(b"minf", [atom(b"smhd", vec![0; 8]), stbl].concat());
+        let mdia = atom(b"mdia", [mdhd, hdlr, minf].concat());
+        let tkhd = atom(b"tkhd", [words(&[7, 0, 0, 1, 0, 4]), vec![0; 14]].concat());
+        let mvhd = atom(
+            b"mvhd",
+            [words(&[0, 0, 0, 48000, 4, 65536]), vec![0; 2]].concat(),
+        );
+        let moov = atom(
+            b"moov",
+            [mvhd, atom(b"trak", [tkhd, mdia].concat())].concat(),
+        );
+        ([ftyp, mdat, moov].concat(), pcm)
+    }
+
+    #[test]
+    fn quicktime_v0_and_v1_nominal_byte_samples_decode_complete_stereo_frames() {
+        for version in [0, 1] {
+            let (movie, expected) = movie(version, 1);
+            let decoded = decode_symphonia_to_pcm(Cursor::new(movie)).unwrap();
+            assert_eq!(decoded.sample_rate, 48000);
+            assert_eq!(decoded.channels, 2);
+            assert_eq!(decoded.bytes, expected);
+        }
+    }
+
+    #[test]
+    fn explicit_pcm_frame_sizes_are_not_multiplied_again() {
+        let (movie, expected) = movie(0, 4);
+        let decoded = decode_symphonia_to_pcm(Cursor::new(movie)).unwrap();
+        assert_eq!(decoded.bytes, expected);
+    }
+}

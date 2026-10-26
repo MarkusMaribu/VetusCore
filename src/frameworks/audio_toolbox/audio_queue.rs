@@ -164,7 +164,7 @@ unsafe impl SafeRead for OpaqueAudioQueue {}
 pub type AudioQueueRef = MutPtr<OpaqueAudioQueue>;
 
 #[repr(C, packed)]
-struct OpaqueAudioQueueTimeline {
+pub struct OpaqueAudioQueueTimeline {
     _filler: u8,
 }
 unsafe impl SafeRead for OpaqueAudioQueueTimeline {}
@@ -331,7 +331,7 @@ fn note_output_underrun(queue: &mut AudioQueueHostObject, source_state: ALint) {
     }
 }
 
-fn AudioQueueGetCurrentTime(
+pub fn AudioQueueGetCurrentTime(
     env: &mut Environment,
     in_aq: AudioQueueRef,
     in_timeline: AudioQueueTimelineRef,
@@ -836,7 +836,7 @@ fn AudioQueueEnqueueBufferWithParameters(
     AudioQueueEnqueueBuffer(env, in_aq, in_buffer, in_num_packet_descs, in_packet_descs)
 }
 
-fn AudioQueueAddPropertyListener(
+pub fn AudioQueueAddPropertyListener(
     env: &mut Environment,
     in_aq: AudioQueueRef,
     in_id: AudioQueuePropertyID,
@@ -970,7 +970,7 @@ fn AudioQueueGetPropertySize(
     0 // success
 }
 
-fn AudioQueueGetProperty(
+pub fn AudioQueueGetProperty(
     env: &mut Environment,
     in_aq: AudioQueueRef,
     in_property_id: AudioQueuePropertyID,

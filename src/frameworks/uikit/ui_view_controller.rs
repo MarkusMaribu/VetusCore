@@ -31,6 +31,10 @@ pub(crate) struct UIViewControllerHostObject {
     /// The root view.
     /// `UIView*`
     view: id,
+    /// The orientation applied to this controller, separate from the status
+    /// bar so rotation callbacks can observe the old and new values.
+    pub(crate) interface_orientation: Option<UIInterfaceOrientation>,
+    pub(crate) autorotation_in_progress: bool,
     /// Nib name to be used at the load
     /// of the root view, may be nil.
     /// `NSString*`
@@ -353,17 +357,23 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
 
-    let host_obj = env.objc.borrow_mut::<UIViewControllerHostObject>(this);
-    let old_view = std::mem::replace(&mut host_obj.view, new_view);
+    let old_view = env.objc.borrow::<UIViewControllerHostObject>(this).view;
+    if old_view == new_view {
+        return;
+    }
+    // Retain before changing the hierarchy: the previous view may own the
+    // replacement as a subview, and removing it must not destroy that view.
+    if new_view != nil {
+        retain(env, new_view);
+    }
+    env.objc.borrow_mut::<UIViewControllerHostObject>(this).view = new_view;
     if old_view != nil {
         set_view_controller(env, old_view, nil);
     }
     if new_view != nil {
         set_view_controller(env, new_view, this);
     }
-    if new_view != nil {
-        retain(env, new_view);
-    }
+    super::ui_view::ui_window::replace_controller_root_view(env, this, old_view, new_view);
     if old_view != nil {
         release(env, old_view);
     }
@@ -884,11 +894,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (UIInterfaceOrientation)interfaceOrientation {
-    // UIKit reports the view controller's current interface orientation,
-    // which tracks the app-wide interface orientation. Returning 0
-    // (UIInterfaceOrientationUnknown) made landscape apps that query this
-    // during layout fall back to portrait, so mirror the shared
-    // application's status bar orientation instead.
+    if let Some(orientation) = env.objc.borrow::<UIViewControllerHostObject>(this)
+        .interface_orientation
+    {
+        return orientation;
+    }
+    // Before this controller participates in rotation, preserve the shared
+    // application orientation used by existing layout code. Once rotation
+    // starts, the stored value also distinguishes willRotate from didRotate.
     let app: id = msg_class![env; UIApplication sharedApplication];
     msg![env; app statusBarOrientation]
 }
@@ -945,6 +958,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 // overrides is already there, so a missing one ends the app at launch.
 - (())willRotateToInterfaceOrientation:(UIInterfaceOrientation)_orientation
                               duration:(f64)_duration {
+}
+
+- (())willAnimateRotationToInterfaceOrientation:(UIInterfaceOrientation)_orientation
+                                      duration:(f64)_duration {
 }
 
 - (())didRotateFromInterfaceOrientation:(UIInterfaceOrientation)_orientation {

@@ -8,7 +8,7 @@ use super::{ns_string, NSRange, NSUInteger};
 use crate::mem::MutPtr;
 use crate::msg;
 use crate::objc::{
-    autorelease, id, msg_class, nil, objc_classes, release, ClassExports, HostObject, NSZonePtr,
+    autorelease, id, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
 use regex::Regex;
 
@@ -46,6 +46,13 @@ pub const CLASSES: ClassExports = objc_classes! {
             return nil;
         }
         autorelease(env, new)
+    }
+
+    // NSRegularExpression is immutable and conforms to NSCopying. Returning
+    // a retained receiver preserves both the compiled pattern and ownership.
+    // https://developer.apple.com/documentation/foundation/nscopying?language=objc
+    - (id)copyWithZone:(NSZonePtr)_zone {
+        retain(env, this)
     }
 
     // - (id)initWithPattern:(NSString *)pattern

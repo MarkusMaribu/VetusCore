@@ -32,6 +32,20 @@
 
 use std::time::Duration;
 
+/// Leave placement to Android unless the user explicitly requests pinning.
+/// Threads created by native graphics, audio and decoder libraries inherit
+/// the calling thread's affinity, so pinning it also constrains their work.
+/// https://source.android.com/docs/core/perf/performance-hint-api
+/// https://man7.org/linux/man-pages/man3/pthread_create.3.html
+#[cfg(any(target_os = "android", test))]
+fn affinity_policy<'a>(environment: Option<&'a str>, option: Option<&'a str>) -> &'a str {
+    environment
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| option.map(str::trim).filter(|value| !value.is_empty()))
+        .unwrap_or("all")
+}
+
 /// Handle for the hints. Create it on the emulator thread, then call
 /// [PerfHints::frame_presented] once per presented frame from that thread.
 pub struct PerfHints {
@@ -173,7 +187,16 @@ fn arm_core_is_high_performance(implementer: u32, part: u32) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{arm_core_performance_cores, select_high_capacity_cores};
+    use super::{affinity_policy, arm_core_performance_cores, select_high_capacity_cores};
+
+    #[test]
+    fn default_affinity_preserves_parallel_host_workers() {
+        assert_eq!(affinity_policy(None, None), "all");
+        assert_eq!(affinity_policy(Some(" "), Some(" ")), "all");
+        assert_eq!(affinity_policy(None, Some("big")), "big");
+        assert_eq!(affinity_policy(Some(" 2-5 "), Some("big")), "2-5");
+        assert_eq!(affinity_policy(Some(" "), Some("big")), "big");
+    }
 
     #[test]
     fn selects_high_capacity_cluster() {
@@ -274,13 +297,9 @@ mod android {
     /// `affinity_override` comes from `--affinity=`; the `TOUCHHLE_AFFINITY`
     /// environment variable, when set, takes precedence over it.
     pub fn pin_to_big_cores(affinity_override: Option<&str>) {
-        let override_ = std::env::var("TOUCHHLE_AFFINITY")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| affinity_override.map(|v| v.to_string()))
-            .unwrap_or_default();
-        let override_ = override_.trim();
-        if override_.is_empty() || override_.eq_ignore_ascii_case("big") {
+        let environment = std::env::var("TOUCHHLE_AFFINITY").ok();
+        let override_ = super::affinity_policy(environment.as_deref(), affinity_override);
+        if override_.eq_ignore_ascii_case("big") {
             if let Some(cores) = big_core_cpus() {
                 if set_affinity(&cores, "big cluster") {
                     return;
@@ -289,7 +308,7 @@ mod android {
             return;
         }
         if override_.eq_ignore_ascii_case("off") || override_.eq_ignore_ascii_case("all") {
-            log!("CPU affinity override: staying on all cores.");
+            log!("CPU affinity: leaving thread placement to Android.");
             return;
         }
         let cores: Vec<usize> = override_
