@@ -391,7 +391,8 @@ fn CTFontDescriptorCreateMatchingFontDescriptor(
 
 /// The file in `/System/Library/Fonts/Cache` (see `fs.rs`) that stands in for
 /// a font with this name or family and style. touchHLE ships the metric
-/// compatible Liberation fonts, plus Arial and a bold Helvetica.
+/// compatible Liberation fonts, plus Heros-derived substitutes at the legacy
+/// Arial/Helvetica file paths. These paths do not identify proprietary fonts.
 fn system_font_file(name: &str, style: &str) -> &'static str {
     let name = name.to_ascii_lowercase();
     let style = style.to_ascii_lowercase();

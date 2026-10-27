@@ -182,6 +182,7 @@ pub const APPLICATIONS: &GuestPath = GuestPath::new_const("/var/mobile/Applicati
 /// Fonts from [paths::FONTS_DIR] that are also exposed to the guest in
 /// `/System/Library/Fonts/Cache`, where the real iPhone OS keeps its fonts.
 const SYSTEM_FONT_FILES: &[&str] = &[
+    // Heros-derived substitutes, with legacy filenames for guest compatibility.
     "Arial.ttf",
     "helvetica-bold.ttf",
     "LiberationSans-Regular.ttf",

@@ -433,7 +433,9 @@ pub fn acknowledge_native_window(generation: u64) {
 pub fn wait_for_surface_release(generation: u64) {
     let (lock, cv) = run_state();
     let mut state = lock.lock().unwrap();
-    while !state.quit && state.surface.released < generation {
+    // Quit wakes the renderer; it does not prove EGL has detached yet.
+    // If the process exits first, Binder death releases the host's waiter.
+    while state.surface.released < generation {
         state = cv.wait(state).unwrap();
     }
 }
@@ -442,11 +444,14 @@ pub fn should_quit() -> bool {
     run_state().0.lock().unwrap().quit
 }
 
-/// Block the emulator thread while the user is away or the surface is gone.
-pub fn wait_until_runnable() {
+/// Park guest execution, but wake the renderer to service a surface change.
+pub fn wait_for_host_update(surface_generation: u64) {
     let (lock, cv) = run_state();
     let mut state = lock.lock().unwrap();
-    while !state.quit && (state.paused || state.surface.window == 0) {
+    while !state.quit
+        && (state.paused || state.surface.window == 0)
+        && state.surface.generation == surface_generation
+    {
         state = cv.wait(state).unwrap();
     }
 }
@@ -863,6 +868,9 @@ pub fn rgba_to_bmp(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    // These tests share the host mailbox, unlike the pure SurfaceState tests.
+    static HOST_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn surface_release_waits_for_render_thread_and_survives_reopen() {
         let mut surface = SurfaceState::default();
@@ -884,6 +892,7 @@ mod tests {
 
     #[test]
     fn texture_owner_is_not_released_until_the_renderer_acknowledges() {
+        let _host_state = HOST_STATE_TEST_LOCK.lock().unwrap();
         use std::sync::mpsc::{channel, RecvTimeoutError};
         set_native_window(10);
         let close = set_native_window(0);
@@ -910,6 +919,76 @@ mod tests {
         waiter.join().unwrap();
         let close = set_native_window(0);
         acknowledge_native_window(close);
+    }
+
+    #[test]
+    fn parked_renderer_retires_surfaces_without_resuming_the_guest() {
+        // Android keeps the texture owner alive until our render fence:
+        // https://developer.android.com/reference/android/view/TextureView.SurfaceTextureListener
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        let _host_state = HOST_STATE_TEST_LOCK.lock().unwrap();
+        set_paused(true);
+        let initial = set_native_window(10);
+        let (serviced_tx, serviced_rx) = channel();
+        let (resumed_tx, resumed_rx) = channel();
+        let renderer = std::thread::spawn(move || {
+            while !is_runnable() {
+                let (_, generation) = native_window_snapshot();
+                acknowledge_native_window(generation);
+                serviced_tx.send(generation).unwrap();
+                wait_for_host_update(generation);
+            }
+            resumed_tx.send(()).unwrap();
+        });
+        assert_eq!(
+            serviced_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            initial
+        );
+        let close = set_native_window(0);
+        assert_eq!(
+            serviced_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            close
+        );
+        wait_for_surface_release(close);
+        let reopen = set_native_window(20);
+        assert_eq!(
+            serviced_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            reopen
+        );
+        assert!(is_paused());
+        assert_eq!(
+            resumed_rx.recv_timeout(Duration::from_millis(20)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        set_paused(false);
+        resumed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        renderer.join().unwrap();
+        let close = set_native_window(0);
+        acknowledge_native_window(close);
+        set_paused(true);
+    }
+
+    #[test]
+    fn quit_does_not_release_texture_before_renderer_acknowledges() {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        let _host_state = HOST_STATE_TEST_LOCK.lock().unwrap();
+        set_native_window(10);
+        let close = set_native_window(0);
+        let (released_tx, released_rx) = channel();
+        let waiter = std::thread::spawn(move || {
+            wait_for_surface_release(close);
+            released_tx.send(()).unwrap();
+        });
+        run_state().0.lock().unwrap().quit = true;
+        wake();
+        assert_eq!(
+            released_rx.recv_timeout(Duration::from_millis(20)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        acknowledge_native_window(close);
+        released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        waiter.join().unwrap();
+        run_state().0.lock().unwrap().quit = false;
     }
 
     #[test]

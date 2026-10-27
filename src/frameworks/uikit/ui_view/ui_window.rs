@@ -799,6 +799,7 @@ mod launch_rotation_tests {
         let mut environment = crate::environment::touch_test_environment();
         let env = &mut environment;
         env.options.ios_version = Some((8, 0, 0));
+        env.options.linked_sdk_version = Some((8, 0, 0));
         let pool: id = msg_class![env; NSAutoreleasePool new];
         let landscape = CGRect {
             origin: CGPoint::default(),
@@ -902,8 +903,8 @@ mod launch_rotation_tests {
         // https://developer.apple.com/documentation/uikit/uiviewcontroller
         let mut environment = crate::environment::touch_test_environment();
         let env = &mut environment;
-        // Exercise the portrait-fixed screen model used before iOS 8.
-        env.options.ios_version = Some((7, 1, 2));
+        // The default compatibility policy must retain portrait-fixed screen
+        // coordinates and rotate the root, even when UIDevice reports Latest.
         let pool: id = msg_class![env; NSAutoreleasePool new];
         let class: crate::objc::Class = msg_class![env; UIViewController class];
         type RotationCallback = fn(&mut crate::Environment, id, crate::objc::SEL, i32, f64);

@@ -1378,6 +1378,37 @@ fn glyph_id_from_post_table(post_data: &[u8], name: &str, _glyph_count: u32) -> 
 mod tests {
     use super::*;
 
+    // Font sizes are in points/em, not the replacement font's raw design units.
+    // https://developer.apple.com/documentation/coretext/ctfontgetsize(_:)
+    // Keep legacy guest file aliases readable by the same RustType path as
+    // app-supplied fonts, and catch accidental UPM/line-height scale changes.
+    #[test]
+    fn heros_guest_substitutes_preserve_font_scale() {
+        for (filename, reference, metrics, cap) in [
+            ("Arial.ttf", Font::sans_regular(), (1854.0, -434.0, 67.0), 1466.0),
+            ("helvetica-bold.ttf", Font::sans_bold(), (1577.0, -471.0, 0.0), 1474.0),
+        ] {
+            let bytes = std::fs::read(format!("{}/{filename}", paths::FONTS_DIR)).unwrap();
+            let font = Font::from_vec(bytes).expect("TrueType guest substitute must load");
+            assert_eq!(font.units_per_em(), 2048, "{filename}");
+            assert_eq!(font.design_v_metrics(), metrics, "{filename}");
+            let h = font.glyph_id_for_unicode('H');
+            assert_eq!(font.glyph_bbox(h).3, cap, "{filename}");
+            for ch in ' '..='~' {
+                assert_eq!(
+                    font.glyph_advance(font.glyph_id_for_unicode(ch)),
+                    reference.glyph_advance(reference.glyph_id_for_unicode(ch)),
+                    "{filename}: {ch}",
+                );
+            }
+            // Actual rasterization must still produce ink after conversion.
+            let glyph = font.glyph(h).scaled(font.em_scale(20.0)).positioned(Point { x: 0.0, y: 0.0 });
+            let mut ink = 0.0;
+            glyph.draw(|_, _, coverage| ink += coverage);
+            assert!(ink > 0.0, "{filename}");
+        }
+    }
+
     #[test]
     fn invalid_glyph_metrics_use_notdef() {
         let font = Font::sans_regular();

@@ -2501,6 +2501,7 @@ mod lazy_link_recovery_tests {
 
         MachO {
             name: "test".to_owned(),
+            sdk_version: None,
             dynamic_libraries: Vec::new(),
             sections: vec![Section {
                 name: section_name.to_owned(),

@@ -645,52 +645,6 @@ impl Environment {
             .read(executable_path)
             .map_err(|_| "Could not load executable: Could not read executable file".to_string())?;
 
-        let window = if options.headless {
-            None
-        } else {
-            let icon = bundle.load_icon(&fs);
-            if let Err(ref e) = icon {
-                log!("Warning: {}", e);
-            }
-
-            // `launch_image_path` already resolved the spelling of the file
-            // that exists in the bundle, so no extra is_file() check here:
-            // doing an exact-match check on the plist's spelling instead was
-            // what made the picker log "Using launch image" for a file that
-            // then silently wasn't shown.
-            let launch_image = bundle
-                .launch_image_path(&fs, device_family)
-                .and_then(|path| {
-                    let res = fs
-                        .read(path)
-                        .map_err(|_| "Could not read launch image file".to_string())
-                        .and_then(|bytes| {
-                            image::Image::from_bytes(&bytes)
-                                .map_err(|e| format!("Could not parse launch image: {e}"))
-                        });
-                    if let Err(ref e) = res {
-                        log!("Warning: {}", e);
-                    };
-                    res.ok()
-                });
-            Some(Box::new(window::Window::new(
-                &format!(
-                    "{} (touchHLE {}{}{})",
-                    bundle.display_name(),
-                    super::branding(),
-                    if super::branding().is_empty() {
-                        ""
-                    } else {
-                        " "
-                    },
-                    super::VERSION
-                ),
-                icon.ok(),
-                launch_image.map(|image| (image, false)),
-                &options,
-            )?))
-        };
-
         let mut mem = mem::Mem::new();
 
         let is_spore = bundle.bundle_identifier().starts_with("com.ea.spore");
@@ -758,6 +712,62 @@ impl Environment {
         )
         .map_err(|e| format!("Could not load executable: {e}"))?;
         drop(executable_bytes);
+
+        // Read linked-SDK metadata from the selected executable slice before
+        // creating the shared screen/input coordinate policy.
+        options.linked_sdk_version = executable.sdk_version;
+        log!(
+            "Screen coordinates: linked SDK {:?}, reported OS {:?}, interface-oriented={}",
+            options.linked_sdk_version,
+            options.ios_version.unwrap_or(crate::options::LATEST_IOS_VERSION),
+            options.interface_oriented_screen_coordinates(),
+        );
+
+        let window = if options.headless {
+            None
+        } else {
+            let icon = bundle.load_icon(&fs);
+            if let Err(ref e) = icon {
+                log!("Warning: {}", e);
+            }
+
+            // `launch_image_path` already resolved the spelling of the file
+            // that exists in the bundle, so no extra is_file() check here:
+            // doing an exact-match check on the plist's spelling instead was
+            // what made the picker log "Using launch image" for a file that
+            // then silently wasn't shown.
+            let launch_image = bundle
+                .launch_image_path(&fs, device_family)
+                .and_then(|path| {
+                    let res = fs
+                        .read(path)
+                        .map_err(|_| "Could not read launch image file".to_string())
+                        .and_then(|bytes| {
+                            image::Image::from_bytes(&bytes)
+                                .map_err(|e| format!("Could not parse launch image: {e}"))
+                        });
+                    if let Err(ref e) = res {
+                        log!("Warning: {}", e);
+                    };
+                    res.ok()
+                });
+            Some(Box::new(window::Window::new(
+                &format!(
+                    "{} (touchHLE {}{}{})",
+                    bundle.display_name(),
+                    super::branding(),
+                    if super::branding().is_empty() {
+                        ""
+                    } else {
+                        " "
+                    },
+                    super::VERSION
+                ),
+                icon.ok(),
+                launch_image.map(|image| (image, false)),
+                &options,
+            )?))
+        };
 
         let dylibs = load_transitive_dependencies(&executable.dynamic_libraries, |dylib| {
             let dylib_path = fs::GuestPath::new(dylib);

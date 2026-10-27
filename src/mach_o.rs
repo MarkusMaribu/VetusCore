@@ -36,6 +36,8 @@ const VM_PROT_EXECUTE: vm_prot_t = 4;
 
 #[derive(Debug)]
 pub struct MachO {
+    /// SDK used to link this image (not its minimum deployment OS).
+    pub sdk_version: Option<(u32, u32, u32)>,
     /// Name (for debugging purposes and sorting)
     pub name: String,
     /// Paths of dynamic libraries referenced by the binary.
@@ -496,11 +498,27 @@ impl MachO {
         let mut external_relocations: Vec<(u32, String)> = Vec::new();
         let mut entry_point_pc: Option<u32> = None;
         let mut entry_point_is_lc_main = false;
+        let mut sdk_version = None;
 
         let slide = slide_to_address;
 
         for MachCommand(command, _size) in commands {
             match command {
+                LoadCommand::VersionMin {
+                    target: mach_object::BuildTarget::IPhoneOs,
+                    sdk,
+                    ..
+                } => {
+                    if sdk.major() != 0 {
+                        sdk_version = Some((sdk.major(), sdk.minor(), sdk.release()));
+                    }
+                }
+                LoadCommand::BuildVersion(version) if version.platform == 2 => {
+                    let sdk = version.sdk;
+                    if sdk.major() != 0 {
+                        sdk_version = Some((sdk.major(), sdk.minor(), sdk.release()));
+                    }
+                }
                 LoadCommand::Segment {
                     segname,
                     vmaddr,
@@ -1085,6 +1103,7 @@ impl MachO {
             .collect();
 
         Ok(MachO {
+            sdk_version,
             name,
             dynamic_libraries,
             sections,
@@ -1166,6 +1185,33 @@ mod segment_validation_tests {
         let mut mem = Mem::new();
         let result = MachO::load_from_bytes(&bytes, &mut mem, "truncated".into(), 0);
         assert!(matches!(result, Err(e) if e.contains("extends past end of file")));
+    }
+
+    #[test]
+    fn linked_sdk_is_distinct_from_deployment_target() {
+        // Apple's load commands encode deployment target and linked SDK
+        // separately. A 6.0 deployment target can still use the iOS 8+ SDK.
+        // https://github.com/apple-oss-distributions/xnu/blob/main/EXTERNAL_HEADERS/mach-o/loader.h
+        for (command, expected) in [
+            (vec![], None),
+            (vec![0x25u32, 16, 0x00060000, 0], None),
+            (vec![0x25, 16, 0x00060000, 0x00070102], Some((7, 1, 2))),
+            (vec![0x25, 16, 0x00060000, 0x00090000], Some((9, 0, 0))),
+            (vec![0x32, 24, 2, 0x00060000, 0x000c0100, 0], Some((12, 1, 0))),
+            (vec![0x32, 24, 1, 0x00060000, 0x000c0100, 0], None),
+        ] {
+            let mut bytes = thin(9, 0x1000, 84 + command.len() as u32 * 4);
+            if !command.is_empty() {
+                bytes[16..20].copy_from_slice(&2u32.to_le_bytes());
+                bytes[20..24].copy_from_slice(&(56 + command.len() as u32 * 4).to_le_bytes());
+                for word in command {
+                    bytes.extend_from_slice(&word.to_le_bytes());
+                }
+            }
+            let mut mem = Mem::new();
+            let image = MachO::load_from_bytes(&bytes, &mut mem, "sdk-test".into(), 0).unwrap();
+            assert_eq!(image.sdk_version, expected);
+        }
     }
 
     #[test]

@@ -167,12 +167,17 @@ mod tests {
         let portrait = (320, 568);
         let landscape = DeviceOrientation::LandscapeLeft;
         let mut options = crate::options::Options::default();
-        for (version, expected_size, top_left) in [
-            ((7, 1, 2), (320, 568), [320.0, 0.0]),
-            ((8, 0, 0), (568, 320), [0.0, 0.0]),
-            ((12, 0, 0), (568, 320), [0.0, 0.0]),
+        for (version, sdk, expected_size, top_left) in [
+            (None, None, (320, 568), [320.0, 0.0]),
+            (None, Some((7, 1, 0)), (320, 568), [320.0, 0.0]),
+            (None, Some((8, 0, 0)), (568, 320), [0.0, 0.0]),
+            (Some((7, 1, 2)), Some((8, 0, 0)), (320, 568), [320.0, 0.0]),
+            (Some((8, 0, 0)), Some((7, 1, 0)), (320, 568), [320.0, 0.0]),
+            (Some((8, 0, 0)), Some((8, 0, 0)), (568, 320), [0.0, 0.0]),
+            (Some((12, 0, 0)), Some((9, 0, 0)), (568, 320), [0.0, 0.0]),
         ] {
-            options.ios_version = Some(version);
+            options.ios_version = version;
+            options.linked_sdk_version = sdk;
             let coordinates = ScreenCoordinates::new(&options);
             assert_eq!(coordinates.size(portrait, landscape), expected_size);
             for orientation in [
@@ -225,6 +230,7 @@ mod tests {
         };
         let mut options = crate::options::Options::default();
         options.ios_version = Some((8, 0, 0));
+        options.linked_sdk_version = Some((8, 0, 0));
         assert_eq!(
             ScreenCoordinates::new(&options).frame_to_viewport(
                 frame,

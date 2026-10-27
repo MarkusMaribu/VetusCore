@@ -110,6 +110,9 @@ pub struct Options {
     pub initial_orientation: DeviceOrientation,
     /// iOS version reported to guest applications. `None` uses the latest compatibility version.
     pub ios_version: Option<(i32, i32, i32)>,
+    /// SDK linked by the main executable, populated before creating the window.
+    /// This is independent of the deployment target and reported OS version.
+    pub(crate) linked_sdk_version: Option<(u32, u32, u32)>,
     /// On iOS, present an OpenGL ES 2.0 renderbuffer directly even when its
     /// CAEAGLayer is not the fullscreen layer, instead of going through the
     /// Core Animation composition path.
@@ -298,6 +301,7 @@ impl Default for Options {
             host_screen_size: None,
             initial_orientation: DeviceOrientation::Portrait,
             ios_version: None,
+            linked_sdk_version: None,
             ios_es2_direct_present: false,
             scale_hack: NonZeroU32::new(1).unwrap(),
             ui_scale: NonZeroU32::new(2).unwrap(),
@@ -398,11 +402,14 @@ impl Options {
         }
     }
 
-    /// iOS 8 rotates the window/screen coordinate space itself. Older iOS
-    /// versions keep portrait screen coordinates and rotate the root view.
+    /// iOS 8 SDK apps use interface-oriented screen/window coordinates on
+    /// iOS 8+. Older linked apps retain the portrait-fixed compatibility space,
+    /// even when UIDevice reports a recent OS. Missing SDK metadata is legacy.
     /// https://developer.apple.com/documentation/uikit/uicoordinatespace
+    /// https://raw.githubusercontent.com/touchHLE/touchHLE/trunk/src/frameworks/uikit/ui_screen.rs
     pub(crate) fn interface_oriented_screen_coordinates(&self) -> bool {
-        self.ios_version.unwrap_or(LATEST_IOS_VERSION).0 >= 8
+        (self.ios_version.unwrap_or(LATEST_IOS_VERSION).0 >= 8
+            && self.linked_sdk_version.is_some_and(|sdk| sdk.0 >= 8))
             || crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS")
     }
 

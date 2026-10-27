@@ -330,7 +330,13 @@ impl Window {
             crate::guest_clock::set_frozen(true);
             self.blocked = true;
         }
-        crate::embed::wait_until_runnable();
+        while !crate::embed::is_runnable() {
+            // Android can destroy/recreate a texture after we have parked.
+            // Retire its EGL surface now, without advancing guest code/audio.
+            let (_, generation) = crate::embed::native_window_snapshot();
+            self.sync_surface();
+            crate::embed::wait_for_host_update(generation);
+        }
         self.sync_surface();
         if crate::embed::is_runnable() && self.blocked {
             crate::guest_clock::set_frozen(false);

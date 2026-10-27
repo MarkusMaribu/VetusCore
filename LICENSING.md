@@ -53,6 +53,12 @@ archive or a substitute for the obligations described below.
 - **Fonts:** `touchHLE_fonts/LICENSE.liberation` and `LICENSE.noto` (SIL Open
   Font License 1.1); provenance is in `touchHLE_fonts/README.md`. The TestApp
   font has its notice in `tests/TestApp.app/LICENSE.liberation`.
+  The legacy `Arial.ttf` and `helvetica-bold.ttf` paths now contain Alpine
+  Emulation Sans, modified TeX Gyre Heros fonts under the GUST Font License
+  (LPPL 1.3c or later), not proprietary Arial or Helvetica font software.
+  Preserve `LICENSE.heros`, `LICENSE.lppl-1.3c`, and
+  `README-Alpine-Emulation-Sans.txt`, including the modification log and
+  original-source locations. Unmodified inputs are in `touchHLE_fonts/sources`.
 - **Guest libraries:** preserve `touchHLE_dylibs/COPYING.*` and
   `touchHLE_dylibs/README.md`, which lists source locations and the GPL
   runtime exceptions for libgcc and libstdc++. These binaries are separate

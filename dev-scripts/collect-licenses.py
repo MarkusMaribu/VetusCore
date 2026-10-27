@@ -115,6 +115,11 @@ def main():
         if relative == "touchHLE_dylibs":
             # Contains source locations and runtime-exception acknowledgements.
             files.add(directory / "README.md")
+        if relative == "touchHLE_fonts":
+            # The Heros-derived guest substitutes need their modification and
+            # original-source notices in binary distributions as well.
+            files.add(directory / "README.md")
+            files.add(directory / "README-Alpine-Emulation-Sans.txt")
         for path in sorted(files):
             sections.append(f"{path.relative_to(ROOT)}\n\n{read_notice(path)}")
     if missing:

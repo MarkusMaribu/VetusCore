@@ -102,6 +102,8 @@ Device options:
     --ios-version=MAJOR.MINOR[.PATCH]
         Select the iOS version reported to the game. The default is "Latest",
         currently the highest compatibility version exposed by HyperHLE.
+        Screen coordinates also honor the executable's linked SDK: pre-iOS-8
+        builds retain portrait-fixed coordinates even with a newer reported OS.
 
 
 Game controller options:
