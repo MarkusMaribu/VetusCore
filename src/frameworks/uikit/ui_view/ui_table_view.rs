@@ -16,6 +16,195 @@ use crate::objc::{
     retain, ClassExports, NSZonePtr,
 };
 
+#[cfg(test)]
+mod grouped_tests {
+    use super::*;
+    use crate::{Environment, objc::{autorelease, SEL}};
+
+    thread_local! { static ARCHIVED_TABLE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+    fn load_archived_table(env: &mut Environment, controller: id, _: SEL) {
+        let table: id = crate::mem::Ptr::from_bits(ARCHIVED_TABLE.with(|table| table.get()));
+        () = msg![env; controller setView:table];
+    }
+
+    #[test]
+    fn table_controller_uses_its_associated_nib_instead_of_synthesizing_a_plain_table() {
+        // The base nib loader supplies a grouped table. UITableViewController
+        // must preserve that decoded root, then connect its normal delegates.
+        // https://developer.apple.com/documentation/uikit/uitableviewcontroller
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let table: id = msg_class![env; UITableView alloc];
+        let table: id = msg![env; table initWithFrame:(CGRect::default()) style:(1i32)];
+        ARCHIVED_TABLE.with(|slot| slot.set(table.to_bits()));
+        let base = env.objc.get_known_class("UIViewController", &mut env.mem);
+        env.objc.add_host_method_if_absent(base, "_testLoadArchivedTable", &(load_archived_table as fn(&mut Environment, id, SEL)), &mut env.mem);
+        let source = env.objc.lookup_selector("_testLoadArchivedTable").unwrap();
+        let method = crate::objc::class_getInstanceMethod(env, base, source);
+        let imp = crate::objc::method_getImplementation(env, method);
+        let selector = env.objc.lookup_selector("loadView").unwrap();
+        crate::objc::class_replaceMethod(env, base, selector, imp, crate::mem::ConstPtr::null());
+        let controller: id = msg_class![env; UITableViewController alloc];
+        let name = get_static_str(env, "Settings");
+        let controller: id = msg![env; controller initWithNibName:name bundle:nil];
+        let actual: id = msg![env; controller view];
+        assert_eq!(actual, table);
+        let style: i32 = msg![env; actual style];
+        assert_eq!(style, 1);
+        let delegate: id = msg![env; actual delegate];
+        let data_source: id = msg![env; actual dataSource];
+        assert_eq!((delegate, data_source), (controller, controller));
+        release(env, controller);
+        release(env, table);
+        release(env, pool);
+    }
+
+    fn sections(_: &mut Environment, _: id, _: SEL, _: id) -> NSInteger { 2 }
+    thread_local! {
+        static SELECTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static VETO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    fn selected(_: &mut Environment, _: id, _: SEL, _: id, _: id) {
+        SELECTED.with(|count| count.set(count.get() + 1));
+    }
+    fn will_select(_: &mut Environment, _: id, _: SEL, _: id, path: id) -> id {
+        if VETO.with(|flag| flag.get()) { nil } else { path }
+    }
+    #[test]
+    fn row_taps_notify_delegate_but_drags_disabled_and_programmatic_selection_do_not() {
+        // https://developer.apple.com/documentation/uikit/uitableviewdelegate/tableview(_:didselectrowat:)
+        // https://developer.apple.com/documentation/uikit/uitableview/selectrow(at:animated:scrollposition:)
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view/ui_table_view.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        SELECTED.with(|count| count.set(0));
+        VETO.with(|flag| flag.set(false));
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let class = env.objc.get_known_class("NSObject", &mut env.mem);
+        env.objc.add_host_method_if_absent(class, "tableView:didSelectRowAtIndexPath:", &(selected as fn(&mut Environment, id, SEL, id, id)), &mut env.mem);
+        env.objc.add_host_method_if_absent(class, "tableView:willSelectRowAtIndexPath:", &(will_select as fn(&mut Environment, id, SEL, id, id) -> id), &mut env.mem);
+        let delegate: id = msg_class![env; NSObject new];
+        let table: id = msg_class![env; UITableView alloc];
+        let table: id = msg![env; table initWithFrame:(make_rect(0.0, 0.0, 320.0, 480.0)) style:(0i32)];
+        let cell: id = msg_class![env; UITableViewCell alloc];
+        let cell: id = msg![env; cell initWithStyle:(0i32) reuseIdentifier:nil];
+        () = msg![env; cell setFrame:(make_rect(0.0, 0.0, 320.0, 44.0))];
+        let path: id = msg_class![env; NSIndexPath indexPathForRow:(0i32) inSection:(0i32)];
+        retain(env, path);
+        let host = env.objc.borrow_mut::<UITableViewHostObject>(table);
+        host.cells.push(cell);
+        host.cell_index_paths.push(path);
+        () = msg![env; table setDelegate:delegate];
+        let point = CGPoint { x: 40.0, y: 20.0 };
+        select_tapped_row(env, table, point, point);
+        assert_eq!(SELECTED.with(|count| count.get()), 1);
+        let actual: id = msg![env; table indexPathForSelectedRow];
+        assert_eq!(actual, path);
+        () = msg![env; table deselectRowAtIndexPath:path animated:false];
+        let actual: id = msg![env; table indexPathForSelectedRow];
+        assert_eq!(actual, nil);
+        select_tapped_row(env, table, point, CGPoint { x: 40.0, y: 60.0 });
+        () = msg![env; table setAllowsSelection:false];
+        select_tapped_row(env, table, point, point);
+        () = msg![env; table setAllowsSelection:true];
+        VETO.with(|flag| flag.set(true));
+        select_tapped_row(env, table, point, point);
+        () = msg![env; table selectRowAtIndexPath:path animated:false scrollPosition:(0i32)];
+        assert_eq!(SELECTED.with(|count| count.get()), 1);
+        release(env, table);
+        release(env, delegate);
+        release(env, pool);
+    }
+    fn rows(_: &mut Environment, _: id, _: SEL, _: id, _: NSInteger) -> NSInteger { 2 }
+    #[test]
+    fn cell_styles_keep_value_labels_beside_titles_and_subtitles_below() {
+        // https://developer.apple.com/documentation/uikit/uitableviewcell/cellstyle
+        // https://developer.apple.com/library/archive/documentation/UserExperience/Conceptual/TableView_iPhone/TableViewCells/TableViewCells.html
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view/ui_table_view.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        for style in 0i32..=3 {
+            let cell: id = msg_class![env; UITableViewCell alloc];
+            let cell: id = msg![env; cell initWithStyle:style reuseIdentifier:nil];
+            let title: id = msg![env; cell textLabel];
+            let text = get_static_str(env, "Display setting");
+            () = msg![env; title setText:text];
+            let detail: id = msg![env; cell detailTextLabel];
+            assert_eq!(detail == nil, style == 0);
+            if detail != nil {
+                let text = get_static_str(env, "Enabled");
+                () = msg![env; detail setText:text];
+            }
+            () = msg![env; cell setFrame:(make_rect(0.0, 0.0, 300.0, 44.0))];
+            () = msg![env; cell layoutSubviews];
+            let title_frame: CGRect = msg![env; title frame];
+            let detail_frame: CGRect = msg![env; detail frame];
+            if style == 1 || style == 2 {
+                assert!(detail_frame.origin.x >= title_frame.origin.x + title_frame.size.width);
+                assert!(detail_frame.origin.x + detail_frame.size.width <= 290.0);
+                assert_eq!({ detail_frame.origin.y }, { title_frame.origin.y });
+                let alignment: i32 = if style == 1 { msg![env; detail textAlignment] }
+                    else { msg![env; title textAlignment] };
+                assert_eq!(alignment, 2);
+            } else if style == 3 {
+                assert!(detail_frame.origin.y >= title_frame.origin.y + title_frame.size.height);
+            }
+            release(env, cell);
+        }
+        release(env, pool);
+    }
+    fn title(env: &mut Environment, _: id, _: SEL, _: id, section: NSInteger) -> id {
+        get_static_str(env, if section == 0 { "General" } else { "Controls" })
+    }
+    fn cell(env: &mut Environment, _: id, _: SEL, _: id, _: id) -> id {
+        let cell: id = msg_class![env; UITableViewCell alloc];
+        let cell: id = msg![env; cell initWithStyle:(0i32) reuseIdentifier:nil];
+        autorelease(env, cell)
+    }
+
+    #[test]
+    fn grouped_tables_preserve_sections_and_clean_up_headers_on_reload() {
+        // Styles and titles belong to the table/data-source contract; plain
+        // tables must retain their edge-to-edge row geometry.
+        // https://developer.apple.com/documentation/uikit/uitableview/style-swift.enum
+        // https://developer.apple.com/documentation/uikit/uitableviewdatasource/tableview(_:titleforheaderinsection:)
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view/ui_table_view.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let class = env.objc.get_known_class("NSObject", &mut env.mem);
+        env.objc.add_host_method_if_absent(class, "numberOfSectionsInTableView:", &(sections as fn(&mut Environment, id, SEL, id) -> NSInteger), &mut env.mem);
+        env.objc.add_host_method_if_absent(class, "tableView:numberOfRowsInSection:", &(rows as fn(&mut Environment, id, SEL, id, NSInteger) -> NSInteger), &mut env.mem);
+        env.objc.add_host_method_if_absent(class, "tableView:titleForHeaderInSection:", &(title as fn(&mut Environment, id, SEL, id, NSInteger) -> id), &mut env.mem);
+        env.objc.add_host_method_if_absent(class, "tableView:cellForRowAtIndexPath:", &(cell as fn(&mut Environment, id, SEL, id, id) -> id), &mut env.mem);
+        let source: id = msg_class![env; NSObject new];
+        for style in [0i32, 1] {
+            let table: id = msg_class![env; UITableView alloc];
+            let table: id = msg![env; table initWithFrame:(make_rect(0.0, 0.0, 320.0, 480.0)) style:style];
+            () = msg![env; table setDataSource:source];
+            () = msg![env; table reloadData];
+            let actual_style: i32 = msg![env; table style];
+            assert_eq!(actual_style, style);
+            let host = env.objc.borrow::<UITableViewHostObject>(table);
+            assert_eq!(host.cells.len(), 4);
+            assert_eq!(host.section_views.len(), 2);
+            let first = host.cells[0];
+            let third = host.cells[2];
+            let first: CGRect = msg![env; first frame];
+            let third: CGRect = msg![env; third frame];
+            assert_eq!(first.origin.x > 0.0, style == 1);
+            assert!(third.origin.y > first.origin.y + 88.0);
+            () = msg![env; table reloadData];
+            assert_eq!(env.objc.borrow::<UITableViewHostObject>(table).section_views.len(), 2);
+            release(env, table);
+        }
+        release(env, source);
+        release(env, pool);
+    }
+}
+
 #[derive(Default)]
 struct UITableViewControllerHostObject {
     superclass: UIViewControllerHostObject,
@@ -27,6 +216,7 @@ impl_HostObject_with_superclass!(UITableViewControllerHostObject);
 
 pub struct UITableViewCellHostObject {
     superclass: ui_view::UIViewHostObject, // <-- Убираем super::
+    style: i32,
     content_view: id,
     /// Lazily-created default subviews (UIKit's built-in cell labels/image),
     /// each retained while it lives here. `nil` until first requested.
@@ -39,6 +229,7 @@ impl Default for UITableViewCellHostObject {
     fn default() -> Self {
         UITableViewCellHostObject {
             superclass: Default::default(),
+            style: 0,
             content_view: nil,
             text_label: nil,
             detail_text_label: nil,
@@ -57,11 +248,17 @@ pub struct UITableViewHostObject {
     table_delegate: id,
     /// Non-retained data source (`UITableViewDataSource`).
     data_source: id,
+    style: i32,
+    section_views: Vec<id>,
+    section_titles: Vec<String>,
     /// Cells currently laid out, top-to-bottom in the order generated by
     /// `reloadData`. Each cell is retained while it is in this list.
     cells: Vec<id>,
     /// Index paths matching `cells` 1:1.
     cell_index_paths: Vec<id>,
+    selected_path: id,
+    allows_selection: bool,
+    selection_touch: Option<(id, CGPoint)>,
     row_height: f32,
     section_header_height: f32,
     section_footer_height: f32,
@@ -78,6 +275,7 @@ pub struct UITableViewHostObject {
     /// load happens then, after the owning view controller's `-viewDidLoad`
     /// has prepared the data, so the table is reloaded again at that point.
     laid_out: bool,
+    layout_width: f32,
 }
 impl Default for UITableViewHostObject {
     fn default() -> Self {
@@ -85,8 +283,14 @@ impl Default for UITableViewHostObject {
             superclass: Default::default(),
             table_delegate: nil,
             data_source: nil,
+            style: 0,
+            section_views: Vec::new(),
+            section_titles: Vec::new(),
             cells: Vec::new(),
             cell_index_paths: Vec::new(),
+            selected_path: nil,
+            allows_selection: true,
+            selection_touch: None,
             row_height: 44.0,
             section_header_height: 22.0,
             section_footer_height: 0.0,
@@ -96,6 +300,7 @@ impl Default for UITableViewHostObject {
             table_footer_view: nil,
             auto_reloaded: false,
             laid_out: false,
+            layout_width: 0.0,
         }
     }
 }
@@ -105,13 +310,14 @@ impl_HostObject_with_superclass!(UITableViewHostObject);
 /// first layout. Called whenever the data source or size changes; only fires
 /// once, and only once both a data source and a usable size are available.
 fn maybe_auto_reload(env: &mut crate::Environment, this: id) {
+    let bounds: CGRect = msg![env; this bounds];
     {
         let host = env.objc.borrow::<UITableViewHostObject>(this);
-        if host.auto_reloaded || host.data_source == nil {
+        if host.data_source == nil || (host.auto_reloaded &&
+            (!host.laid_out || host.layout_width == bounds.size.width)) {
             return;
         }
     }
-    let bounds: CGRect = msg![env; this bounds];
     let (bw, bh) = (bounds.size.width, bounds.size.height);
     if bw <= 0.0 || bh <= 0.0 {
         return;
@@ -124,6 +330,11 @@ fn maybe_auto_reload(env: &mut crate::Environment, this: id) {
 
 /// Drop the cell list and (optionally) remove the cell views from the table.
 fn clear_cells(env: &mut crate::Environment, this: id, remove_subviews: bool) {
+    let decorations = std::mem::take(&mut env.objc.borrow_mut::<UITableViewHostObject>(this).section_views);
+    for view in decorations {
+        if remove_subviews { () = msg![env; view removeFromSuperview]; }
+        release(env, view);
+    }
     // Take both vectors out so we can release without nested borrows.
     let (cells, paths) = {
         let host = env.objc.borrow_mut::<UITableViewHostObject>(this);
@@ -161,13 +372,14 @@ fn make_rect(x: f32, y: f32, w: f32, h: f32) -> CGRect {
 fn layout_cell_contents(env: &mut crate::Environment, this: id) {
     let bounds: CGRect = msg![env; this bounds];
     let (w, h) = (bounds.size.width, bounds.size.height);
-    let (content_view, image_view, text_label, detail_label) = {
+    let (content_view, image_view, text_label, detail_label, style) = {
         let host = env.objc.borrow::<UITableViewCellHostObject>(this);
         (
             host.content_view,
             host.image_view,
             host.text_label,
             host.detail_text_label,
+            host.style,
         )
     };
 
@@ -187,10 +399,25 @@ fn layout_cell_contents(env: &mut crate::Environment, this: id) {
     }
 
     let text_w = (w - text_x - 10.0).max(0.0);
-    if text_label != nil && detail_label != nil {
-        // Two-line cell: stack the title over the detail text.
-        () = msg![env; text_label setFrame:(make_rect(text_x, 0.0, text_w, h * 0.6))];
-        () = msg![env; detail_label setFrame:(make_rect(text_x, h * 0.6, text_w, h * 0.4))];
+    if detail_label != nil && (style == 1 || style == 2) {
+        // Value cells put the two labels on one line. In particular, do not
+        // give the trailing label the entire row width: subclasses may use
+        // that frame when aligning it against the content view's right edge.
+        let detail_size: CGSize = msg![env; detail_label sizeThatFits:(CGSize { width: text_w, height: h })];
+        let detail_w = if style == 2 { (text_w - 86.0).max(0.0) }
+            else { detail_size.width.min(text_w * 0.6).max(0.0) };
+        let title_w = if style == 2 { 80.0f32.min(text_w) }
+            else { (text_w - detail_w - if detail_w > 0.0 { 10.0 } else { 0.0 }).max(0.0) };
+        () = msg![env; text_label setFrame:(make_rect(text_x, 0.0, title_w, h))];
+        () = msg![env; detail_label setFrame:(make_rect(w - 10.0 - detail_w, 0.0, detail_w, h))];
+    } else if text_label != nil && detail_label != nil && style == 3 {
+        let title: CGSize = msg![env; text_label sizeThatFits:(CGSize { width: text_w, height: h })];
+        let detail: CGSize = msg![env; detail_label sizeThatFits:(CGSize { width: text_w, height: h })];
+        let title_h = title.height.min(h * 0.6).max(0.0);
+        let detail_h = detail.height.min((h - title_h).max(0.0)).max(0.0);
+        let y = ((h - title_h - detail_h) / 2.0).max(0.0);
+        () = msg![env; text_label setFrame:(make_rect(text_x, y, text_w, title_h))];
+        () = msg![env; detail_label setFrame:(make_rect(text_x, y + title_h, text_w, detail_h))];
     } else if text_label != nil {
         () = msg![env; text_label setFrame:(make_rect(text_x, 0.0, text_w, h))];
     }
@@ -214,6 +441,34 @@ fn ensure_cell_subview(env: &mut crate::Environment, this: id, class_name: &str)
         () = msg![env; content_view addSubview:view];
     }
     view
+}
+
+fn select_tapped_row(env: &mut crate::Environment, table: id, start: CGPoint, end: CGPoint) {
+    if !env.objc.borrow::<UITableViewHostObject>(table).allows_selection
+        || (start.x - end.x).hypot(start.y - end.y) >= 10.0 {
+        return;
+    }
+    let first: id = msg![env; table indexPathForRowAtPoint:start];
+    let last: id = msg![env; table indexPathForRowAtPoint:end];
+    if first == nil || last == nil || !msg![env; first isEqual:last] { return; }
+    retain(env, last);
+    let delegate = env.objc.borrow::<UITableViewHostObject>(table).table_delegate;
+    retain(env, delegate);
+    let selector = env.objc.register_host_selector("tableView:willSelectRowAtIndexPath:".into(), &mut env.mem);
+    let path: id = if msg![env; delegate respondsToSelector:selector] {
+        msg![env; delegate tableView:table willSelectRowAtIndexPath:last]
+    } else { last };
+    retain(env, path);
+    release(env, last);
+    if path != nil {
+        () = msg![env; table selectRowAtIndexPath:path animated:false scrollPosition:(0i32)];
+        let selector = env.objc.register_host_selector("tableView:didSelectRowAtIndexPath:".into(), &mut env.mem);
+        if msg![env; delegate respondsToSelector:selector] {
+            () = msg![env; delegate tableView:table didSelectRowAtIndexPath:path];
+        }
+    }
+    release(env, path);
+    release(env, delegate);
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -255,7 +510,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
-- (id)initWithStyle:(i32)_style reuseIdentifier:(id)_identifier {
+- (id)initWithStyle:(i32)style reuseIdentifier:(id)_identifier {
+    env.objc.borrow_mut::<UITableViewCellHostObject>(this).style = style;
     let frame = <CGRect as Default>::default();
     msg![env; this initWithFrame:frame]
 }
@@ -275,17 +531,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithCoder:(id)coder {
     let this: id = msg_super![env; this initWithCoder:coder];
-    // При загрузке из NIB contentView обычно уже внутри (как под-вьюха).
-    // Мы можем просто инициализировать поле, если NIB его создал,
-    // но для безопасности создадим пустой, если его нет.
-    let frame = <CGRect as Default>::default();
-
-    // Исправлено здесь: убран get_known_class и переменная, имя класса передано
-    // напрямую
-    let content_view: id = msg_class![env; UITableViewCellContentView alloc];
-    let content_view: id = msg![env; content_view initWithFrame:frame];
-
-    () = msg![env; this addSubview:content_view];
+    // Preserve the archived content view and its controls. Adding a new empty
+    // view in front of it intercepts touches and resizes the wrong view.
+    // https://developer.apple.com/documentation/uikit/uitableviewcell/contentview
+    let key = get_static_str(env, "UIContentView");
+    let archived_content: id = msg![env; coder decodeObjectForKey:key];
+    let content_view = if archived_content != nil {
+        retain(env, archived_content)
+    } else {
+        let frame: CGRect = msg![env; this bounds];
+        let content: id = msg_class![env; UITableViewCellContentView alloc];
+        msg![env; content initWithFrame:frame]
+    };
+    let parent: id = msg![env; content_view superview];
+    if parent != this { () = msg![env; this addSubview:content_view]; }
     env.objc.borrow_mut::<UITableViewCellHostObject>(this).content_view = content_view;
     this
 }
@@ -311,17 +570,39 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let label = ensure_cell_subview(env, this, "UILabel");
     env.objc.borrow_mut::<UITableViewCellHostObject>(this).text_label = label;
+    let style = env.objc.borrow::<UITableViewCellHostObject>(this).style;
+    let font: id = if style == 2 { msg_class![env; UIFont systemFontOfSize:(12.0f32)] }
+        else { msg_class![env; UIFont boldSystemFontOfSize:(17.0f32)] };
+    () = msg![env; label setFont:font];
+    if style == 2 {
+        let blue: id = msg_class![env; UIColor colorWithRed:(0.22f32) green:(0.33f32) blue:(0.53f32) alpha:(1.0f32)];
+        () = msg![env; label setTextColor:blue];
+        () = msg![env; label setTextAlignment:(2i32)];
+    }
     layout_cell_contents(env, this);
     label
 }
 
 - (id)detailTextLabel {
+    let style = env.objc.borrow::<UITableViewCellHostObject>(this).style;
+    if style == 0 { return nil; }
     let existing = env.objc.borrow::<UITableViewCellHostObject>(this).detail_text_label;
     if existing != nil {
         return existing;
     }
     let label = ensure_cell_subview(env, this, "UILabel");
     env.objc.borrow_mut::<UITableViewCellHostObject>(this).detail_text_label = label;
+    let size = if style == 3 { 14.0f32 } else if style == 2 { 15.0 } else { 17.0 };
+    let font: id = msg_class![env; UIFont systemFontOfSize:size];
+    () = msg![env; label setFont:font];
+    if style == 1 {
+        let blue: id = msg_class![env; UIColor colorWithRed:(0.22f32) green:(0.33f32) blue:(0.53f32) alpha:(1.0f32)];
+        () = msg![env; label setTextColor:blue];
+        () = msg![env; label setTextAlignment:(2i32)];
+    } else if style == 3 {
+        let gray: id = msg_class![env; UIColor grayColor];
+        () = msg![env; label setTextColor:gray];
+    }
     layout_cell_contents(env, this);
     label
 }
@@ -411,12 +692,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
-- (id)initWithFrame:(CGRect)frame style:(i32)_style {
-    msg_super![env; this initWithFrame:frame]
+- (id)initWithFrame:(CGRect)frame style:(i32)style {
+    let this: id = msg_super![env; this initWithFrame:frame];
+    env.objc.borrow_mut::<UITableViewHostObject>(this).style = style;
+    this
 }
+
+- (i32)style { env.objc.borrow::<UITableViewHostObject>(this).style }
 
 - (id)initWithCoder:(id)coder {
     let this: id = msg_super![env; this initWithCoder:coder];
+    let key = get_static_str(env, "UIStyle");
+    let style: i32 = msg![env; coder decodeIntForKey:key];
+    env.objc.borrow_mut::<UITableViewHostObject>(this).style = style;
     let row_height_key = get_static_str(env, "UIRowHeight");
     let has_row_height: bool = msg![env; coder containsValueForKey:row_height_key];
     if has_row_height {
@@ -449,6 +737,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     clear_cells(env, this, false);
+    let selected = env.objc.borrow::<UITableViewHostObject>(this).selected_path;
+    release(env, selected);
     let header = env.objc.borrow::<UITableViewHostObject>(this).table_header_view;
     let footer = env.objc.borrow::<UITableViewHostObject>(this).table_footer_view;
     let separator_color = env.objc.borrow::<UITableViewHostObject>(this).separator_color;
@@ -504,6 +794,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let bounds: CGRect = msg![env; this bounds];
     let width = bounds.size.width;
+    env.objc.borrow_mut::<UITableViewHostObject>(this).layout_width = width;
+    let grouped = env.objc.borrow::<UITableViewHostObject>(this).style != 0;
+    let cell_width = if grouped { (width - 20.0).max(0.0) } else { width };
+    let inset = (width - cell_width) / 2.0;
+
     let row_height = env.objc.borrow::<UITableViewHostObject>(this).row_height;
 
     // Section count defaults to 1 if the data source does not implement
@@ -531,6 +826,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let mut new_cells: Vec<id> = Vec::new();
     let mut new_paths: Vec<id> = Vec::new();
+    let mut section_titles = Vec::new();
 
     // Rows can have individual heights (-tableView:heightForRowAtIndexPath:).
     let delegate = env.objc.borrow::<UITableViewHostObject>(this).table_delegate;
@@ -546,6 +842,24 @@ pub const CLASSES: ClassExports = objc_classes! {
         let row_count: NSInteger = msg![env; data_source
             tableView:this
             numberOfRowsInSection:section];
+        let selector = env.objc.register_host_selector("tableView:titleForHeaderInSection:".into(), &mut env.mem);
+        let title: id = if msg![env; data_source respondsToSelector:selector] {
+            msg![env; data_source tableView:this titleForHeaderInSection:section]
+        } else { nil };
+        section_titles.push(if title == nil { String::new() } else { crate::frameworks::foundation::ns_string::to_rust_string(env, title).into_owned() });
+        if grouped { y += 8.5; }
+        if title != nil {
+            let label: id = msg_class![env; UILabel new];
+            () = msg![env; label setText:title];
+            let font: id = msg_class![env; UIFont boldSystemFontOfSize:(17.0f32)];
+            let clear: id = msg_class![env; UIColor clearColor];
+            () = msg![env; label setFont:font];
+            () = msg![env; label setBackgroundColor:clear];
+            () = msg![env; label setFrame:(make_rect(inset + 10.0, y, (cell_width - 20.0).max(0.0), 28.0))];
+            () = msg![env; this addSubview:label];
+            env.objc.borrow_mut::<UITableViewHostObject>(this).section_views.push(label);
+            y += 28.0;
+        }
         for row in 0..row_count {
             let index_path: id = msg_class![env; NSIndexPath
                 indexPathForRow:(row as NSUInteger)
@@ -567,17 +881,20 @@ pub const CLASSES: ClassExports = objc_classes! {
                 row_height
             };
             let frame = CGRect {
-                origin: CGPoint { x: 0.0, y },
-                size: CGSize { width, height: this_row_height },
+                origin: CGPoint { x: inset, y },
+                size: CGSize { width: cell_width, height: this_row_height },
             };
             () = msg![env; cell setFrame:frame];
             () = msg![env; this addSubview:cell];
+
 
             y += this_row_height;
             new_cells.push(cell);
             new_paths.push(index_path);
         }
     }
+
+    if grouped { y += 12.0; }
 
     let footer = env.objc.borrow::<UITableViewHostObject>(this).table_footer_view;
     if footer != nil {
@@ -594,6 +911,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let host = env.objc.borrow_mut::<UITableViewHostObject>(this);
         host.cells = new_cells;
         host.cell_index_paths = new_paths;
+        host.section_titles = section_titles;
     }
 
     let content_size = CGSize { width, height: y };
@@ -648,15 +966,69 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     nil
 }
-- (id)indexPathForSelectedRow { nil }
-- (id)indexPathsForSelectedRows { nil }
-- (())selectRowAtIndexPath:(id)_path animated:(bool)_animated scrollPosition:(i32)_pos {}
-- (())deselectRowAtIndexPath:(id)_path animated:(bool)_animated {}
+- (id)indexPathForSelectedRow { env.objc.borrow::<UITableViewHostObject>(this).selected_path }
+- (id)indexPathsForSelectedRows {
+    let path = env.objc.borrow::<UITableViewHostObject>(this).selected_path;
+    if path == nil { nil } else { msg_class![env; NSArray arrayWithObject:path] }
+}
+- (())selectRowAtIndexPath:(id)path animated:(bool)_animated scrollPosition:(i32)_pos {
+    retain(env, path);
+    let old = std::mem::replace(&mut env.objc.borrow_mut::<UITableViewHostObject>(this).selected_path, path);
+    if old != nil {
+        let cell: id = msg![env; this cellForRowAtIndexPath:old];
+        () = msg![env; cell setSelected:false animated:false];
+    }
+    release(env, old);
+    if path != nil {
+        let cell: id = msg![env; this cellForRowAtIndexPath:path];
+        () = msg![env; cell setSelected:true animated:false];
+    }
+}
+- (())deselectRowAtIndexPath:(id)path animated:(bool)animated {
+    let selected = env.objc.borrow::<UITableViewHostObject>(this).selected_path;
+    if selected != nil && msg![env; selected isEqual:path] {
+        () = msg![env; this selectRowAtIndexPath:nil animated:animated scrollPosition:(0i32)];
+    }
+}
+- (id)indexPathForRowAtPoint:(CGPoint)point {
+    let host = env.objc.borrow::<UITableViewHostObject>(this);
+    let rows: Vec<_> = host.cells.iter().copied().zip(host.cell_index_paths.iter().copied()).collect();
+    for (cell, path) in rows {
+        let frame: CGRect = msg![env; cell frame];
+        if point.x >= frame.origin.x && point.x < frame.origin.x + frame.size.width
+            && point.y >= frame.origin.y && point.y < frame.origin.y + frame.size.height {
+            return path;
+        }
+    }
+    nil
+}
+- (())touchesBegan:(id)touches withEvent:(id)event {
+    let touch: id = msg![env; touches anyObject];
+    let point: CGPoint = msg![env; touch locationInView:this];
+    env.objc.borrow_mut::<UITableViewHostObject>(this).selection_touch = Some((touch, point));
+    () = msg_super![env; this touchesBegan:touches withEvent:event];
+}
+- (())touchesEnded:(id)touches withEvent:(id)event {
+    let touch: id = msg![env; touches anyObject];
+    let point: CGPoint = msg![env; touch locationInView:this];
+    let dragging: bool = msg![env; this isDragging];
+    let start = env.objc.borrow_mut::<UITableViewHostObject>(this).selection_touch.take();
+    () = msg_super![env; this touchesEnded:touches withEvent:event];
+    if let Some((tracked, start)) = start {
+        if tracked == touch && !dragging {
+            select_tapped_row(env, this, start, point);
+        }
+    }
+}
+- (())touchesCancelled:(id)touches withEvent:(id)event {
+    env.objc.borrow_mut::<UITableViewHostObject>(this).selection_touch = None;
+    () = msg_super![env; this touchesCancelled:touches withEvent:event];
+}
 - (())scrollToRowAtIndexPath:(id)_path atScrollPosition:(i32)_pos animated:(bool)_animated {}
 - (())setEditing:(bool)_editing animated:(bool)_animated {}
 - (bool)isEditing { false }
-- (())setAllowsSelection:(bool)_allows {}
-- (bool)allowsSelection { true }
+- (())setAllowsSelection:(bool)allows { env.objc.borrow_mut::<UITableViewHostObject>(this).allows_selection = allows; }
+- (bool)allowsSelection { env.objc.borrow::<UITableViewHostObject>(this).allows_selection }
 - (())setAllowsMultipleSelection:(bool)_allows {}
 - (())setRowHeight:(f32)height {
     env.objc.borrow_mut::<UITableViewHostObject>(this).row_height = height;
@@ -738,6 +1110,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 // Честный iOS-подход: переопределяем создание вьюхи по умолчанию.
 // Если NIB'а нет, мы принудительно создаем UITableView, а не UIView.
 - (())loadView {
+    // A supplied table nib owns its style, outlets and background. Only
+    // synthesize a table when the controller has no associated view archive.
+    // https://developer.apple.com/documentation/uikit/uitableviewcontroller
+    if crate::frameworks::uikit::ui_view_controller::has_explicit_view_nib(env, this) {
+        () = msg_super![env; this loadView];
+        let table: id = msg![env; this view];
+        () = msg![env; table setDataSource:this];
+        () = msg![env; table setDelegate:this];
+        return;
+    }
     let frame = <CGRect as Default>::default();
     let style = env.objc.borrow::<UITableViewControllerHostObject>(this).style;
     let table_view: id = msg_class![env; UITableView alloc];
@@ -769,3 +1151,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+/// Project the table's current materialized rows without asking its data source
+/// to recreate cells or load localization resources on every host frame.
+pub(crate) fn native_sections(env: &mut crate::Environment, table: id) -> Vec<(String, Vec<id>)> {
+    let host = env.objc.borrow::<UITableViewHostObject>(table);
+    let (cells, paths, titles) = (host.cells.clone(), host.cell_index_paths.clone(), host.section_titles.clone());
+    let mut result: Vec<_> = titles.into_iter().map(|title| (title, Vec::new())).collect();
+    for (cell, path) in cells.into_iter().zip(paths) {
+        let section: NSUInteger = msg![env; path section];
+        if let Some((_, rows)) = result.get_mut(section as usize) { rows.push(cell); }
+    }
+    result
+}

@@ -533,6 +533,7 @@ pub enum TextInputEvent {
 
 #[derive(Debug)]
 pub enum Event {
+    UIKitAction(crate::embed::UIKitAction),
     /// User requested quit.
     Quit,
     /// OS has informed touchHLE it will soon become inactive.

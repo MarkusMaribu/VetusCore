@@ -253,9 +253,21 @@ OSStatus AudioUnitUninitialize(AudioUnit);
 OSStatus AudioOutputUnitStart(AudioUnit);
 OSStatus AudioOutputUnitStop(AudioUnit);
 static int unit_callbacks;
+typedef struct {
+  pthread_mutex_t mutex;
+  pthread_t caller;
+  int callbacks, on_caller;
+} UnitThreadCheck;
 static OSStatus unit_render(void *context, UInt32 *flags, const void *timestamp,
                             UInt32 bus, UInt32 frames, AudioBufferList *data) {
   unit_callbacks++;
+  if (context) {
+    UnitThreadCheck *check = context;
+    pthread_mutex_lock(&check->mutex);
+    check->callbacks++;
+    check->on_caller |= pthread_equal(pthread_self(), check->caller);
+    pthread_mutex_unlock(&check->mutex);
+  }
   for (UInt32 i = 0; i < data->count; i++)
     if (data->buffers[i].data)
       memset(data->buffers[i].data, 0, data->buffers[i].size);
@@ -268,7 +280,8 @@ int test_runloop_audio_unit_independent(void) {
   AudioUnit unit;
   if (AudioComponentInstanceNew(component, &unit)) return -2;
   int result = 0, initialized = 0, started = 0;
-  RenderCallbackStruct callback = {unit_render, NULL};
+  UnitThreadCheck check = {PTHREAD_MUTEX_INITIALIZER, pthread_self(), 0, 0};
+  RenderCallbackStruct callback = {unit_render, &check};
   AudioStreamBasicDescription format = {44100, 0x6c70636d, 12, 2, 1, 2, 1, 16, 0};
   if (AudioUnitSetProperty(unit, 23, 1, 0, &callback, sizeof(callback)) ||
       AudioUnitSetProperty(unit, 8, 1, 0, &format, sizeof(format))) {
@@ -292,10 +305,32 @@ int test_runloop_audio_unit_independent(void) {
   CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, custom);
   CFRelease(source);
   CFRelease(custom);
+  // RemoteIO runs on an audio thread even while the calling thread is not
+  // pumping a run loop. Main-thread stalls must not starve output.
+  // https://developer.apple.com/library/archive/qa/qa1715/_index.html
+  pthread_mutex_lock(&check.mutex);
+  int previous = check.callbacks;
+  pthread_mutex_unlock(&check.mutex);
+  usleep(300000);
+  pthread_mutex_lock(&check.mutex);
+  if (check.callbacks <= previous || check.on_caller) result = -11;
+  pthread_mutex_unlock(&check.mutex);
+  if (AudioOutputUnitStop(unit)) { result = -12; goto dispose; }
+  started = 0;
+  pthread_mutex_lock(&check.mutex);
+  previous = check.callbacks;
+  pthread_mutex_unlock(&check.mutex);
+  usleep(100000);
+  if (check.callbacks != previous) { result = -13; goto dispose; }
+  if (AudioOutputUnitStart(unit)) { result = -14; goto dispose; }
+  started = 1;
+  usleep(100000);
+  if (check.callbacks <= previous) result = -15;
 dispose:
   if (started && AudioOutputUnitStop(unit) && result == 0) result = -8;
   if (initialized && AudioUnitUninitialize(unit) && result == 0) result = -9;
   if (AudioComponentInstanceDispose(unit) && result == 0) result = -10;
+  pthread_mutex_destroy(&check.mutex);
   return result;
 }
 

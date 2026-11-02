@@ -1297,18 +1297,29 @@ impl Mem {
     /// The null terminator is not
     /// included in the slice.
     ///
-    /// Safety: includes a maximum length guard (64KB) to prevent infinite loops
-    /// if the guest provides a pointer to non-terminated data.
+    /// A C string has no implicit length limit. Stop at the terminator, or
+    /// fail if the scan reaches the end of the guest address space.
     pub fn cstr_at<const MUT: bool>(&self, ptr: Ptr<u8, MUT>) -> &[u8] {
-        const MAX_CSTR_LEN: u32 = 65536; // 64KB safety limit
-        self.cstr_at_with_max_len(ptr, MAX_CSTR_LEN)
+        let mut length = 0u32;
+        loop {
+            let address = ptr
+                .to_bits()
+                .checked_add(length)
+                .expect("unterminated C string reaches end of guest address space");
+            // Scan a page at a time without crossing the address-space end.
+            // Keep the backing memory and null-page rules of bytes_at().
+            let count = PAGE_SIZE - address % PAGE_SIZE;
+            let chunk = self.bytes_at(Ptr::<u8, false>::from_bits(address), count);
+            if let Some(end) = chunk.iter().position(|&byte| byte == 0) {
+                return self.bytes_at(ptr, length + end as u32);
+            }
+            length = length
+                .checked_add(count)
+                .expect("unterminated C string reaches end of guest address space");
+        }
     }
 
-    /// Like [Self::cstr_at], but with a caller-chosen maximum length instead of
-    /// the default 64KB safety limit. Useful for data that can legitimately be
-    /// larger than 64KB (e.g. GLSL shader source uploaded via `glShaderSource`
-    /// without an explicit length), where the default cap would silently
-    /// truncate the string and corrupt it.
+    /// Like [Self::cstr_at], but with an explicit caller-chosen length limit.
     pub fn cstr_at_with_max_len<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, max_len: u32) -> &[u8] {
         let mut len: u32 = 0;
         while self.read(ptr + len) != b'\0' {
@@ -1410,6 +1421,37 @@ impl Mem {
 #[cfg(test)]
 mod mem_tests {
     use super::{Mem, MutPtr, Ptr};
+
+    #[test]
+    fn c_strings_are_not_truncated_at_64k() {
+        // C strings end at NUL, not an implementation-defined byte limit.
+        // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/strlen.3.html
+        let mut mem = Mem::new();
+        let mut text = vec![b'x'; 131_123];
+        text.extend_from_slice(b" end");
+        let pointer = mem.alloc_and_write_cstr(&text);
+        assert_eq!(mem.cstr_at(pointer), text);
+        assert_eq!(mem.cstr_at_utf8(pointer).unwrap().len(), text.len());
+        mem.write(pointer + 100, 0u8);
+        assert_eq!(mem.cstr_at(pointer), &text[..100]);
+    }
+
+    #[test]
+    fn c_string_can_terminate_at_the_last_guest_byte() {
+        let mut mem = Mem::new();
+        let pointer: MutPtr<u8> = Ptr::from_bits(u32::MAX - 2);
+        mem.bytes_at_mut(pointer, 3).copy_from_slice(b"ok\0");
+        assert_eq!(mem.cstr_at(pointer), b"ok");
+    }
+
+    #[test]
+    #[should_panic(expected = "unterminated C string reaches end of guest address space")]
+    fn unterminated_c_string_does_not_wrap_to_zero() {
+        let mut mem = Mem::new();
+        let pointer: MutPtr<u8> = Ptr::from_bits(u32::MAX);
+        mem.write(pointer, b'x');
+        mem.cstr_at(pointer);
+    }
 
     #[test]
     fn lazy_commit_far_addresses() {

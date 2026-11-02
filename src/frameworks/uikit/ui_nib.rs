@@ -13,7 +13,7 @@
 
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
-use crate::frameworks::foundation::{ns_string, NSUInteger};
+use crate::frameworks::foundation::{ns_array, ns_string, NSUInteger};
 use crate::frameworks::uikit::ui_view::ui_control::UIControlEvents;
 use crate::fs::GuestPathBuf;
 use crate::mem::ConstVoidPtr;
@@ -22,6 +22,10 @@ use crate::objc::{
     release, retain, Class, ClassExports, HostObject,
 };
 use crate::Environment;
+
+#[cfg(test)]
+#[path = "ui_nib_tests.rs"]
+mod tests;
 
 // Per Apple's UINib loading documentation, the `options` dictionary passed to
 // `-[UINib instantiateWithOwner:options:]` recognises a single documented key:
@@ -57,6 +61,9 @@ struct UINibHostObject {
     /// `UINibExternalObjects` / `UINibProxiedObjectsKey`. Non-retained:
     /// the caller owns the dictionary for the duration of the call.
     external_objects: id,
+    /// Resolved placeholders in the current instantiation. These are weak:
+    /// the unarchiver owns them until the returned top-level array is built.
+    proxy_objects: Vec<id>,
 }
 impl HostObject for UINibHostObject {}
 
@@ -74,6 +81,45 @@ struct UIRuntimeEventConnectionHostObject {
     event_mask: UIControlEvents,
 }
 impl_HostObject_with_superclass!(UIRuntimeEventConnectionHostObject);
+
+// UIKit returns instantiated top-level objects, excluding File's Owner and
+// other placeholders even when the archive lists them before the actual view.
+// https://developer.apple.com/documentation/foundation/bundle/loadnibnamed(_:owner:options:)
+fn decode_top_level_objects(env: &mut Environment, nib: id, unarchiver: id) -> id {
+    let key = get_static_str(env, "UINibTopLevelObjectsKey");
+    let objects: id = msg![env; unarchiver decodeObjectForKey:key];
+    if objects == nil {
+        return nil;
+    }
+    let count: NSUInteger = msg![env; objects count];
+    let mut top_level = Vec::new();
+    for index in 0..count {
+        let object: id = msg![env; objects objectAtIndex:index];
+        if object != nil && !env.objc.borrow::<UINibHostObject>(nib).proxy_objects.contains(&object) {
+            top_level.push(retain(env, object));
+        }
+    }
+    ns_array::from_vec(env, top_level)
+}
+
+fn record_proxy_object(env: &mut Environment, nib: id, object: id) {
+    if nib != nil {
+        env.objc.borrow_mut::<UINibHostObject>(nib).proxy_objects.push(object);
+    }
+}
+
+// Unlike AppKit, UIKit does not awaken File's Owner or external placeholders.
+// Iterate by index: a nil First Responder proxy must not terminate the pass.
+// https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/LoadingResources/CocoaNibs/CocoaNibs.html
+fn awaken_nib_objects(env: &mut Environment, nib: id, objects: id) {
+    let count: NSUInteger = msg![env; objects count];
+    for index in 0..count {
+        let object: id = msg![env; objects objectAtIndex:index];
+        if object != nil && !env.objc.borrow::<UINibHostObject>(nib).proxy_objects.contains(&object) {
+            () = msg![env; object awakeFromNib];
+        }
+    }
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -95,6 +141,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         bundle,
         file_owner: nil,
         external_objects: nil,
+        proxy_objects: Vec::new(),
     });
 
     let new = env.objc.alloc_object(this, host_object, &mut env.mem);
@@ -174,14 +221,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let top_level_objects = if let Ok(unarchiver) = load_nib_file(env, this, GuestPathBuf::from(nib_path)) {
-        let top_level_objects_key = get_static_str(env, "UINibTopLevelObjectsKey");
-        let objects = msg![env; unarchiver decodeObjectForKey:top_level_objects_key];
-
-        // Удерживаем объекты ДО удаления анрайхиватора, иначе они могут
-        // вычиститься
-        if objects != nil {
-            retain(env, objects);
-        }
+        let objects = decode_top_level_objects(env, this, unarchiver);
         release(env, unarchiver);
 
         if objects != nil {
@@ -197,6 +237,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let host = env.objc.borrow_mut::<UINibHostObject>(this);
         host.file_owner = nil;
         host.external_objects = nil;
+        host.proxy_objects.clear();
     }
     top_level_objects
 }
@@ -220,13 +261,14 @@ pub const CLASSES: ClassExports = objc_classes! {
         if external != nil {
             let replacement: id = msg![env; external objectForKey:id_nss];
             if replacement != nil {
+                record_proxy_object(env, delegate, replacement);
                 release(env, this);
                 return retain(env, replacement);
             }
         }
     }
 
-    if id == "IBFilesOwner" || id.starts_with("UpstreamPlaceholder-") {
+    let object = if id == "IBFilesOwner" || id.starts_with("UpstreamPlaceholder-") {
         // `UpstreamPlaceholder-*` identifiers are emitted by Xcode's
         // storyboard compiler for connections that reach *out* of a
         // scene nib into its enclosing context — typically the view
@@ -237,6 +279,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         if delegate != nil {
             let file_owner = env.objc.borrow::<UINibHostObject>(delegate).file_owner;
             if file_owner != nil {
+                record_proxy_object(env, delegate, file_owner);
                 release(env, this);
                 return retain(env, file_owner);
             }
@@ -253,7 +296,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         log!("TODO: UIProxyObject replacement for {}, instance {:?} left unreplaced", id, this);
         this
-    }
+    };
+    record_proxy_object(env, delegate, object);
+    object
 }
 
 @end
@@ -640,18 +685,7 @@ fn load_nib_file(env: &mut Environment, ui_nib: id, path: GuestPathBuf) -> Resul
         }
     }
 
-    if objects != nil {
-        let enumerator: id = msg![env; objects objectEnumerator];
-        if enumerator != nil {
-            loop {
-                let next: id = msg![env; enumerator nextObject];
-                if next == nil {
-                    break;
-                }
-                () = msg![env; next awakeFromNib];
-            }
-        }
-    }
+    awaken_nib_objects(env, ui_nib, objects);
 
     let visibles_key = get_static_str(env, "UINibVisibleWindowsKey");
     let visibles: id = msg![env; unarchiver decodeObjectForKey:visibles_key];
@@ -665,5 +699,6 @@ fn load_nib_file(env: &mut Environment, ui_nib: id, path: GuestPathBuf) -> Resul
         }
     }
 
+    release(env, objects);
     Ok(unarchiver)
 }

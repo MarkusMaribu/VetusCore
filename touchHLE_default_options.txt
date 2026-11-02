@@ -384,3 +384,8 @@ com.ea.simsmedieval.bv: --ios-es2-direct-present
 # Retina screen. On the 320x480 iPhone 3GS every label and icon is twice too
 # big for its row, so the title and text overflow. Emulate a Retina iPhone.
 com.anarchyent.mcwikipaid: --device-family=iphone-4
+
+# Plants vs. Zombies Free constructs its landscape EAGL child during launch.
+# Rotate its parent first so autoresizing does not turn 480x320 into 640x160.
+# Native GLES also avoids ANGLE/Vulkan GPU allocation growth while loading.
+com.ea.pvzfree.bv: --early-initial-autorotation --gles-native

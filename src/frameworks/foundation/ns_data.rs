@@ -50,6 +50,61 @@ fn base64_encode(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Foundation rejects non-alphabet bytes unless ignoreUnknownCharacters is set.
+/// Padding must be at the end and the encoded character count a multiple of 4.
+/// https://developer.apple.com/documentation/foundation/nsdata/init(base64encodeddata:options:)
+/// See also Apple's NSData.base64DecodeBytes in swift-corelibs-foundation.
+fn base64_decode(input: &[u8], options: NSUInteger) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len() / 4 * 3);
+    let mut count = 0usize;
+    let mut padding = 0usize;
+    let mut previous = 0u8;
+    for &byte in input {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padding += 1;
+                continue;
+            }
+            _ if options & 1 != 0 => continue,
+            _ => return None,
+        };
+        if padding != 0 {
+            return None;
+        }
+        match count % 4 {
+            0 => (),
+            1 => output.push((previous << 2) | (value >> 4)),
+            2 => output.push((previous << 4) | (value >> 2)),
+            3 => output.push((previous << 6) | value),
+            _ => unreachable!(),
+        }
+        previous = value;
+        count += 1;
+    }
+    ((count + padding) % 4 == 0).then_some(output)
+}
+
+fn init_with_base64(env: &mut Environment, this: id, input: &[u8], options: NSUInteger) -> id {
+    let Some(decoded) = base64_decode(input, options) else {
+        release(env, this);
+        return nil;
+    };
+    let length: NSUInteger = decoded.len().try_into().unwrap();
+    let bytes = if length == 0 {
+        Ptr::null()
+    } else {
+        let bytes = env.mem.alloc(length);
+        env.mem.bytes_at_mut(bytes.cast(), length).copy_from_slice(&decoded);
+        bytes
+    };
+    msg![env; this initWithBytesNoCopy:bytes length:length freeWhenDone:true]
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -184,6 +239,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     let bytes: ConstVoidPtr = msg![env; data bytes];
     let length: NSUInteger = msg![env; data length];
     msg![env; this initWithBytes:bytes length:length]
+}
+
+- (id)initWithBase64EncodedData:(id)data options:(NSUInteger)options {
+    assert!(data != nil, "NSInvalidArgumentException: nil Base64 data");
+    let input = to_rust_slice(env, data).to_vec();
+    init_with_base64(env, this, &input, options)
+}
+
+- (id)initWithBase64EncodedString:(id)string options:(NSUInteger)options {
+    assert!(string != nil, "NSInvalidArgumentException: nil Base64 string");
+    let input = to_rust_string(env, string).into_owned();
+    init_with_base64(env, this, input.as_bytes(), options)
 }
 
 - (id)initWithContentsOfURL:(id)url {

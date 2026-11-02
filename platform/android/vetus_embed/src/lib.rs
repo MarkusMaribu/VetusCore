@@ -46,6 +46,7 @@ struct Cache {
     orientation: *mut c_void,
     status_bar: *mut c_void,
     keyboard: *mut c_void,
+    native_ui: *mut c_void,
     idle_timer: *mut c_void,
     open_url: *mut c_void,
     alert: *mut c_void,
@@ -217,6 +218,7 @@ fn ensure_cache(env: *mut c_void) -> Option<&'static Cache> {
         idle_timer: method("onIdleTimer", "(Z)V"),
         open_url: method("onOpenUrl", "(Ljava/lang/String;)Z"),
         alert: method("onAlert", "(Ljava/lang/String;Ljava/lang/String;)I"),
+        native_ui: method("onUIKitScreen", "(Ljava/lang/String;)Z"),
         crash: method("onCrash", "(Ljava/lang/String;)V"),
         photo_picker: method("onPickImage", "(I)Z"),
         save_image: method("onSaveImage", "(Ljava/lang/String;)Z"),
@@ -261,6 +263,27 @@ fn host_status_bar(hidden: bool) {
 fn host_keyboard(show: bool, snapshot: &str) {
     let snapshot = snapshot.to_owned();
     let _ = touchHLE::android_jni::on_native_stack(move || host_keyboard_on_java(show, &snapshot));
+}
+fn host_native_ui(snapshot: &str) -> bool {
+    let snapshot = snapshot.to_owned();
+    touchHLE::android_jni::on_native_stack(move || host_native_ui_on_java(&snapshot)).unwrap_or(false)
+}
+
+fn host_native_ui_on_java(snapshot: &str) -> bool {
+    with_env(|env| {
+        let Some(cache) = ensure_cache(env) else { return false; };
+        if cache.native_ui.is_null() { return false; }
+        let text = java_string(env, snapshot);
+        let args = [JValue { l: text }];
+        let Some(call): Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const JValue) -> u8> =
+            (unsafe { touchHLE::android_jni::table_fn(env, CALL_STATIC_BOOLEAN_METHOD_A) }) else {
+                delete_local(env, text); return false;
+            };
+        let result = unsafe { call(env, cache.class, cache.native_ui, args.as_ptr()) };
+        delete_local(env, text);
+        clear_exception(env);
+        result != 0
+    }).unwrap_or(false)
 }
 fn host_idle(enabled: bool) {
     let _ = touchHLE::android_jni::on_native_stack(move || host_idle_on_java(enabled));
@@ -471,6 +494,7 @@ fn install_host() {
         idle_timer: host_idle,
         open_url: host_open_url,
         alert: host_alert,
+        native_ui: Some(host_native_ui),
         crash: host_crash,
         photo_picker: host_photo_picker,
         save_image: host_save_image,
@@ -824,4 +848,18 @@ pub extern "system" fn Java_com_markusmaribu_alpinelauncher_vetus_VetusCore_nati
     if !native.is_null() {
         let _ = ASSETS.set(native as usize);
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_markusmaribu_alpinelauncher_vetus_VetusCore_nativePostUIKitAction(
+    env: *mut c_void, _class: *mut c_void, scene: i64, target: c_int,
+    action: *mut c_void, value: *mut c_void,
+) {
+    let Some(action) = rust_string(env, action) else { return; };
+    let value = rust_string(env, value).unwrap_or_default();
+    touchHLE::embed::push_input(touchHLE::embed::InputEvent {
+        kind: touchHLE::embed::InputKind::UIKitAction(touchHLE::embed::UIKitAction {
+            scene: scene as u64, target: target as u32, action, value,
+        }),
+    });
 }

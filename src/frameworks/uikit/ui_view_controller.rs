@@ -22,6 +22,7 @@ use crate::objc::{
 use crate::Environment;
 
 pub mod ui_navigation_controller;
+pub(crate) mod modal_transition;
 
 pub type UIModalTransitionStyle = i32;
 pub type UIModalPresentationStyle = i32;
@@ -70,6 +71,7 @@ pub(crate) struct UIViewControllerHostObject {
     modal_presentation_style: UIModalPresentationStyle,
     editing: bool,
     is_being_presented: bool,
+    is_being_dismissed: bool,
     /// When non-empty, the path (relative to the bundle resource path)
     /// at which the storyboardc directory lives. Storyboard-instantiated
     /// view controllers store the path so `-loadView` knows to load the
@@ -89,6 +91,11 @@ pub(crate) struct UIViewControllerHostObject {
     edges_for_extended_layout: NSUInteger,
 }
 impl HostObject for UIViewControllerHostObject {}
+
+pub(crate) fn has_explicit_view_nib(env: &Environment, controller: id) -> bool {
+    let host = env.objc.borrow::<UIViewControllerHostObject>(controller);
+    host.nib_name != nil || !host.storyboard_view_nib_dir.is_empty()
+}
 
 // Apple's UIRectEdgeAll = UIRectEdgeTop|UIRectEdgeLeft|UIRectEdgeBottom|UIRectEdgeRight = 15
 const UI_RECT_EDGE_ALL: NSUInteger = 15;
@@ -431,14 +438,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setTitle:(id)title {
-    let old_title = env.objc.borrow::<UIViewControllerHostObject>(this).title;
-    if old_title != nil {
-        release(env, old_title);
-    }
-    if title != nil {
-        retain(env, title);
-    }
-    env.objc.borrow_mut::<UIViewControllerHostObject>(this).title = title;
+    // UIKit's title is copied and also updates existing navigation/tab items.
+    // https://developer.apple.com/documentation/uikit/uiviewcontroller/title
+    let title: id = msg![env; title copy];
+    let host = env.objc.borrow_mut::<UIViewControllerHostObject>(this);
+    let old_title = std::mem::replace(&mut host.title, title);
+    let (navigation_item, tab_item) = (host.navigation_item, host.tab_bar_item);
+    if navigation_item != nil { () = msg![env; navigation_item setTitle:title]; }
+    if tab_item != nil { () = msg![env; tab_item setTitle:title]; }
+    release(env, old_title);
 }
 
 - (())setEditing:(bool)editing {
@@ -449,6 +457,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (bool)isBeingPresented {
     env.objc.borrow::<UIViewControllerHostObject>(this).is_being_presented
+}
+- (bool)isBeingDismissed {
+    env.objc.borrow::<UIViewControllerHostObject>(this).is_being_dismissed
 }
 
 - (())setWantsFullScreenLayout:(bool)_wants {
@@ -515,18 +526,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
+    if env.objc.borrow::<UIViewControllerHostObject>(presented).is_being_dismissed { return; }
+    env.objc.borrow_mut::<UIViewControllerHostObject>(presented).is_being_dismissed = true;
     () = msg![env; presented viewWillDisappear:animated];
-
-    let presented_view: id = msg![env; presented view];
-    if presented_view != nil {
-        () = msg![env; presented_view removeFromSuperview];
+    if super::native_ui::dismiss(env, presented, animated) { return; }
+    if animated && env.objc.borrow::<UIViewControllerHostObject>(presented).modal_transition_style == 0 {
+        modal_transition::animate(env, this, presented, true);
+    } else {
+        modal_transition::complete(env, this, presented, true, animated);
     }
-
-    () = msg![env; presented viewDidDisappear:animated];
-
-    env.objc.borrow_mut::<UIViewControllerHostObject>(presented).presenting_view_controller = nil;
-    env.objc.borrow_mut::<UIViewControllerHostObject>(this).presented_view_controller = nil;
-    release(env, presented);
 }
 // Presents an MPMoviePlayerViewController modally.
 // https://developer.apple.com/documentation/mediaplayer/uiviewcontroller/1619166-presentmovieplayerviewcontroller
@@ -556,16 +564,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)title {
-    let stored_title = env.objc.borrow::<UIViewControllerHostObject>(this).title;
-    if stored_title != nil {
-        stored_title
-    } else {
-        let class: Class = msg![env; this class];
-        // The class-name string is newly created (+1); autorelease it so
-        // the getter respects the +0 return convention.
-        let class_name = NSStringFromClass(env, class);
-        autorelease(env, class_name)
-    }
+    env.objc.borrow::<UIViewControllerHostObject>(this).title
 }
 
 - (bool)isViewLoaded {
@@ -641,6 +640,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if modal_vc == nil {
         return;
     }
+    super::native_ui::prepare_presentation(env);
 
     // The presenting view controller retains the presented one until it is
     // dismissed. The reverse pointer (`presenting_view_controller`) is a weak
@@ -769,10 +769,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     // appearance hooks for the new view, so we route through the window
     // directly instead of adding the view to the presenter's view.
     () = msg![env; window addSubview:modal_view];
-    () = msg![env; modal_vc viewDidAppear:animated];
-    env.objc
-        .borrow_mut::<UIViewControllerHostObject>(modal_vc)
-        .is_being_presented = false;
+    if super::native_ui::present(env, this, modal_vc, animated) {
+        // Compose acknowledges the completed enter transition asynchronously.
+    } else if animated && env.objc.borrow::<UIViewControllerHostObject>(modal_vc).modal_transition_style == 0 {
+        modal_transition::animate(env, this, modal_vc, false);
+    } else {
+        modal_transition::complete(env, this, modal_vc, false, animated);
+    }
 
 
     // The modal hierarchy is now fully attached to a window. Any UIWebView
@@ -912,18 +915,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         return existing;
     }
     // Match Apple: lazily create an item whose title is the controller's
-    // current `title` (falling back to the class name when unset). Retain it
+    // current `title`, which is nil until the application sets it. Retain it
     // on the host object so subsequent property writes (e.g.
     // `self.navigationItem.rightBarButtonItem = ...`) are not lost.
     let title: id = msg![env; this title];
-    let init_title = if title != nil {
-        title
-    } else {
-        let class: Class = msg![env; this class];
-        NSStringFromClass(env, class)
-    };
     let item: id = msg_class![env; UINavigationItem alloc];
-    let item: id = msg![env; item initWithTitle:init_title];
+    let item: id = msg![env; item initWithTitle:title];
     env.objc.borrow_mut::<UIViewControllerHostObject>(this).navigation_item = item;
     item
 }

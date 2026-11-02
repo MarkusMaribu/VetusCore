@@ -103,6 +103,8 @@ pub(crate) struct CALayerHostObject {
     /// (`[0..1]`). Defaults to the unit rectangle `(0,0,1,1)`.
     /// <https://developer.apple.com/documentation/quartzcore/calayer/1410893-contentsrect>
     pub(super) contents_rect: CGRect,
+    /// Normalized center region for three-part or nine-part resizing.
+    pub(super) contents_center: Option<CGRect>,
     /// `edgeAntialiasingMask` — bitmask of `CAEdgeAntialiasingMask` edges
     /// (left/right/top/bottom). Stored verbatim so the property
     /// round-trips through `-[CALayer edgeAntialiasingMask]`.
@@ -595,6 +597,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             origin: CGPoint { x: 0.0, y: 0.0 },
             size: CGSize { width: 1.0, height: 1.0 },
         },
+        contents_center: None,
         edge_antialiasing_mask: 0, // All edges disabled by default
         minification_filter: kCAFilterLinear.to_owned(),
         magnification_filter: kCAFilterLinear.to_owned(),
@@ -1171,6 +1174,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (CGRect)contentsRect {
     env.objc.borrow::<CALayerHostObject>(this).contents_rect
+}
+
+// https://developer.apple.com/documentation/quartzcore/calayer/contentscenter
+- (())setContentsCenter:(CGRect)rect {
+    env.objc.borrow_mut::<CALayerHostObject>(this).contents_center = Some(rect);
+}
+- (CGRect)contentsCenter {
+    env.objc.borrow::<CALayerHostObject>(this).contents_center.unwrap_or(CGRect {
+        origin: CGPoint::default(), size: CGSize { width: 1.0, height: 1.0 },
+    })
 }
 
 - (())setMinificationFilterBias:(f32)bias {

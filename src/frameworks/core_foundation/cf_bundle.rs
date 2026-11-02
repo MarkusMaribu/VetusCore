@@ -505,7 +505,7 @@ fn CFBundleCopyResourceURLsOfTypeForLocalization(
 // =========================================================================
 
 pub fn CFBundleCopyBundleLocalizations(env: &mut Environment, bundle: CFBundleRef) -> CFArrayRef {
-    let bundle_localizations = env
+    let mut bundle_localizations = env
         .objc
         .borrow_mut::<NSBundleHostObject>(bundle)
         .bundle
@@ -516,6 +516,28 @@ pub fn CFBundleCopyBundleLocalizations(env: &mut Environment, bundle: CFBundleRe
         // A corrupt plist must not panic the host; skip non-string entries.
         .filter_map(|value| value.as_string().map(|s| s.to_string()))
         .collect::<Vec<String>>();
+
+    // CFBundleLocalizations only describes manually managed translations.
+    // Most apps declare their languages through the actual .lproj folders.
+    // https://developer.apple.com/documentation/corefoundation/cfbundlecopybundlelocalizations(_:)
+    let root: id = msg![env; bundle resourcePath];
+    let root = ns_string::to_rust_string(env, root).into_owned();
+    if let Ok(entries) = env
+        .fs
+        .enumerate_with_types(crate::fs::GuestPath::new(&root))
+    {
+        for (name, ty) in entries {
+            if matches!(ty, crate::fs::FsNodeType::Directory) {
+                if let Some(language) = name.strip_suffix(".lproj") {
+                    if language != "Base" {
+                        bundle_localizations.push(language.to_string());
+                    }
+                }
+            }
+        }
+    }
+    bundle_localizations.sort();
+    bundle_localizations.dedup();
 
     let guest_bundle_localizations = bundle_localizations
         .iter()
@@ -536,34 +558,48 @@ pub fn CFBundleCopyPreferredLocalizationsFromArray(
     env: &mut Environment,
     loc_array: CFArrayRef,
 ) -> CFArrayRef {
-    let mut result = Vec::new();
     let preferred_languages: id = msg_class![env; NSLocale preferredLanguages];
+    CFBundleCopyLocalizationsForPreferences(env, loc_array, preferred_languages)
+}
 
-    let loc_count: NSUInteger = msg![env; loc_array count];
-    let pref_loc_count: NSUInteger = msg![env; preferred_languages count];
-
-    for loc_index in 0..loc_count {
-        let loc: id = msg![env; loc_array objectAtIndex:loc_index];
-        for pref_loc_index in 0..pref_loc_count {
-            let pref_loc: id = msg![env; preferred_languages objectAtIndex:pref_loc_index];
-            let equal: bool = msg![env; loc isEqualToString:pref_loc];
-            if equal {
-                result.push(loc);
-                retain(env, loc);
-                break;
-            }
-        }
-    }
-
-    if loc_count > 0 {
-        let first_loc: id = msg![env; loc_array objectAtIndex:(0 as NSUInteger)];
-        result.push(first_loc);
-        retain(env, first_loc);
+pub fn CFBundleCopyLocalizationsForPreferences(
+    env: &mut Environment,
+    loc_array: CFArrayRef,
+    preferences: CFArrayRef,
+) -> CFArrayRef {
+    let preferences = if preferences == nil {
+        msg_class![env; NSLocale preferredLanguages]
     } else {
-        let en_loc = ns_string::get_static_str(env, "en");
-        result.push(en_loc);
+        preferences
+    };
+    let loc_count: NSUInteger = msg![env; loc_array count];
+    let pref_count: NSUInteger = msg![env; preferences count];
+    let mut localizations = Vec::new();
+    let mut languages = Vec::new();
+    for i in 0..loc_count {
+        let value: id = msg![env; loc_array objectAtIndex:i];
+        localizations.push(ns_string::to_rust_string(env, value).into_owned());
     }
-
+    for i in 0..pref_count {
+        let value: id = msg![env; preferences objectAtIndex:i];
+        languages.push(ns_string::to_rust_string(env, value).into_owned());
+    }
+    let mut selected = crate::frameworks::foundation::ns_bundle::localization::preferred(
+        &localizations,
+        &languages,
+    );
+    if selected.is_empty() && loc_count > 0 {
+        selected.push(0);
+    }
+    let mut result = Vec::new();
+    for index in selected {
+        let value: id = msg![env; loc_array objectAtIndex:(index as NSUInteger)];
+        retain(env, value);
+        result.push(value);
+    }
+    if result.is_empty() {
+        result.push(ns_string::get_static_str(env, "en"));
+    }
     let result = ns_array::from_vec(env, result);
     log_dbg!(
         "CFBundleCopyPreferredLocalizationsFromArray({:?}) => {:?}",
@@ -769,6 +805,7 @@ pub const FUNCTIONS: FunctionExports = &[
     // Localizations
     export_c_func!(CFBundleCopyBundleLocalizations(_)),
     export_c_func!(CFBundleCopyPreferredLocalizationsFromArray(_)),
+    export_c_func!(CFBundleCopyLocalizationsForPreferences(_, _)),
     export_c_func!(CFBundleCopyLocalizedString(_, _, _, _)),
     export_c_func!(CFBundleCopyLocalizedStringForLocalization(_, _, _, _, _)),
     // Load state

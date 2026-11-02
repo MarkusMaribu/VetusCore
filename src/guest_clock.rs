@@ -33,7 +33,10 @@ pub fn set_frozen(frozen: bool) {
 }
 
 fn effective_now() -> Instant {
-    let now = Instant::now();
+    effective_now_at(Instant::now())
+}
+
+fn effective_now_at(now: Instant) -> Instant {
     let pause = PAUSE.lock().unwrap();
     let frozen = pause
         .frozen_since
@@ -96,7 +99,12 @@ impl Default for GuestClock {
 
 impl GuestClock {
     pub fn new() -> Self {
-        Self::at(Instant::now(), SystemTime::now())
+        let host_now = Instant::now();
+        let mut clock = Self::at(host_now, SystemTime::now());
+        // Keep the guest origin in the same domain as Environment::startup_time,
+        // while ignoring pauses that happened before this clock was created.
+        clock.host_anchor = effective_now_at(host_now);
+        clock
     }
 
     fn at(host: Instant, wall: SystemTime) -> Self {
@@ -134,7 +142,14 @@ impl GuestClock {
     /// Convert a guest deadline to host time before comparing with audio,
     /// composition or scheduler deadlines. Recompute after a speed change.
     pub fn host_deadline(&self, guest: Instant) -> Instant {
-        self.host_deadline_at(guest, effective_now())
+        let host_now = Instant::now();
+        let effective_now = effective_now_at(host_now);
+        // The scheduler compares this result with real host Instants, not
+        // the timeline with parked time removed. Only the remaining delay
+        // belongs in that adjusted timeline.
+        let remaining = self.host_deadline_at(guest, effective_now)
+            .saturating_duration_since(effective_now);
+        host_now + remaining
     }
 
     fn host_deadline_at(&self, guest: Instant, host: Instant) -> Instant {
@@ -192,10 +207,21 @@ mod tests {
         let during = clock.now().saturating_duration_since(before);
         assert!(during < Duration::from_millis(20), "guest time moved while frozen: {during:?}");
         set_frozen(false);
+        let new_host_start = Instant::now();
+        let new_clock = GuestClock::new();
+        let new_start = new_clock.now();
+        assert!(new_start >= new_host_start, "new clock predates its environment");
+        let host_before = Instant::now();
+        let due = clock.host_deadline(clock.now() + Duration::from_millis(100));
+        assert!(due >= host_before + Duration::from_millis(80),
+                "guest deadline was translated into the paused host timeline");
         std::thread::sleep(Duration::from_millis(40));
         let after = clock.now().saturating_duration_since(before);
         assert!(after >= Duration::from_millis(20), "guest time did not resume: {after:?}");
         assert!(after < Duration::from_millis(200), "paused time leaked into the guest: {after:?}");
+        let new_elapsed = new_clock.now().saturating_duration_since(new_start);
+        assert!(new_elapsed >= Duration::from_millis(20),
+                "a new guest clock inherited earlier pauses: {new_elapsed:?}");
     }
 
     #[test]

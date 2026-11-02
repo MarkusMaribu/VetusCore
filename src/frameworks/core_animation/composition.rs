@@ -56,6 +56,7 @@ struct MiscGlObjects {
     /// 9-patch rounded corner vertex co-ords (varies with ratio of corner
     /// radius to overall rectangle size).
     rounded_tex_coord_buffer: GLuint,
+    contents_tex_coord_buffer: GLuint,
     /// Index buffer for 9-patch (first 6 elements can be used for square).
     index_buffer: GLuint,
 }
@@ -80,6 +81,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     }
 
     crate::frameworks::uikit::ui_view::layout_windows_if_needed(env);
+    crate::frameworks::uikit::native_ui::refresh(env);
 
     let mut animation_state = animation::State::default();
     let window_count = env.framework_state.uikit.ui_view.ui_window.windows.len();
@@ -434,9 +436,9 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 );
             }
 
-            let [basic_square_buffer, flipped_square_buffer, rounded_vertex_buffer, rounded_tex_coord_buffer, index_buffer] = unsafe {
-                let mut array_buffers = [0; 5];
-                gles.GenBuffers(5, array_buffers.as_mut_ptr());
+            let [basic_square_buffer, flipped_square_buffer, rounded_vertex_buffer, rounded_tex_coord_buffer, index_buffer, contents_tex_coord_buffer] = unsafe {
+                let mut array_buffers = [0; 6];
+                gles.GenBuffers(6, array_buffers.as_mut_ptr());
                 array_buffers
             };
             unsafe {
@@ -468,6 +470,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 flipped_square_buffer,
                 rounded_vertex_buffer,
                 rounded_tex_coord_buffer,
+                contents_tex_coord_buffer,
                 index_buffer,
             }
         });
@@ -1050,29 +1053,70 @@ unsafe fn composite_layer_contents(
                 .multiply(&Matrix::translate_3d(rect.origin.x, rect.origin.y, 0.0))
                 .multiply(&cumulative_transform),
         );
-        gles.EnableClientState(gles11::VERTEX_ARRAY);
-        gles.BindBuffer(gles11::ARRAY_BUFFER, misc.basic_square_buffer);
-        gles.VertexPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
+        let unit = CGRect {
+            origin: CGPoint::default(),
+            size: CGSize { width: 1.0, height: 1.0 },
+        };
+        let center = host_obj.contents_center.filter(|center| *center != unit);
+        if let Some(center) = center.filter(|_| {
+            host_obj.contents_gravity.is_empty()
+                || host_obj.contents_gravity.starts_with("resize")
+        }) {
+            let (x, u) = contents_axis_edges(
+                center.origin.x, center.size.width, dimensions.0 as f32,
+                host_obj.contents_scale, rect.size.width,
+            );
+            let (y, mut v) = contents_axis_edges(
+                center.origin.y, center.size.height, dimensions.1 as f32,
+                host_obj.contents_scale, rect.size.height,
+            );
+            if host_obj.contents == nil {
+                v = v.map(|value| 1.0 - value);
+            }
+            gles.EnableClientState(gles11::VERTEX_ARRAY);
+            gles.BindBuffer(gles11::ARRAY_BUFFER, misc.rounded_vertex_buffer);
+            upload_slice(
+                gles.as_mut(), gles11::ARRAY_BUFFER,
+                &make_9patch_coords(x, y), gles11::DYNAMIC_DRAW,
+            );
+            gles.VertexPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
+            gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+            gles.BindBuffer(gles11::ARRAY_BUFFER, misc.contents_tex_coord_buffer);
+            upload_slice(
+                gles.as_mut(), gles11::ARRAY_BUFFER,
+                &make_9patch_coords(u, v), gles11::DYNAMIC_DRAW,
+            );
+            gles.TexCoordPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
+            gles.Enable(gles11::TEXTURE_2D);
+            gles.DrawElements(
+                gles11::TRIANGLES, INDICES_PER_9PATCH as _,
+                gles11::UNSIGNED_BYTE, 0 as *const GLvoid,
+            );
+        } else {
+            gles.EnableClientState(gles11::VERTEX_ARRAY);
+            gles.BindBuffer(gles11::ARRAY_BUFFER, misc.basic_square_buffer);
+            gles.VertexPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
 
-        gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
-        // Normal images will have top-to-bottom row order, but OpenGL ES
-        // expects bottom-to-top, so flip the UVs in that case.
-        gles.BindBuffer(
-            gles11::ARRAY_BUFFER,
-            if host_obj.contents != nil {
-                misc.basic_square_buffer
-            } else {
-                misc.flipped_square_buffer
-            },
-        );
-        gles.TexCoordPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
-        gles.Enable(gles11::TEXTURE_2D);
-        gles.DrawElements(
-            gles11::TRIANGLES,
-            SQUARE_INDICES.len() as _,
-            gles11::UNSIGNED_BYTE,
-            0 as *const GLvoid,
-        );
+            gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+            // Normal images will have top-to-bottom row order, but OpenGL ES
+            // expects bottom-to-top, so flip the UVs in that case.
+            gles.BindBuffer(
+                gles11::ARRAY_BUFFER,
+                if host_obj.contents != nil {
+                    misc.basic_square_buffer
+                } else {
+                    misc.flipped_square_buffer
+                },
+            );
+            gles.TexCoordPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
+            gles.Enable(gles11::TEXTURE_2D);
+            gles.DrawElements(
+                gles11::TRIANGLES,
+                SQUARE_INDICES.len() as _,
+                gles11::UNSIGNED_BYTE,
+                0 as *const GLvoid,
+            );
+        }
     }
     std::mem::drop(gles);
 
@@ -1331,6 +1375,42 @@ unsafe fn composite_masked_layer(
         .extend([content, alpha]);
 }
 
+/// Keep source end caps at their point size while stretching only the center.
+/// https://developer.apple.com/documentation/quartzcore/calayer/contentscenter
+fn contents_axis_edges(
+    start: f32,
+    length: f32,
+    pixels: f32,
+    scale: f32,
+    destination: f32,
+) -> ([f32; 4], [f32; 4]) {
+    let pixel = 1.0 / pixels.max(1.0);
+    let requested_length = length.max(0.0);
+    let length = requested_length.max(pixel).min(1.0);
+    let start = start + (requested_length - length) / 2.0;
+    let start = start.clamp(0.0, 1.0 - length);
+    let end = start + length;
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let left = start * pixels / scale;
+    let right = (1.0 - end) * pixels / scale;
+    let factor = if left + right > 0.0 {
+        (destination / (left + right)).min(1.0)
+    } else {
+        1.0
+    };
+    let positions = if destination > 0.0 {
+        [
+            0.0,
+            left * factor / destination,
+            1.0 - right * factor / destination,
+            1.0,
+        ]
+    } else {
+        [0.0, 0.0, 1.0, 1.0]
+    };
+    (positions, [0.0, start, end, 1.0])
+}
+
 const FLOATS_PER_POINT: usize = 2;
 const BASIC_SQUARE_POINTS: [f32; 4 * FLOATS_PER_POINT] = [0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
 const SQUARE_INDICES: [u8; 6] = [0, 1, 2, 2, 1, 3];
@@ -1464,6 +1544,22 @@ unsafe fn upload_rgba8_pixels(
 #[cfg(test)]
 mod contents_tests {
     use super::*;
+    #[test]
+    fn contents_center_keeps_retina_caps_at_their_point_size() {
+        // https://developer.apple.com/documentation/quartzcore/calayer/contentscenter
+        let (positions, uv) = contents_axis_edges(0.25, 0.1, 200.0, 2.0, 300.0);
+        assert_eq!(uv, [0.0, 0.25, 0.35, 1.0]);
+        assert!((positions[1] * 300.0 - 25.0).abs() < 0.001);
+        assert!(((1.0 - positions[2]) * 300.0 - 65.0).abs() < 0.001);
+        let (positions, _) = contents_axis_edges(0.25, 0.1, 200.0, 2.0, 600.0);
+        assert!((positions[1] * 600.0 - 25.0).abs() < 0.001);
+        assert!(((1.0 - positions[2]) * 600.0 - 65.0).abs() < 0.001);
+        let (small, _) = contents_axis_edges(0.25, 0.1, 200.0, 2.0, 40.0);
+        assert!(small.windows(2).all(|pair| pair[0] <= pair[1] + 0.00001));
+        let (_, pixel_uv) = contents_axis_edges(0.5, 0.0, 200.0, 2.0, 300.0);
+        assert!((pixel_uv[2] - pixel_uv[1] - 0.005).abs() < 0.00001);
+        assert!(((pixel_uv[1] + pixel_uv[2]) / 2.0 - 0.5).abs() < 0.00001);
+    }
     fn bounds() -> CGRect {
         CGRect {
             origin: CGPoint { x: 10.0, y: 20.0 },

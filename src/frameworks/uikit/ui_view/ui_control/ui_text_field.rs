@@ -54,6 +54,8 @@ struct UITextFieldHostObject {
     delegate: id,
     editing: bool,
     text_label: id,
+    placeholder_label: id,
+    background_view: id,
     placeholder: id,
     attributed_placeholder: id,
     font: id,
@@ -90,6 +92,8 @@ impl Default for UITextFieldHostObject {
             delegate: nil,
             editing: false,
             text_label: nil,
+            placeholder_label: nil,
+            background_view: nil,
             placeholder: nil,
             attributed_placeholder: nil,
             font: nil,
@@ -121,6 +125,68 @@ impl Default for UITextFieldHostObject {
     }
 }
 
+// Apple documents background images as content behind the editable text;
+// rounded-rectangle borders ignore custom images. Upstream touchHLE leaves
+// these properties unimplemented.
+// https://developer.apple.com/documentation/uikit/uitextfield/borderstyle-swift.property
+// https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view/ui_control/ui_text_field.rs
+fn update_background(env: &mut Environment, field: id) {
+    let enabled: bool = msg![env; field isEnabled];
+    let host = env.objc.borrow::<UITextFieldHostObject>(field);
+    let style = host.border_style;
+    let image = if host.border_style == 3 { nil } else if enabled {
+        host.background
+    } else {
+        host.disabled_background
+    };
+    let mut view = host.background_view;
+    if view == nil && (image != nil || style != 0) {
+        view = msg_class![env; UIImageView new];
+        env.objc.borrow_mut::<UITextFieldHostObject>(field).background_view = view;
+        () = msg![env; view setUserInteractionEnabled:false];
+        () = msg![env; field insertSubview:view atIndex:0u32];
+    }
+    if view != nil {
+        let bounds: CGRect = msg![env; field bounds];
+        () = msg![env; view setFrame:bounds];
+        () = msg![env; view setImage:image];
+        let layer: id = msg![env; view layer];
+        let bordered = style != 0 && image == nil;
+        let color: id = if bordered { msg_class![env; UIColor whiteColor] }
+            else { msg_class![env; UIColor clearColor] };
+        () = msg![env; view setBackgroundColor:color];
+        let border_color: id = msg_class![env; UIColor grayColor];
+        let border_color: id = msg![env; border_color CGColor];
+        () = msg![env; layer setBorderColor:border_color];
+        () = msg![env; layer setBorderWidth:(if bordered { 1.0f32 } else { 0.0f32 })];
+        () = msg![env; layer setCornerRadius:(if style == 3 { 6.0f32 } else { 0.0f32 })];
+    }
+}
+
+fn accessory_visible(mode: UITextFieldViewMode, editing: bool) -> bool {
+    mode == 3 || (mode == 1 && editing) || (mode == 2 && !editing)
+}
+
+fn field_content_rect(env: &mut Environment, field: id, mut bounds: CGRect) -> CGRect {
+    let host = env.objc.borrow::<UITextFieldHostObject>(field);
+    let (left, right, editing, lm, rm, border) = (host.left_view, host.right_view,
+        host.editing, host.left_view_mode, host.right_view_mode, host.border_style);
+    let padding = if border == 3 { 6.0 } else { 0.0 };
+    let mut start = bounds.origin.x + padding;
+    let mut end = bounds.origin.x + bounds.size.width - padding;
+    if left != nil && accessory_visible(lm, editing) {
+        let rect: CGRect = msg![env; field leftViewRectForBounds:bounds];
+        start = start.max(rect.origin.x + rect.size.width);
+    }
+    if right != nil && accessory_visible(rm, editing) {
+        let rect: CGRect = msg![env; field rightViewRectForBounds:bounds];
+        end = end.min(rect.origin.x);
+    }
+    bounds.origin.x = start;
+    bounds.size.width = (end - start).max(0.0);
+    bounds
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -135,9 +201,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithFrame:(CGRect)frame {
     let this: id = msg_super![env; this initWithFrame:frame];
 
-    let _: () = msg![env; this setOpaque:true];
-    let bg_color: id = msg_class![env; UIColor whiteColor];
-    let _: () = msg![env; this setBackgroundColor:bg_color];
+    // A borderless field inherits the transparent UIView background. A forced
+    // white fill hides the containing bar and makes light text unreadable.
+    let _: () = msg![env; this setOpaque:false];
 
     let text_label: id = msg_class![env; UILabel new];
 
@@ -195,16 +261,41 @@ pub const CLASSES: ClassExports = objc_classes! {
         () = msg![env; this setTextAlignment:align];
     }
 
+    for (key, selector) in [("UIBackground", "setBackground:"),
+                            ("UIDisabledBackground", "setDisabledBackground:"),
+                            ("UIPlaceholder", "setPlaceholder:")] {
+        let key = get_static_str(env, key);
+        if msg![env; coder containsValueForKey:key] {
+            let value: id = msg![env; coder decodeObjectForKey:key];
+            let selector = env.objc.register_host_selector(selector.into(), &mut env.mem);
+            () = msg![env; this performSelector:selector withObject:value];
+        }
+    }
+    for key in ["UIBorderStyle", "UIKeyboardType", "UIReturnKeyType", "UIAutocorrectionType"] {
+        let key_string = get_static_str(env, key);
+        if msg![env; coder containsValueForKey:key_string] {
+            let value: NSInteger = msg![env; coder decodeIntegerForKey:key_string];
+            match key {
+                "UIBorderStyle" => { () = msg![env; this setBorderStyle:value]; }
+                "UIKeyboardType" => { () = msg![env; this setKeyboardType:value]; }
+                "UIReturnKeyType" => { () = msg![env; this setReturnKeyType:value]; }
+                _ => { () = msg![env; this setAutocorrectionType:value]; }
+            }
+        }
+    }
+
     this
 }
 
 - (())dealloc {
     let UITextFieldHostObject {
-        text_label, placeholder, attributed_placeholder, font, text_color,
+        text_label, placeholder_label, background_view, placeholder, attributed_placeholder, font, text_color,
         background, disabled_background, left_view, right_view, input_view, input_accessory_view, ..
     } = std::mem::take(env.objc.borrow_mut(this));
 
     release(env, text_label);
+    release(env, placeholder_label);
+    release(env, background_view);
     release(env, placeholder);
     release(env, attributed_placeholder);
     release(env, font);
@@ -219,9 +310,51 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())layoutSubviews {
-    let text_label = env.objc.borrow::<UITextFieldHostObject>(this).text_label;
+    update_background(env, this);
+    let host = env.objc.borrow::<UITextFieldHostObject>(this);
+    let (text_label, left, right, lm, rm, editing, placeholder, font, alignment) =
+        (host.text_label, host.left_view, host.right_view, host.left_view_mode,
+         host.right_view_mode, host.editing, host.placeholder, host.font, host.text_alignment);
     let bounds: CGRect = msg![env; this bounds];
-    let _: () = msg![env; text_label setFrame:bounds];
+    for (view, left_side, mode) in [(left, true, lm), (right, false, rm)] {
+        if view == nil { continue; }
+        let visible = accessory_visible(mode, editing);
+        let parent: id = msg![env; view superview];
+        if visible {
+            if parent != this { () = msg![env; this addSubview:view]; }
+            let rect: CGRect = if left_side { msg![env; this leftViewRectForBounds:bounds] }
+                else { msg![env; this rightViewRectForBounds:bounds] };
+            () = msg![env; view setFrame:rect];
+        } else if parent == this {
+            () = msg![env; view removeFromSuperview];
+        }
+    }
+    let rect: CGRect = if editing {
+        msg![env; this editingRectForBounds:bounds]
+    } else {
+        msg![env; this textRectForBounds:bounds]
+    };
+    let _: () = msg![env; text_label setFrame:rect];
+    let mut label = env.objc.borrow::<UITextFieldHostObject>(this).placeholder_label;
+    if placeholder != nil && label == nil {
+        label = msg_class![env; UILabel new];
+        let gray: id = msg_class![env; UIColor grayColor];
+        let clear: id = msg_class![env; UIColor clearColor];
+        () = msg![env; label setBackgroundColor:clear];
+        () = msg![env; label setTextColor:gray];
+        () = msg![env; this addSubview:label];
+        env.objc.borrow_mut::<UITextFieldHostObject>(this).placeholder_label = label;
+    }
+    if label != nil {
+        let text: id = msg![env; text_label text];
+        let length: NSUInteger = msg![env; text length];
+        () = msg![env; label setHidden:(length != 0 || placeholder == nil)];
+        () = msg![env; label setText:placeholder];
+        () = msg![env; label setFont:font];
+        () = msg![env; label setTextAlignment:alignment];
+        let rect: CGRect = msg![env; this placeholderRectForBounds:bounds];
+        () = msg![env; label setFrame:rect];
+    }
 }
 
 - (id)text {
@@ -232,6 +365,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setText:(id)text {
     let text_label = env.objc.borrow::<UITextFieldHostObject>(this).text_label;
     let _: () = msg![env; text_label setText:text];
+    () = msg![env; this setNeedsLayout];
 }
 
 - (id)attributedText {
@@ -256,6 +390,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
     retain(env, placeholder);
     env.objc.borrow_mut::<UITextFieldHostObject>(this).placeholder = placeholder;
+    () = msg![env; this setNeedsLayout];
 }
 
 - (id)attributedPlaceholder { env.objc.borrow::<UITextFieldHostObject>(this).attributed_placeholder }
@@ -280,6 +415,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<UITextFieldHostObject>(this).font = new_font;
     let text_label = env.objc.borrow::<UITextFieldHostObject>(this).text_label;
     let _: () = msg![env; text_label setFont:new_font];
+    () = msg![env; this setNeedsLayout];
 }
 
 - (id)textColor { env.objc.borrow::<UITextFieldHostObject>(this).text_color }
@@ -299,10 +435,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<UITextFieldHostObject>(this).text_alignment = text_alignment;
     let text_label = env.objc.borrow::<UITextFieldHostObject>(this).text_label;
     let _: () = msg![env; text_label setTextAlignment:text_alignment];
+    () = msg![env; this setNeedsLayout];
 }
 
 - (UITextBorderStyle)borderStyle { env.objc.borrow::<UITextFieldHostObject>(this).border_style }
-- (())setBorderStyle:(UITextBorderStyle)style { env.objc.borrow_mut::<UITextFieldHostObject>(this).border_style = style; }
+- (())setBorderStyle:(UITextBorderStyle)style {
+    env.objc.borrow_mut::<UITextFieldHostObject>(this).border_style = style;
+    update_background(env, this);
+}
+
+- (())setEnabled:(bool)enabled {
+    () = msg_super![env; this setEnabled:enabled];
+    update_background(env, this);
+}
 
 - (id)background { env.objc.borrow::<UITextFieldHostObject>(this).background }
 - (())setBackground:(id)background {
@@ -310,6 +455,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
     retain(env, background);
     env.objc.borrow_mut::<UITextFieldHostObject>(this).background = background;
+    update_background(env, this);
 }
 
 - (id)disabledBackground { env.objc.borrow::<UITextFieldHostObject>(this).disabled_background }
@@ -318,6 +464,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
     retain(env, background);
     env.objc.borrow_mut::<UITextFieldHostObject>(this).disabled_background = background;
+    update_background(env, this);
 }
 
 - (UITextFieldViewMode)clearButtonMode { env.objc.borrow::<UITextFieldHostObject>(this).clear_button_mode }
@@ -328,23 +475,35 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)leftView { env.objc.borrow::<UITextFieldHostObject>(this).left_view }
 - (())setLeftView:(id)view {
     let old = env.objc.borrow::<UITextFieldHostObject>(this).left_view;
-    release(env, old);
     retain(env, view);
+    () = msg![env; old removeFromSuperview];
+    release(env, old);
     env.objc.borrow_mut::<UITextFieldHostObject>(this).left_view = view;
+    if view != nil { () = msg![env; this addSubview:view]; }
+    () = msg![env; this setNeedsLayout];
 }
 
 - (UITextFieldViewMode)leftViewMode { env.objc.borrow::<UITextFieldHostObject>(this).left_view_mode }
-- (())setLeftViewMode:(UITextFieldViewMode)mode { env.objc.borrow_mut::<UITextFieldHostObject>(this).left_view_mode = mode; }
+- (())setLeftViewMode:(UITextFieldViewMode)mode {
+    env.objc.borrow_mut::<UITextFieldHostObject>(this).left_view_mode = mode;
+    () = msg![env; this setNeedsLayout];
+}
 
 - (id)rightView { env.objc.borrow::<UITextFieldHostObject>(this).right_view }
 - (())setRightView:(id)view {
     let old = env.objc.borrow::<UITextFieldHostObject>(this).right_view;
-    release(env, old);
     retain(env, view);
+    () = msg![env; old removeFromSuperview];
+    release(env, old);
     env.objc.borrow_mut::<UITextFieldHostObject>(this).right_view = view;
+    if view != nil { () = msg![env; this addSubview:view]; }
+    () = msg![env; this setNeedsLayout];
 }
 - (UITextFieldViewMode)rightViewMode { env.objc.borrow::<UITextFieldHostObject>(this).right_view_mode }
-- (())setRightViewMode:(UITextFieldViewMode)mode { env.objc.borrow_mut::<UITextFieldHostObject>(this).right_view_mode = mode; }
+- (())setRightViewMode:(UITextFieldViewMode)mode {
+    env.objc.borrow_mut::<UITextFieldHostObject>(this).right_view_mode = mode;
+    () = msg![env; this setNeedsLayout];
+}
 
 - (id)inputView { env.objc.borrow::<UITextFieldHostObject>(this).input_view }
 - (())setInputView:(id)view {
@@ -397,6 +556,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     len > 0
 }
 
+- (())deleteBackward {
+    // UIKeyInput is dynamically dispatched, including when an engine keeps its
+    // visible text outside the UITextField and overrides deletion on an empty field.
+    // https://developer.apple.com/documentation/uikit/uikeyinput/deletebackward()
+    handle_backspace(env, this);
+}
+
 - (())touchesBegan:(id)_touches withEvent:(id)_event { let _: bool = msg![env; this becomeFirstResponder]; }
 - (bool)canBecomeFirstResponder { true }
 - (bool)canResignFirstResponder { true }
@@ -442,6 +608,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
 
     env.objc.borrow_mut::<UITextFieldHostObject>(this).editing = true;
+    () = msg![env; this setNeedsLayout];
 
     let name = ns_string::get_static_str(env, UITextFieldTextDidBeginEditingNotification);
     let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
@@ -472,6 +639,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // ask the same field to end editing again; it must see the committed state
     // rather than recursively beginning another keyboard dismissal.
     env.objc.borrow_mut::<UITextFieldHostObject>(this).editing = false;
+    () = msg![env; this setNeedsLayout];
     env.framework_state.uikit.ui_responder.first_responder = nil;
 
     let center: id = msg_class![env; NSNotificationCenter defaultCenter];
@@ -493,9 +661,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     true
 }
 
-- (CGRect)textRectForBounds:(CGRect)bounds { bounds }
-- (CGRect)editingRectForBounds:(CGRect)bounds { bounds }
-- (CGRect)placeholderRectForBounds:(CGRect)bounds { bounds }
+- (CGRect)textRectForBounds:(CGRect)bounds { field_content_rect(env, this, bounds) }
+- (CGRect)editingRectForBounds:(CGRect)bounds { field_content_rect(env, this, bounds) }
+- (CGRect)placeholderRectForBounds:(CGRect)bounds { field_content_rect(env, this, bounds) }
 - (CGRect)borderRectForBounds:(CGRect)bounds { bounds }
 
 - (CGRect)clearButtonRectForBounds:(CGRect)bounds {
@@ -510,13 +678,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (CGRect)leftViewRectForBounds:(CGRect)bounds {
-    CGRect { origin: bounds.origin, size: CGSize { width: 0.0, height: bounds.size.height } }
+    let view = env.objc.borrow::<UITextFieldHostObject>(this).left_view;
+    let frame: CGRect = msg![env; view frame];
+    CGRect { origin: CGPoint { x: bounds.origin.x,
+        y: bounds.origin.y + (bounds.size.height - frame.size.height) / 2.0 }, size: frame.size }
 }
 
 - (CGRect)rightViewRectForBounds:(CGRect)bounds {
+    let view = env.objc.borrow::<UITextFieldHostObject>(this).right_view;
+    let frame: CGRect = msg![env; view frame];
     CGRect {
-        origin: CGPoint { x: bounds.origin.x + bounds.size.width, y: bounds.origin.y },
-        size: CGSize { width: 0.0, height: bounds.size.height },
+        origin: CGPoint { x: bounds.origin.x + bounds.size.width - frame.size.width,
+            y: bounds.origin.y + (bounds.size.height - frame.size.height) / 2.0 },
+        size: frame.size,
     }
 }
 
@@ -526,9 +700,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
-// Only accepted user edits post this notification. Programmatic setters must
-// remain silent so observers can normalize the text without recursive edits.
+// Only accepted user edits send editing actions and notifications. Programmatic
+// setters stay silent so observers can normalize text without recursive edits.
 fn post_text_change(env: &mut Environment, field: id) {
+    super::send_actions(env, field, nil, super::UIControlEventEditingChanged);
     let center: id = msg_class![env; NSNotificationCenter defaultCenter];
     let name = ns_string::get_static_str(env, UITextFieldTextDidChangeNotification);
     () = msg![env; center postNotificationName:name object:field userInfo:nil];
@@ -538,6 +713,7 @@ fn post_text_change(env: &mut Environment, field: id) {
 // text and autocorrection), while UIKit delegates receive a UTF-16 NSRange.
 // https://developer.apple.com/documentation/uikit/uitextfielddelegate/textfield(_:shouldchangecharactersin:replacementstring:)
 pub fn handle_edit(env: &mut Environment, field: id, text: String) {
+    let requested = text.clone();
     let current: id = msg![env; field text];
     let old = if current == nil { String::new() } else {
         ns_string::to_rust_string(env, current).into_owned()
@@ -558,6 +734,20 @@ pub fn handle_edit(env: &mut Environment, field: id, text: String) {
         release(env, value);
     }
     release(env, replacement);
+    // Delegates can reject a change after consuming its characters in an
+    // engine-owned editor, or observers can normalize/clear the field. Return
+    // that canonical value to the host editor so its next edit does not send
+    // the previously consumed prefix again.
+    // https://developer.apple.com/documentation/uikit/uitextfielddelegate/textfield(_:shouldchangecharactersin:replacementstring:)
+    if env.framework_state.uikit.ui_responder.first_responder == field {
+        let current: id = msg![env; field text];
+        let current = if current == nil { String::new() } else {
+            ns_string::to_rust_string(env, current).into_owned()
+        };
+        if current != requested {
+            crate::frameworks::uikit::ui_keyboard::start_text_input(env);
+        }
+    }
 }
 
 fn editing_change(old: &str, new: &str) -> (NSRange, String) {
@@ -661,6 +851,8 @@ pub fn handle_backspace(env: &mut Environment, text_field: id) {
 }
 
 pub fn handle_return(env: &mut Environment, text_field: id) {
+    // Delegate/action handlers may remove the sender from its view hierarchy.
+    retain(env, text_field);
     let delegate: id = env
         .objc
         .borrow::<UITextFieldHostObject>(text_field)
@@ -672,15 +864,255 @@ pub fn handle_return(env: &mut Environment, text_field: id) {
                 .objc
                 .register_host_selector("textFieldShouldReturn:".to_string(), &mut env.mem);
             if msg![env; delegate respondsToSelector:sel] {
-                let _: () = msg![env; delegate textFieldShouldReturn:text_field];
+                let should_return: bool = msg![env; delegate textFieldShouldReturn:text_field];
+                if !should_return {
+                    release(env, text_field);
+                    return;
+                }
             }
         }
     }
+    // A Return key is also a target-action event. Nib-backed forms often
+    // connect this event without installing a text-field delegate.
+    // https://developer.apple.com/documentation/uikit/uicontrol/event/editingdidendonexit
+    super::send_actions(env, text_field, nil, super::UIControlEventEditingDidEndOnExit);
+    release(env, text_field);
 }
 
 #[cfg(test)]
 mod editing_tests {
     use super::*;
+
+    #[test]
+    fn accessories_follow_editing_modes_and_placeholder_never_changes_text() {
+        // https://developer.apple.com/documentation/uikit/uitextfield/leftview
+        // https://developer.apple.com/documentation/uikit/uitextfield/leftviewmode
+        // https://developer.apple.com/documentation/uikit/uitextfield/placeholder
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view/ui_control/ui_text_field.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let bounds = CGRect { origin: CGPoint::default(), size: CGSize { width: 200.0, height: 40.0 } };
+        let field: id = msg_class![env; UITextField alloc];
+        let field: id = msg![env; field initWithFrame:bounds];
+        let left: id = msg_class![env; UIView new];
+        let right: id = msg_class![env; UIView new];
+        let frame = CGRect { origin: CGPoint::default(), size: CGSize { width: 24.0, height: 20.0 } };
+        () = msg![env; left setFrame:frame];
+        () = msg![env; right setFrame:frame];
+        () = msg![env; field setLeftView:left];
+        () = msg![env; field setRightView:right];
+        let placeholder = get_static_str(env, "Search");
+        () = msg![env; field setPlaceholder:placeholder];
+        for editing in [false, true] {
+            env.objc.borrow_mut::<UITextFieldHostObject>(field).editing = editing;
+            for mode in 0i32..=3 {
+                () = msg![env; field setLeftViewMode:mode];
+                () = msg![env; field setRightViewMode:mode];
+                () = msg![env; field layoutSubviews];
+                let parent: id = msg![env; left superview];
+                let expected = matches!((mode, editing), (3, _) | (1, true) | (2, false));
+                assert_eq!(parent == field, expected);
+                let rect: CGRect = msg![env; field textRectForBounds:bounds];
+                assert_eq!({ rect.size.width }, if expected { 152.0 } else { 200.0 });
+                if expected {
+                    let left_frame: CGRect = msg![env; left frame];
+                    let right_frame: CGRect = msg![env; right frame];
+                    assert_eq!({ left_frame.origin.y }, 10.0);
+                    assert_eq!({ right_frame.origin.x }, 176.0);
+                }
+            }
+        }
+        let label = env.objc.borrow::<UITextFieldHostObject>(field).placeholder_label;
+        let bg: id = msg![env; label backgroundColor];
+        assert_eq!(crate::frameworks::uikit::ui_color::get_rgba(&env.objc, bg).3, 0.0);
+        let hidden: bool = msg![env; label isHidden];
+        assert!(!hidden);
+        let text: id = msg![env; field text];
+        assert_eq!(text, nil);
+        () = msg![env; field setText:placeholder];
+        () = msg![env; field layoutSubviews];
+        let hidden: bool = msg![env; label isHidden];
+        assert!(hidden);
+        // UIKit's view mode must not undo an app's own visibility changes.
+        () = msg![env; right setHidden:true];
+        () = msg![env; field layoutSubviews];
+        let hidden: bool = msg![env; right isHidden];
+        assert!(hidden);
+        () = msg![env; field setLeftView:nil];
+        let parent: id = msg![env; left superview];
+        assert_eq!(parent, nil);
+        release(env, left);
+        release(env, right);
+        release(env, field);
+        release(env, pool);
+    }
+
+    fn inset_text(_: &mut Environment, _: id, _: SEL, mut bounds: CGRect) -> CGRect {
+        bounds.origin.x += 4.0;
+        bounds.size.width -= 8.0;
+        bounds
+    }
+    fn inset_editing(_: &mut Environment, _: id, _: SEL, mut bounds: CGRect) -> CGRect {
+        bounds.origin.x += 12.0;
+        bounds.size.width -= 24.0;
+        bounds
+    }
+    #[test]
+    fn borderless_fields_are_transparent_and_use_overridden_text_rectangles() {
+        // https://developer.apple.com/documentation/uikit/uiview/backgroundcolor
+        // https://developer.apple.com/documentation/uikit/uitextfield/editingrect(forbounds:)
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view/ui_control/ui_text_field.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let class = env.objc.get_known_class("UITextField", &mut env.mem);
+        type RectMethod = fn(&mut Environment, id, SEL, CGRect) -> CGRect;
+        static TEXT_RECT: RectMethod = inset_text;
+        static EDITING_RECT: RectMethod = inset_editing;
+        for (name, method) in [("textRectForBounds:", &TEXT_RECT),
+                               ("editingRectForBounds:", &EDITING_RECT)] {
+            let selector = env.objc.register_host_selector(name.into(), &mut env.mem);
+            let imp = env.dyld.create_guest_function(&mut env.mem, "[text rectangle probe]", method);
+            let types = env.mem.alloc_and_write_cstr(b"{CGRect={CGPoint=ff}{CGSize=ff}}@:{CGRect={CGPoint=ff}{CGSize=ff}}");
+            crate::objc::class_replaceMethod(env, class, selector, imp.to_ptr(), types.cast_const());
+        }
+        let field: id = msg_class![env; UITextField alloc];
+        let frame = CGRect { origin: CGPoint::default(), size: CGSize { width: 120.0, height: 32.0 } };
+        let field: id = msg![env; field initWithFrame:frame];
+        let background: id = msg![env; field backgroundColor];
+        assert_eq!(background, nil);
+        let opaque: bool = msg![env; field isOpaque];
+        assert!(!opaque);
+        let label = env.objc.borrow::<UITextFieldHostObject>(field).text_label;
+        for (editing, expected) in [(false, 4.0), (true, 12.0), (false, 4.0)] {
+            if editing { assert!(msg![env; field becomeFirstResponder]); }
+            else { assert!(msg![env; field resignFirstResponder]); }
+            () = msg![env; field layoutIfNeeded];
+            let actual: CGRect = msg![env; label frame];
+            let x = actual.origin.x;
+            assert_eq!(x, expected);
+        }
+        release(env, field);
+        release(env, pool);
+    }
+
+    fn record_delete_key(env: &mut Environment, field: id, _: SEL) {
+        let count: NSInteger = msg![env; field tag];
+        () = msg![env; field setTag:(count + 1)];
+    }
+
+    #[test]
+    fn delete_backward_dispatches_overrides_even_with_an_empty_proxy() {
+        // UIKeyInput deletion belongs to the responder, whose backing store
+        // need not be UITextField.text (e.g. a guest engine's visible editor).
+        // https://developer.apple.com/documentation/uikit/uikeyinput/deletebackward()
+        // Upstream currently handles keys through host helpers instead:
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view/ui_control/ui_text_field.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let field: id = msg_class![env; UITextField new];
+        let value = ns_string::get_static_str(env, "A");
+        () = msg![env; field setText:value];
+        () = msg![env; field deleteBackward];
+        let value: id = msg![env; field text];
+        assert_eq!(ns_string::to_rust_string(env, value), "");
+        let class = env.objc.get_known_class("UITextField", &mut env.mem);
+        let selector = env.objc.register_host_selector("deleteBackward".into(), &mut env.mem);
+        type Callback = fn(&mut Environment, id, SEL);
+        let imp = env.dyld.create_guest_function(
+            &mut env.mem, "[custom deletion]", &(record_delete_key as Callback));
+        let types = env.mem.alloc_and_write_cstr(b"v@:");
+        crate::objc::class_replaceMethod(env, class, selector, imp.to_ptr(), types.cast_const());
+        crate::frameworks::uikit::ui_responder::handle_text_input_event(
+            env, field, crate::window::TextInputEvent::Backspace);
+        let count: NSInteger = msg![env; field tag];
+        assert_eq!(count, 1);
+        release(env, field);
+        release(env, pool);
+    }
+
+    #[test]
+    fn background_images_follow_border_and_enabled_state_without_covering_text() {
+        use crate::frameworks::core_graphics::{cg_image, CGFloat};
+
+        fn image(env: &mut Environment, pixel: Vec<u8>) -> id {
+            let cg = cg_image::from_image(env, crate::image::Image::from_pixels(1, 1, pixel));
+            let image: id = msg_class![env; UIImage alloc];
+            let image: id = msg![env; image initWithCGImage:cg];
+            cg_image::CGImageRelease(env, cg);
+            image
+        }
+
+        fn assert_image(env: &mut Environment, view: id, expected: id) {
+            let actual: id = msg![env; view image];
+            assert_eq!(actual, expected);
+            let layer: id = msg![env; view layer];
+            let contents: id = msg![env; layer contents];
+            let expected_contents: id = msg![env; expected CGImage];
+            assert_eq!(contents, expected_contents);
+        }
+
+        // Rounded borders ignore custom images. Other border styles display
+        // the normal or disabled image behind the field's editable text.
+        // https://developer.apple.com/documentation/uikit/uitextfield/background
+        // https://developer.apple.com/documentation/uikit/uitextfield/disabledbackground
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let field: id = msg_class![env; UITextField new];
+        let normal = image(env, vec![255, 0, 0, 255]);
+        let disabled = image(env, vec![0, 0, 255, 255]);
+        let text = ns_string::get_static_str(env, "18");
+        () = msg![env; field setText:text];
+        () = msg![env; field setBorderStyle:(3i32)];
+        () = msg![env; field setBackground:normal];
+        () = msg![env; field setDisabledBackground:disabled];
+        let background = env.objc.borrow::<UITextFieldHostObject>(field).background_view;
+        assert_ne!(background, nil);
+        let layer: id = msg![env; background layer];
+        let border: CGFloat = msg![env; layer borderWidth];
+        let radius: CGFloat = msg![env; layer cornerRadius];
+        assert!(border > 0.0 && radius > 0.0);
+        assert_image(env, background, nil);
+        () = msg![env; field setEnabled:false];
+        assert_image(env, background, nil);
+
+        () = msg![env; field setBorderStyle:(0i32)];
+        assert_image(env, background, disabled);
+        let border: CGFloat = msg![env; layer borderWidth];
+        let radius: CGFloat = msg![env; layer cornerRadius];
+        assert_eq!((border, radius), (0.0, 0.0));
+        () = msg![env; field setEnabled:true];
+        assert_image(env, background, normal);
+
+        let frame = CGRect {
+            origin: CGPoint { x: 9.0, y: 11.0 },
+            size: CGSize { width: 72.0, height: 36.0 },
+        };
+        () = msg![env; field setFrame:frame];
+        () = msg![env; field layoutSubviews];
+        let background_frame: CGRect = msg![env; background frame];
+        let bounds: CGRect = msg![env; field bounds];
+        assert_eq!(background_frame, bounds);
+        let interactive: bool = msg![env; background isUserInteractionEnabled];
+        assert!(!interactive);
+        let subviews: id = msg![env; field subviews];
+        let count: NSUInteger = msg![env; subviews count];
+        let bottom: id = msg![env; subviews objectAtIndex:0u32];
+        let top: id = msg![env; subviews objectAtIndex:1u32];
+        assert_eq!(count, 2);
+        assert_eq!(bottom, background);
+        assert_eq!(top, env.objc.borrow::<UITextFieldHostObject>(field).text_label);
+        let displayed_text: id = msg![env; top text];
+        assert_eq!(ns_string::to_rust_string(env, displayed_text), "18");
+
+        release(env, field);
+        release(env, normal);
+        release(env, disabled);
+        release(env, pool);
+    }
 
     thread_local! {
         static CHANGE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -748,6 +1180,100 @@ mod editing_tests {
         }
     }
 
+    fn reject_host_change(_: &mut Environment, _: id, _: SEL, _: id, _: NSRange, _: id) -> bool {
+        false
+    }
+
+    #[test]
+    fn rejected_host_edits_restore_the_canonical_editor_value() {
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let field: id = msg_class![env; UITextField new];
+        let delegate: id = msg_class![env; NSObject new];
+        let class: crate::objc::Class = msg_class![env; NSObject class];
+        let selector = env.objc.register_host_selector(
+            "textField:shouldChangeCharactersInRange:replacementString:".into(), &mut env.mem);
+        type Callback = fn(&mut Environment, id, SEL, id, NSRange, id) -> bool;
+        let imp = env.dyld.create_guest_function(
+            &mut env.mem, "[reject host edit]", &(reject_host_change as Callback));
+        let types = env.mem.alloc_and_write_cstr(b"B@:@{_NSRange=II}@");
+        crate::objc::class_replaceMethod(env, class, selector, imp.to_ptr(), types.cast_const());
+        () = msg![env; field setDelegate:delegate];
+        let value = ns_string::get_static_str(env, "A");
+        () = msg![env; field setText:value];
+        env.framework_state.uikit.ui_responder.first_responder = field;
+        // The host editor has tentatively accepted the keystroke. A delegate
+        // veto must send back "A", otherwise its next edit resends "AB".
+        env.framework_state.uikit.ui_responder.host_text = "AB".into();
+        handle_edit(env, field, "AB".into());
+        assert_eq!(env.framework_state.uikit.ui_responder.host_text, "A");
+        let actual: id = msg![env; field text];
+        assert_eq!(ns_string::to_rust_string(env, actual), "A");
+        env.framework_state.uikit.ui_responder.first_responder = nil;
+        release(env, delegate);
+        release(env, field);
+        release(env, pool);
+    }
+
+    fn save_edited_text(env: &mut Environment, target: id, _: SEL, field: id) {
+        let count: NSInteger = msg![env; target tag];
+        () = msg![env; target setTag:(count + 1)];
+        let text: id = msg![env; field text];
+        let defaults: id = msg_class![env; NSUserDefaults standardUserDefaults];
+        let key = ns_string::get_static_str(env, "editingActionTest");
+        () = msg![env; defaults setObject:text forKey:key];
+    }
+
+    #[test]
+    fn user_editing_actions_save_the_field_value_once_per_change() {
+        // Target-action consumers receive the text field itself, and can save
+        // its value without observing NSNotificationCenter. setText: is silent.
+        // https://developer.apple.com/documentation/uikit/uicontrol/event/editingchanged
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view/ui_control/ui_text_field.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let _application: id = msg_class![env; UIApplication new];
+        let field: id = msg_class![env; UITextField new];
+        let value = ns_string::get_static_str(env, "18");
+        () = msg![env; field setText:value];
+        let target: id = msg_class![env; UIView new];
+        let class: crate::objc::Class = msg_class![env; UIView class];
+        let selector = env.objc.register_host_selector("editingTestSave:".into(), &mut env.mem);
+        type Callback = fn(&mut Environment, id, SEL, id);
+        let imp = env.dyld.create_guest_function(
+            &mut env.mem, "[editing action target]", &(save_edited_text as Callback));
+        let types = env.mem.alloc_and_write_cstr(b"v@:@");
+        crate::objc::class_replaceMethod(env, class, selector, imp.to_ptr(), types.cast_const());
+        let events = super::super::UIControlEventEditingChanged;
+        () = msg![env; field addTarget:target action:selector forControlEvents:events];
+        let defaults: id = msg_class![env; NSUserDefaults standardUserDefaults];
+        let key = ns_string::get_static_str(env, "editingActionTest");
+        let initial = ns_string::get_static_str(env, "Ada");
+        () = msg![env; field setText:initial];
+        let count: NSInteger = msg![env; target tag];
+        assert_eq!(count, 0);
+        for (count, expected) in [(1, "Ada1"), (2, "Ada"), (3, "Grace")] {
+            match count {
+                1 => handle_text(env, field, "1".into()),
+                2 => handle_backspace(env, field),
+                _ => handle_edit(env, field, expected.into()),
+            }
+            let actual_count: NSInteger = msg![env; target tag];
+            assert_eq!(actual_count, count);
+            let saved: id = msg![env; defaults objectForKey:key];
+            assert_ne!(saved, nil);
+            assert_eq!(ns_string::to_rust_string(env, saved), expected);
+        }
+        handle_edit(env, field, "Grace".into());
+        let count: NSInteger = msg![env; target tag];
+        assert_eq!(count, 3);
+        release(env, target);
+        release(env, field);
+        release(env, pool);
+    }
+
     #[test]
     fn programmatic_text_is_silent_and_user_edits_notify_once() {
         // Notifications describe user editing; an observer may normalize text
@@ -788,6 +1314,34 @@ mod editing_tests {
         assert_eq!(ns_string::to_rust_string(env, actual), "30");
         () = msg![env; center removeObserver:observer];
         release(env, observer);
+        release(env, field);
+        release(env, pool);
+    }
+
+    #[test]
+    fn return_key_delivers_the_nib_exit_action_without_a_delegate() {
+        // Forms can connect EditingDidEndOnExit in Interface Builder instead
+        // of implementing UITextFieldDelegate.
+        // https://developer.apple.com/documentation/uikit/uicontrol/event/editingdidendonexit
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let _application: id = msg_class![env; UIApplication new];
+        let field: id = msg_class![env; UITextField new];
+        let target: id = msg_class![env; UIView new];
+        let class: crate::objc::Class = msg_class![env; UIView class];
+        let selector = env.objc.register_host_selector("textFieldTestExit:".into(), &mut env.mem);
+        type Callback = fn(&mut Environment, id, SEL, id);
+        let imp = env.dyld.create_guest_function(
+            &mut env.mem, "[text field exit action]", &(save_edited_text as Callback));
+        let types = env.mem.alloc_and_write_cstr(b"v@:@");
+        crate::objc::class_replaceMethod(env, class, selector, imp.to_ptr(), types.cast_const());
+        () = msg![env; field addTarget:target action:selector
+            forControlEvents:(super::super::UIControlEventEditingDidEndOnExit)];
+        handle_return(env, field);
+        let count: NSInteger = msg![env; target tag];
+        assert_eq!(count, 1);
+        release(env, target);
         release(env, field);
         release(env, pool);
     }

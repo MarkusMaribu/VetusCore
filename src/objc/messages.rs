@@ -220,7 +220,7 @@ fn objc_msgSend_inner(
     env: &mut Environment,
     receiver: id,
     selector: SEL,
-    super2: Option<Class>,
+    super2: Option<(Class, bool)>,
     tolerate_type_mismatch: bool,
     skip_initialize: bool,
 ) {
@@ -392,7 +392,8 @@ fn objc_msgSend_inner(
         return;
     }
 
-    let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
+    let orig_class = super2.map(|(class, _)| class)
+        .unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
     // Graceful exit if isa is nil — this typically means the object was
     // already deallocated (use-after-free in guest code) or was never
     // properly allocated. Per Apple's Objective-C runtime behavior,
@@ -742,7 +743,7 @@ fn objc_msgSend_inner(
         {
             // Skip method lookup on first iteration if this is the super-call
             // variant of objc_msgSend (look up the superclass first)
-            if super2.is_some() && class == orig_class {
+            if matches!(super2, Some((_, true))) && class == orig_class {
                 class = superclass;
                 continue;
             }
@@ -2462,7 +2463,7 @@ pub(crate) fn _touchHLE_objc_msgSend_stret_tolerant(
 /// `objc_msgSendSuper2` and [msg_send_super2].
 pub struct objc_super {
     pub receiver: id,
-    /// If this is used with `objc_msgSendSuper` (not implemented here, TODO),
+    /// If this is used with `objc_msgSendSuper`,
     /// this is a pointer to the superclass to look up the method on.
     /// If this is used with `objc_msgSendSuper2`, this is a pointer to a class
     /// and the superclass will be looked up from it.
@@ -2491,7 +2492,7 @@ pub(super) fn objc_msgSendSuper2(
         env,
         receiver,
         selector,
-        /* super2: */ Some(class),
+        /* super2: */ Some((class, true)),
         /* tolerate_type_mismatch: */ false,
         /* skip_initialize: */ false,
     )
@@ -2500,20 +2501,45 @@ pub(super) fn objc_msgSendSuper2(
 #[allow(non_snake_case)]
 pub(super) fn objc_msgSendSuper2_stret(
     env: &mut Environment,
+    _stret: MutVoidPtr,
     super_ptr: ConstPtr<objc_super>,
     selector: SEL,
 ) {
     let objc_super { receiver, class } = env.mem.read(super_ptr);
-    // Rewrite first argument to match the normal ABI.
-    crate::abi::write_next_arg(&mut 0, env.cpu.regs_mut(), &mut env.mem, receiver);
+    // r0 holds the result buffer; only replace objc_super* in r1 with self.
+    crate::abi::write_next_arg(&mut 1, env.cpu.regs_mut(), &mut env.mem, receiver);
     objc_msgSend_inner(
         env,
         receiver,
         selector,
-        /* super2: */ Some(class),
+        /* super2: */ Some((class, true)),
         /* tolerate_type_mismatch: */ false,
         /* skip_initialize: */ false,
     )
+}
+
+#[allow(non_snake_case)]
+pub(super) fn objc_msgSendSuper(
+    env: &mut Environment,
+    super_ptr: ConstPtr<objc_super>,
+    selector: SEL,
+) {
+    let objc_super { receiver, class } = env.mem.read(super_ptr);
+    crate::abi::write_next_arg(&mut 0, env.cpu.regs_mut(), &mut env.mem, receiver);
+    // Unlike Super2, this ABI already supplies the lookup superclass.
+    objc_msgSend_inner(env, receiver, selector, Some((class, false)), false, false)
+}
+
+#[allow(non_snake_case)]
+pub(super) fn objc_msgSendSuper_stret(
+    env: &mut Environment,
+    _stret: MutVoidPtr,
+    super_ptr: ConstPtr<objc_super>,
+    selector: SEL,
+) {
+    let objc_super { receiver, class } = env.mem.read(super_ptr);
+    crate::abi::write_next_arg(&mut 1, env.cpu.regs_mut(), &mut env.mem, receiver);
+    objc_msgSend_inner(env, receiver, selector, Some((class, false)), false, false)
 }
 
 /// `void objc_enumerationMutation(id)` is called by compiler-generated fast
@@ -2756,14 +2782,7 @@ where
     // Provide type info for dynamic type checking.
     env.objc.message_type_info = Some(<(R, P) as MsgSendSuperSignature>::WithoutSuper::type_info());
     if R::SIZE_IN_MEM.is_some() {
-        // Struct returns (stret) for super-calls aren't implemented yet.
-        // Log this clearly and fall through to the non-stret path so the
-        // host process keeps running and the caller will simply observe
-        // the default-constructed return value via to_regs/to_mem below.
-        log!(
-            "Warning: msg_send_super2: struct-return (stret) super-call is not implemented; falling back to non-stret dispatch. Result may be unreliable.",
-        );
-        (objc_msgSendSuper2 as fn(&mut Environment, ConstPtr<objc_super>, SEL))
+        (objc_msgSendSuper2_stret as fn(&mut Environment, MutVoidPtr, ConstPtr<objc_super>, SEL))
             .call_from_host(env, args)
     } else {
         (objc_msgSendSuper2 as fn(&mut Environment, ConstPtr<objc_super>, SEL))
@@ -2920,6 +2939,27 @@ pub fn autorelease(env: &mut Environment, object: id) -> id {
 #[cfg(test)]
 mod fake_class_tests {
     use super::fake_class_message_result;
+
+    #[test]
+    fn host_super_call_preserves_struct_result_buffer() {
+        // https://github.com/apple-oss-distributions/objc4/blob/main/runtime/Messengers.subproj/objc-msg-arm.s
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/objc/messages.rs
+        use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+        use crate::objc::{msg, msg_class, release};
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let label = msg_class![env; UILabel new];
+        let frame = CGRect { origin: CGPoint { x: 7.0, y: 9.0 },
+            size: CGSize { width: 123.0, height: 45.0 } };
+        () = msg![env; label setFrame:frame];
+        let class = env.objc.get_known_class("UILabel", &mut env.mem);
+        let info = env.mem.alloc_and_write(super::objc_super { receiver: label, class });
+        let sel = env.objc.lookup_selector("bounds").unwrap();
+        let result: CGRect = super::msg_send_super2(env, (info.cast_const(), sel));
+        assert_eq!(result, CGRect { origin: CGPoint::default(), size: frame.size });
+        env.mem.free(info.cast());
+        release(env, label);
+    }
 
     #[test]
     fn openfeint_reports_that_the_player_declined_it() {

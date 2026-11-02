@@ -326,6 +326,15 @@ pub fn pthread_create(
         DEFAULT_ATTR
     };
     let thread_id = env.new_thread(start_routine, user_data, attr.stacksize);
+    // Fixed-priority policies must take effect when the thread is created;
+    // storing the attributes alone lets CPU-heavy ordinary threads delay I/O.
+    // Apple's pthread_create also forwards explicitly set attributes here.
+    // https://github.com/apple-oss-distributions/libpthread/blob/main/src/pthread.c
+    env.threads[thread_id].scheduling_priority = if matches!(attr.sched_policy, 2 | 4) {
+        attr.sched_param.sched_priority
+    } else {
+        0
+    };
 
     let opaque = env.mem.alloc_and_write(OpaqueThread {
         magic: MAGIC_THREAD,
@@ -715,9 +724,7 @@ fn pthread_get_stacksize_np(env: &mut Environment, thread: pthread_t) -> GuestUS
 /// `int pthread_getschedparam(pthread_t thread, int *policy,
 ///                            struct sched_param *param)`
 ///
-/// Reports the nominal scheduling attributes. All guest threads share the
-/// host scheduler and always run under the default `SCHED_OTHER` policy, so
-/// that is what gets reported.
+/// Reports the attributes used at creation or by pthread_setschedparam.
 fn pthread_getschedparam(
     env: &mut Environment,
     thread: pthread_t,
@@ -728,18 +735,17 @@ fn pthread_getschedparam(
         set_errno(env, ESRCH);
         return ESRCH;
     }
-    // SCHED_OTHER (Darwin value).
-    env.mem.write(policy, 1);
-    env.mem.write(param, sched_param { sched_priority: 0 });
+    let attr = State::get(env).threads.get(&thread).unwrap().attr;
+    env.mem.write(policy, attr.sched_policy);
+    env.mem.write(param, attr.sched_param);
     0
 }
 
 /// `int pthread_setschedparam(pthread_t thread, int policy,
 ///                            const struct sched_param *param)`
 ///
-/// Guest threads cannot have their host scheduling policy changed from the
-/// guest, but Apple's implementation silently accepts `SCHED_OTHER` on
-/// non-realtime threads, so validate the policy and report success.
+/// Update guest scheduling importance for Darwin's fixed-priority policies.
+/// Host scheduling is independent: guest threads share one emulator thread.
 fn pthread_setschedparam(
     env: &mut Environment,
     thread: pthread_t,
@@ -750,17 +756,22 @@ fn pthread_setschedparam(
         set_errno(env, ESRCH);
         return ESRCH;
     }
-    // Darwin: SCHED_OTHER = 1, SCHED_FIFO = 2, SCHED_RR = 3.
-    if !(1..=3).contains(&policy) {
+    // Darwin: SCHED_OTHER = 1, SCHED_RR = 2, SCHED_FIFO = 4.
+    if !matches!(policy, 1 | 2 | 4) {
         set_errno(env, EINVAL);
         return EINVAL;
     }
-    let _sched: sched_param = env.mem.read(param);
-    log_dbg!(
-        "pthread_setschedparam({:?}, {}) accepted (no-op)",
-        thread,
-        policy
-    );
+    let sched: sched_param = env.mem.read(param);
+    let obj = State::get(env).threads.get_mut(&thread).unwrap();
+    obj.attr.sched_policy = policy;
+    obj.attr.sched_param = sched;
+    let thread_id = obj.thread_id;
+    env.threads[thread_id].scheduling_priority = if matches!(policy, 2 | 4) {
+        sched.sched_priority
+    } else {
+        0
+    };
+    log_dbg!("pthread_setschedparam({:?}, {})", thread, policy);
     0
 }
 

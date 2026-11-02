@@ -439,6 +439,7 @@ impl Window {
                 InputKind::Text(text) => {
                     self.event_queue.push_back(Event::TextInput(TextInputEvent::Text(text)));
                 }
+                InputKind::UIKitAction(action) => self.event_queue.push_back(Event::UIKitAction(action)),
                 InputKind::EditingText(text) => {
                     self.event_queue.push_back(Event::TextInput(TextInputEvent::EditingText(text)));
                 }

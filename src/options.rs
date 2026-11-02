@@ -209,6 +209,10 @@ pub struct Options {
     /// presenter. Enabled by default; --no-rotation-fix restores the legacy
     /// iPad/non-portrait heuristic for compatibility.
     pub rotation_fix: bool,
+    /// Apply initial controller rotation when its view enters the window.
+    /// Some legacy engines construct landscape children during launch and
+    /// require their parent to have its final bounds before that construction.
+    pub early_initial_autorotation: bool,
     /// Force EAGL `initWithAPI:` to create an OpenGL ES 1.1 (fixed-function)
     /// context even when the app requested an OpenGL ES 2.0/3.x context.
     ///
@@ -343,6 +347,7 @@ impl Default for Options {
             mach_semaphore_spurious_wake_ms: None,
             present_rotate: None,
             rotation_fix: true,
+            early_initial_autorotation: false,
             force_gles1_context: std::env::var("TOUCHHLE_FORCE_GLES1_CONTEXT")
                 .map(|value| {
                     let value = value.trim();
@@ -671,6 +676,10 @@ impl Options {
             self.rotation_fix = true;
         } else if arg == "--no-rotation-fix" {
             self.rotation_fix = false;
+        } else if arg == "--early-initial-autorotation" {
+            self.early_initial_autorotation = true;
+        } else if arg == "--defer-initial-autorotation" {
+            self.early_initial_autorotation = false;
         } else if arg == "--perf-hints" {
             self.perf_hints = true;
         } else if arg == "--no-perf-hints" {
@@ -872,5 +881,15 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--rotation-fix").unwrap());
         assert!(options.rotation_fix);
+    }
+
+    #[test]
+    fn initial_autorotation_timing_is_opt_in_and_reversible() {
+        let mut options = Options::default();
+        assert!(!options.early_initial_autorotation);
+        assert!(options.parse_argument("--early-initial-autorotation").unwrap());
+        assert!(options.early_initial_autorotation);
+        assert!(options.parse_argument("--defer-initial-autorotation").unwrap());
+        assert!(!options.early_initial_autorotation);
     }
 }

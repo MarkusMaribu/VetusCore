@@ -205,6 +205,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     retain(env, view_controller);
     let _: () = msg![env; view_controller setNavigationController:this];
+    // A navigation stack is a container relationship, including its root.
+    // https://developer.apple.com/library/archive/featuredarticles/ViewControllerPGforiPhoneOS/ImplementingaContainerViewController.html
+    let _: () = msg![env; view_controller setParentViewController:this];
 
     // Delegate: willShow. Use `register_host_selector` so we don't panic when
     // the app's delegate doesn't implement (and therefore never references)
@@ -276,6 +279,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _: () = msg![env; popped viewDidDisappear:animated];
 
     let _: () = msg![env; popped setNavigationController:nil];
+    let _: () = msg![env; popped setParentViewController:nil];
 
     // Show the new top VC.
     let new_top = env.objc
@@ -334,6 +338,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let _: () = msg![env; vc_view removeFromSuperview];
         let _: () = msg![env; vc viewDidDisappear:animated];
         let _: () = msg![env; vc setNavigationController:nil];
+        let _: () = msg![env; vc setParentViewController:nil];
         release(env, vc);
     }
 
@@ -447,6 +452,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let vc_view: id = msg![env; vc view];
         let _: () = msg![env; vc_view removeFromSuperview];
         let _: () = msg![env; vc setNavigationController:nil];
+        let _: () = msg![env; vc setParentViewController:nil];
         release(env, vc);
     }
 
@@ -458,6 +464,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let vc: id = msg![env; controllers objectAtIndex:i];
         retain(env, vc);
         let _: () = msg![env; vc setNavigationController:this];
+        let _: () = msg![env; vc setParentViewController:this];
         tmp.push(vc);
     }
     env.objc
@@ -572,6 +579,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
     for vc in stack {
         let _: () = msg![env; vc setNavigationController:nil];
+        let _: () = msg![env; vc setParentViewController:nil];
         release(env, vc);
     }
     release(env, bar);
@@ -644,6 +652,11 @@ mod navigation_container_tests {
         let env = &mut environment;
         let pool: id = msg_class![env; NSAutoreleasePool new];
         let root_controller: id = msg_class![env; UIViewController new];
+        let initial_title: id = msg![env; root_controller title];
+        assert_eq!(initial_title, nil);
+        let initial_item: id = msg![env; root_controller navigationItem];
+        let initial_item_title: id = msg![env; initial_item title];
+        assert_eq!(initial_item_title, nil);
         let root_view: id = msg_class![env; UIView new];
         () = msg![env; root_controller setView:root_view];
         let root_title = get_static_str(env, "Photos");
@@ -677,14 +690,27 @@ mod navigation_container_tests {
         let item: id = msg![env; root_controller navigationItem];
         let actual_item: id = msg![env; bar topItem];
         assert_eq!(actual_item, item);
+        let parent: id = msg![env; root_controller parentViewController];
+        assert_eq!(parent, navigation);
+        let tab_item: id = msg![env; root_controller tabBarItem];
+        let title = get_static_str(env, "Settings");
+        () = msg![env; root_controller setTitle:title];
+        let navigation_title: id = msg![env; item title];
+        let tab_title: id = msg![env; tab_item title];
+        assert_eq!(navigation_title, title);
+        assert_eq!(tab_title, title);
         let second: id = msg_class![env; UIViewController new];
         let second_view: id = msg_class![env; UIView new];
         () = msg![env; second setView:second_view];
         () = msg![env; navigation pushViewController:second animated:false];
+        let parent: id = msg![env; second parentViewController];
+        assert_eq!(parent, navigation);
         assert!(msg![env; root_view isHidden]);
         assert!(!msg![env; second_view isHidden]);
         let returned: id = msg![env; navigation popViewControllerAnimated:false];
         assert_eq!(returned, second);
+        let parent: id = msg![env; second parentViewController];
+        assert_eq!(parent, nil);
         let top: id = msg![env; navigation topViewController];
         assert_eq!(top, root_controller);
         assert!(!msg![env; root_view isHidden]);

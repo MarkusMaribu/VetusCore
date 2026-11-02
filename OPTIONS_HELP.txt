@@ -530,3 +530,10 @@ Other options:
     --disable-links
         Deny URL launches and embedded web page requests. The embedded host
         enables this policy for all apps; network access does not enable links.
+
+    --early-initial-autorotation
+        Rotate controller views when attached during launch, before legacy
+        engines construct landscape children.
+
+    --defer-initial-autorotation
+        Defer initial controller rotation until launch finishes (default).

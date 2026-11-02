@@ -6,9 +6,9 @@
  */
 //! `AudioUnit.h` (Audio Unit Services)
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::audio::openal::al_types::{ALsizei, ALuint, ALvoid};
+use crate::audio::openal::al_types::{ALenum, ALsizei, ALuint, ALvoid};
 use crate::audio::openal::{
     AL_BUFFERS_PROCESSED, AL_BUFFERS_QUEUED, AL_GAIN, AL_PITCH, AL_PLAYING, AL_SOURCE_STATE,
 };
@@ -19,7 +19,7 @@ const AL_ROLLOFF_FACTOR: i32 = 0x1021;
 const AL_MAX_DISTANCE: i32 = 0x1023;
 
 use crate::abi::{CallFromHost, GuestFunction};
-use crate::dyld::FunctionExports;
+use crate::dyld::{FunctionExports, HostFunction};
 use crate::environment::Environment;
 use crate::export_c_func;
 use crate::frameworks::audio_toolbox::au_graph;
@@ -33,9 +33,7 @@ use crate::frameworks::core_audio_types::{
     kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
     AudioStreamBasicDescription, AudioTimeStamp, SMPTETime,
 };
-use crate::frameworks::core_foundation::cf_run_loop::CFRunLoopGetMain;
 use crate::frameworks::foundation::ns_dictionary::dict_from_keys_and_objects;
-use crate::frameworks::foundation::ns_run_loop;
 use crate::frameworks::foundation::ns_string;
 use crate::mem::{guest_size_of, ConstVoidPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::objc::{autorelease, id, msg, msg_class};
@@ -70,6 +68,105 @@ fn interleaved_format_for_planar_pcm(
     format.bytes_per_frame *= format.channels_per_frame;
     format.bytes_per_packet *= format.channels_per_frame;
     format
+}
+
+/// A render callback may replace the supplied buffer pointers. Consume the
+/// returned list, while retaining ownership only of the original allocations.
+/// Apple AUInputElement passes this mutable list through unchanged:
+/// https://github.com/apple/AudioUnitSDK/blob/main/include/AudioUnitSDK/AUInputElement.h
+/// https://developer.apple.com/documentation/audiotoolbox/aurenderpullinputblock
+fn decode_rendered_buffer_list(
+    mem: &crate::mem::Mem,
+    format: AudioStreamBasicDescription,
+    list: MutVoidPtr,
+    frames: u32,
+    planar: bool,
+    status: OSStatus,
+    action_flags: u32,
+) -> (ALenum, ALsizei, Vec<u8>) {
+    if status != 0 {
+        return (0, 0, Vec::new());
+    }
+    let output_format = if planar {
+        interleaved_format_for_planar_pcm(format)
+    } else {
+        format
+    };
+    let bytes_per_buffer_frame = format.bytes_per_frame;
+    let Some(size) = frames.checked_mul(bytes_per_buffer_frame) else {
+        return (0, 0, Vec::new());
+    };
+    if bytes_per_buffer_frame == 0 {
+        return (0, 0, Vec::new());
+    }
+    // Preserve the requested render duration when the callback supplies a
+    // shorter buffer. Never read beyond its returned mDataByteSize.
+    let silence = if format.bits_per_channel == 8
+        && format.format_flags & kAudioFormatFlagIsSignedInteger == 0
+    { 0x80 } else { 0 };
+    let channels = if planar { 2 } else { 1 };
+    let mut planes = vec![vec![silence; size as usize]; channels];
+    if action_flags & kAudioUnitRenderAction_OutputIsSilence == 0 {
+        let count: u32 = mem.read(list.cast());
+        if count < channels as u32 {
+            return (0, 0, Vec::new());
+        }
+        let first = mem.read(list.cast::<AudioBufferList<1>>());
+        let mut buffers = vec![&first.buffers[0]];
+        let second;
+        if planar {
+            second = mem.read(list.cast::<AudioBufferList<2>>());
+            buffers.push(&second.buffers[1]);
+        }
+        for (plane, buffer) in planes.iter_mut().zip(buffers) {
+            let bytes = buffer.data_byte_size.min(size);
+            let bytes = bytes - bytes % bytes_per_buffer_frame;
+            if !buffer.data.is_null() && bytes != 0 {
+                plane[..bytes as usize]
+                    .copy_from_slice(mem.bytes_at(buffer.data.cast(), bytes));
+            }
+        }
+    }
+    let data = if planar {
+        interleave_planar_pcm(&[&planes[0], &planes[1]], (format.bits_per_channel / 8) as usize)
+            .unwrap_or_default()
+    } else {
+        planes.pop().unwrap()
+    };
+    decode_buffer_from_bytes(&output_format, &data, &[])
+}
+
+/// Input callbacks can supply a shorter contiguous segment of their own
+/// storage. Consume that segment before pulling again, rather than inserting
+/// silence between segments. Apple's AUBuffer likewise copies the returned
+/// byte size, not the originally requested capacity:
+/// https://github.com/apple/AudioUnitSDK/blob/main/include/AudioUnitSDK/AUBuffer.h
+fn rendered_input_frames(
+    mem: &crate::mem::Mem,
+    format: &AudioStreamBasicDescription,
+    list: MutVoidPtr,
+    requested: u32,
+    planar: bool,
+    action_flags: u32,
+) -> u32 {
+    if action_flags & kAudioUnitRenderAction_OutputIsSilence != 0 {
+        return requested;
+    }
+    let count: u32 = mem.read(list.cast());
+    if count < if planar { 2 } else { 1 } || format.bytes_per_frame == 0 {
+        return 0;
+    }
+    let first = mem.read(list.cast::<AudioBufferList<1>>());
+    let mut frames = if first.buffers[0].data.is_null() { 0 } else {
+        requested.min(first.buffers[0].data_byte_size / format.bytes_per_frame)
+    };
+    if planar {
+        let list = mem.read(list.cast::<AudioBufferList<2>>());
+        frames = if list.buffers[1].data.is_null() { 0 } else {
+            frames.min(list.buffers[1].data_byte_size / format.bytes_per_frame)
+        };
+    }
+    frames
 }
 
 fn uses_planar_stereo_buffers(
@@ -226,20 +323,94 @@ const k3DMixerParam_PlaybackRate: AudioUnitParameterID = 4;
 // MARK: - Инициализация / Деинициализация AudioUnit
 // =========================================================================
 
-fn AudioUnitInitialize(env: &mut Environment, in_unit: AudioUnit) -> OSStatus {
+pub fn AudioUnitInitialize(env: &mut Environment, in_unit: AudioUnit) -> OSStatus {
     log_dbg!("AudioUnitInitialize({:?})", in_unit);
-    let run_loop = CFRunLoopGetMain(env);
-    ns_run_loop::add_audio_unit(env, run_loop, in_unit);
+    let state = audio_components::State::get(&mut env.framework_state);
+    if !state.audio_component_instances.contains_key(&in_unit) {
+        return paramErr;
+    }
+    state.initialized_units.insert(in_unit);
     0
 }
 
 fn AudioUnitUninitialize(env: &mut Environment, in_unit: AudioUnit) -> OSStatus {
     release_mic_capture(env, in_unit);
-    let run_loop = CFRunLoopGetMain(env);
-    match ns_run_loop::remove_audio_unit(env, run_loop, in_unit) {
-        Ok(_) => 0,
-        Err(_) => paramErr,
+    if audio_components::State::get(&mut env.framework_state)
+        .initialized_units
+        .remove(&in_unit)
+    {
+        0
+    } else {
+        paramErr
     }
+}
+
+/// RemoteIO callbacks run on an audio thread, independently of run-loop modes
+/// or work on the application's main thread. Use a guest thread so callbacks
+/// can use pthread synchronization without blocking the entire emulator.
+/// https://developer.apple.com/library/archive/qa/qa1715/_index.html
+fn audio_render_thread(env: &mut Environment, _: MutVoidPtr) -> MutVoidPtr {
+    // Core Audio's I/O thread has real-time importance above normal pthreads.
+    env.threads[env.current_thread].scheduling_priority = 128;
+    loop {
+        let units: Vec<_> = {
+            let state = audio_components::State::get(&mut env.framework_state);
+            state
+                .initialized_units
+                .iter()
+                .copied()
+                .filter(|unit| {
+                    state
+                        .audio_component_instances
+                        .get(unit)
+                        .is_some_and(|obj| obj.started)
+                })
+                .collect()
+        };
+        if units.is_empty() {
+            audio_components::State::get(&mut env.framework_state).render_thread_running = false;
+            return MutVoidPtr::null();
+        }
+        for unit in units {
+            if audio_components::State::get(&mut env.framework_state)
+                .initialized_units
+                .contains(&unit)
+            {
+                render_audio_unit(env, unit);
+            }
+        }
+        // Poll more frequently than one hardware slice. The OpenAL queue
+        // determines how many frames to render, so this does not alter pitch.
+        env.sleep(Duration::from_millis(5));
+    }
+}
+
+fn start_audio_render_thread(env: &mut Environment) {
+    let state = audio_components::State::get(&mut env.framework_state);
+    if state.render_thread_running {
+        return;
+    }
+    state.render_thread_running = true;
+    let function: HostFunction = &(audio_render_thread as fn(&mut Environment, _) -> _);
+    let entry = env.dyld.create_guest_function(
+        &mut env.mem,
+        "__vetus_audio_render_thread",
+        function,
+    );
+    use crate::libc::pthread::thread::{
+        pthread_attr_init, pthread_attr_setdetachstate, pthread_attr_t, pthread_create,
+        pthread_t, PTHREAD_CREATE_DETACHED,
+    };
+    let attr = env.mem.alloc(guest_size_of::<pthread_attr_t>()).cast();
+    pthread_attr_init(env, attr);
+    pthread_attr_setdetachstate(env, attr, PTHREAD_CREATE_DETACHED);
+    let thread = env.mem.alloc(guest_size_of::<pthread_t>()).cast();
+    assert_eq!(
+        pthread_create(env, thread, attr.cast_const(), entry, MutVoidPtr::null()),
+        0
+    );
+    env.mem.free(thread.cast());
+    env.mem.free(attr.cast());
 }
 
 /// Notify listeners registered for one Audio Unit property.
@@ -1291,7 +1462,7 @@ fn AudioOutputUnitStart(env: &mut Environment, ci: AudioUnit) -> OSStatus {
     0
 }
 
-/// Подготовить AudioUnit к работе в run-loop'e: завести OpenAL-источник для
+/// Подготовить AudioUnit к работе в audio-thread: завести OpenAL-источник для
 /// прямого render-callback'а (если он есть) и/или для каждой input-шины
 /// 3D-Mixer'а (если callback'и заданы через
 /// `AUGraphSetNodeInputCallback`).
@@ -1385,6 +1556,7 @@ pub fn setup_audio_unit_for_render(env: &mut Environment, ci: AudioUnit) {
         notify_audio_unit_is_running(env, ci);
     }
     sync_mic_capture(env, ci);
+    start_audio_render_thread(env);
 }
 
 fn AudioOutputUnitStop(env: &mut Environment, ci: AudioUnit) -> OSStatus {
@@ -1804,6 +1976,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
         Instant,
         AudioStreamBasicDescription,
         f64,
+        u32,
     )> = {
         let at = &mut env.framework_state.audio_toolbox;
         let hardware_sr = at.audio_session.current_hardware_sample_rate;
@@ -1842,7 +2015,10 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
                 continue;
             };
             let fmt = bus.stream_format.unwrap_or(default_format);
-            v.push((*bus_id, cb, src, last, fmt, bus.sample_time));
+            v.push((
+                *bus_id, cb, src, last, fmt, bus.sample_time,
+                obj.maximum_frames_per_slice.max(1),
+            ));
         }
         v
     };
@@ -1856,7 +2032,9 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
     );
 
     let now = Instant::now();
-    for (bus_id, callback, al_source, last_render_time, fmt, start_sample_time) in plan {
+    for (
+        bus_id, callback, al_source, last_render_time, fmt, start_sample_time, maximum_frames,
+    ) in plan {
         // Frames rendered for this bus so far; handed to the callback through
         // the `AudioTimeStamp` below and advanced by every render pass.
         let mut sample_time = start_sample_time;
@@ -1915,7 +2093,12 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
         let nominal_frames = ((env.framework_state.audio_toolbox.audio_session
             .current_hardware_io_buffer_duration as f64)
             * fmt.sample_rate as f64) as u32;
-        let mut frames = ((elapsed.as_secs_f64() * fmt.sample_rate) as u32).clamp(64, 4096);
+        // QA1533: an audio unit must not ask its input for more frames than
+        // MaximumFramesPerSlice, including after a stalled render cycle.
+        // https://developer.apple.com/library/archive/qa/qa1533/_index.html
+        let mut frames = ((elapsed.as_secs_f64() * fmt.sample_rate) as u32)
+            .clamp(64, 4096)
+            .min(maximum_frames);
         let is_planar_stereo = fmt.format_id == kAudioFormatLinearPCM
             && fmt.channels_per_frame == 2
             && fmt.format_flags & kAudioFormatFlagIsNonInterleaved != 0
@@ -1962,7 +2145,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
 
         for audio_pass in 0..render_passes {
             if audio_pass > 0 {
-                frames = nominal_frames.clamp(64, 4096);
+                frames = nominal_frames.clamp(64, 4096).min(maximum_frames);
                 buffer_size = if is_planar_stereo {
                     frames * fmt.bytes_per_frame
                 } else {
@@ -2019,7 +2202,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
                 abl.cast::<std::ffi::c_void>(),
             );
             env.mem.write(action_flags, 0u32);
-            let _: OSStatus = input_proc.call_from_host(
+            let callback_status: OSStatus = input_proc.call_from_host(
                 env,
                 (
                     input_proc_ref,
@@ -2030,6 +2213,7 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
                     abl,
                 ),
             );
+            let callback_flags: u32 = env.mem.read(action_flags);
             call_render_notifies(
                 env,
                 audio_unit,
@@ -2040,23 +2224,15 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
                 frames,
                 abl.cast::<std::ffi::c_void>(),
             );
-            sample_time += frames as f64;
-
-            let (al_fmt, _, processed) = if let Some(right) = second_buffer_data {
-                let planes = [
-                    env.mem.bytes_at(buffer_data.cast(), buffer_size),
-                    env.mem.bytes_at(right.cast(), buffer_size),
-                ];
-                let interleaved = interleave_planar_pcm(
-                    &planes,
-                    (fmt.bits_per_channel / 8) as usize,
-                )
-                .unwrap_or_default();
-                let interleaved_format = interleaved_format_for_planar_pcm(fmt);
-                decode_buffer_from_bytes(&interleaved_format, &interleaved, &[])
-            } else {
-                decode_buffer(&env.mem, &fmt, buffer_data.cast(), buffer_size, &[])
-            };
+            let render_flags = callback_flags | env.mem.read(action_flags);
+            let returned_frames = if callback_status == 0 {
+                rendered_input_frames(&env.mem, &fmt, abl, frames, is_planar_stereo, render_flags)
+            } else { 0 };
+            sample_time += returned_frames as f64;
+            let (al_fmt, _, processed) = decode_rendered_buffer_list(
+                &env.mem, fmt, abl.cast_void(), returned_frames, is_planar_stereo,
+                callback_status, render_flags,
+            );
             if processed.is_empty() {
                 // Если callback ничего не записал — прекращаем burst.
                 env.mem.free(action_flags.cast_void());
@@ -2142,6 +2318,7 @@ const AUDIO_RENDER_TARGET_DEPTH: i32 = 6;
 /// notify callbacks (see AUComponent.h).
 const kAudioUnitRenderAction_PreRender: u32 = 1 << 2;
 const kAudioUnitRenderAction_PostRender: u32 = 1 << 3;
+const kAudioUnitRenderAction_OutputIsSilence: u32 = 1 << 4;
 
 /// Run the render notifies of a unit that has no render callback of its own,
 /// such as a RemoteIO unit pulling from a mixer through a connection. Its
@@ -2155,6 +2332,7 @@ fn pump_render_notifies(
     format: &AudioStreamBasicDescription,
     last_render_time: Instant,
     sample_time: f64,
+    maximum_frames: u32,
 ) {
     let has_notifies = audio_components::State::get(&mut env.framework_state)
         .audio_component_instances
@@ -2174,7 +2352,7 @@ fn pump_render_notifies(
     if elapsed_frames < nominal_frames {
         return;
     }
-    let frames = elapsed_frames.min(4096);
+    let frames = elapsed_frames.min(4096).min(maximum_frames);
 
     // Hand over silence in the unit's format: one buffer, or one per channel
     // for non-interleaved formats.
@@ -2272,6 +2450,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         last_render_time,
         callback,
         start_sample_time,
+        maximum_frames,
     ) = {
         let at = &mut env.framework_state.audio_toolbox;
         let Some(obj) = at
@@ -2298,6 +2477,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             obj.last_render_time,
             obj.render_callback,
             obj.sample_time,
+            obj.maximum_frames_per_slice.max(1),
         )
     };
 
@@ -2357,6 +2537,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             &stream_format,
             last_render_time,
             start_sample_time,
+            maximum_frames,
         );
         if let Some(obj) = env
             .framework_state
@@ -2449,7 +2630,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             .audio_session
             .current_hardware_io_buffer_duration as f64)
         .round() as u32;
-    let frames = target_frames.clamp(64, 2048);
+    let frames = target_frames.clamp(64, 2048).min(maximum_frames);
     let planar_stereo_buffers = uses_planar_stereo_buffers(&stream_format, has_input_format);
     let bytes_per_sample = stream_format.bits_per_channel / 8;
     let bytes_per_frame = if planar_stereo_buffers {
@@ -2558,7 +2739,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             audio_buffer_list,
         );
         env.mem.write(action_flags, 0u32);
-        let _: OSStatus = input_proc.call_from_host(
+        let callback_status: OSStatus = input_proc.call_from_host(
             env,
             (
                 input_proc_ref,
@@ -2569,6 +2750,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
                 audio_buffer_list,
             ),
         );
+        let callback_flags: u32 = env.mem.read(action_flags);
         call_render_notifies(
             env,
             audio_unit,
@@ -2581,7 +2763,13 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         );
         sample_time += frames as f64;
 
+        let returned = env.mem.read(audio_buffer_list.cast::<AudioBufferList<1>>());
+        let returned_data = returned.buffers[0].data;
+        let render_flags = callback_flags | env.mem.read(action_flags);
         let wrote_interleaved_frames = planar_stereo_buffers
+            && callback_status == 0
+            && render_flags & kAudioUnitRenderAction_OutputIsSilence == 0
+            && returned_data == buffer1_data
             && env.mem.bytes_at(buffer1_data.cast(), plane_alloc_size)[buffer_size as usize..]
                 .iter()
                 .any(|&byte| byte != PLANE_SLACK_CANARY);
@@ -2600,33 +2788,10 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
                 interleaved_size,
                 &[],
             )
-        } else if planar_stereo_buffers {
-            match buffer2_data {
-                Some(buffer2_data) => {
-                    let planes = [
-                        env.mem.bytes_at(buffer1_data.cast(), buffer_size),
-                        env.mem.bytes_at(buffer2_data.cast(), buffer_size),
-                    ];
-                    let interleaved = interleave_planar_pcm(&planes, bytes_per_sample as usize)
-                        .unwrap_or_default();
-                    let interleaved_format = interleaved_format_for_planar_pcm(stream_format);
-                    decode_buffer_from_bytes(&interleaved_format, &interleaved, &[])
-                }
-                None => decode_buffer(
-                    &env.mem,
-                    &stream_format,
-                    buffer1_data.cast(),
-                    buffer_size,
-                    &[],
-                ),
-            }
         } else {
-            decode_buffer(
-                &env.mem,
-                &stream_format,
-                buffer1_data.cast(),
-                buffer_size,
-                &[],
+            decode_rendered_buffer_list(
+                &env.mem, stream_format, audio_buffer_list, frames,
+                planar_stereo_buffers, callback_status, render_flags,
             )
         };
         let output_sample_rate = if decoded_sample_rate > 0 {
@@ -2634,7 +2799,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         } else {
             sample_rate as ALsizei
         };
-        {
+        if !processed.is_empty() {
             let context = env
                 .framework_state
                 .audio_toolbox
@@ -2814,6 +2979,106 @@ mod tests {
     #[test]
     fn planar_pcm_rejects_mismatched_plane_lengths() {
         assert_eq!(interleave_planar_pcm(&[&[1, 2], &[3]], 1), None);
+    }
+
+    #[test]
+    fn render_callback_replaced_planes_are_decoded_and_short_buffers_are_padded() {
+        // Upstream comparison (it currently reads the originally supplied buffer):
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/audio_toolbox/audio_unit.rs
+        // Apple's mutable-list contract is cited on decode_rendered_buffer_list.
+        use super::{decode_rendered_buffer_list, AudioBuffer, AudioBufferList};
+        let mut mem = crate::mem::Mem::new();
+        mem.set_null_segment_size(0x1000);
+        let format = AudioStreamBasicDescription {
+            sample_rate: 44_100.0, format_id: kAudioFormatLinearPCM,
+            format_flags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsNonInterleaved,
+            bytes_per_packet: 2, frames_per_packet: 1, bytes_per_frame: 2,
+            channels_per_frame: 2, bits_per_channel: 16, _reserved: 0,
+        };
+        let supplied = [mem.alloc(8), mem.alloc(8)];
+        let list = mem.alloc_and_write(AudioBufferList::<2> {
+            number_buffers: 2,
+            buffers: supplied.map(|data| AudioBuffer {
+                number_channels: 1, data_byte_size: 8, data,
+            }),
+        });
+        let left = mem.alloc(6);
+        let right = mem.alloc(4);
+        mem.bytes_at_mut(left.cast(), 6).copy_from_slice(&[0x34, 0x12, 0xfe, 0xff, 0x7f, 0x7f]);
+        mem.bytes_at_mut(right.cast(), 4).copy_from_slice(&[0xcc, 0xed, 0x02, 0x00]);
+        // Model the callback replacing the ABL pointers with its own storage.
+        // The extra left-plane sample is beyond mDataByteSize and must be ignored.
+        mem.write(list, AudioBufferList::<2> {
+            number_buffers: 2,
+            buffers: [left, right].map(|data| AudioBuffer {
+                number_channels: 1, data_byte_size: 4, data,
+            }),
+        });
+        let (al_format, rate, decoded) = decode_rendered_buffer_list(
+            &mem, format, list.cast_void(), 4, true, 0, 0,
+        );
+        assert_eq!(al_format, AL_FORMAT_STEREO16);
+        assert_eq!(rate, 44_100);
+        let samples: Vec<_> = decoded.chunks_exact(2)
+            .map(|s| i16::from_le_bytes([s[0], s[1]])).collect();
+        assert_eq!(samples, [0x1234, -0x1234, -2, 2, 0, 0, 0, 0]);
+        // An input bus consumes the returned segment before pulling again;
+        // unlike a direct output render, it must not add a padded silent tail.
+        let input_frames = super::rendered_input_frames(&mem, &format, list.cast_void(), 4, true, 0);
+        assert_eq!(input_frames, 2);
+        let (_, _, input_pcm) = decode_rendered_buffer_list(
+            &mem, format, list.cast_void(), input_frames, true, 0, 0,
+        );
+        let mut joined_segments = input_pcm.clone();
+        joined_segments.extend_from_slice(&input_pcm);
+        assert_eq!(joined_segments, [
+            0x34, 0x12, 0xcc, 0xed, 0xfe, 0xff, 2, 0,
+            0x34, 0x12, 0xcc, 0xed, 0xfe, 0xff, 2, 0,
+        ]);
+        for data in supplied {
+            assert_eq!(mem.bytes_at(data.cast(), 8), &[0; 8]);
+        }
+        assert_eq!(mem.bytes_at(left.cast(), 6), &[0x34, 0x12, 0xfe, 0xff, 0x7f, 0x7f]);
+        let (_, _, silent) = decode_rendered_buffer_list(
+            &mem, format, list.cast_void(), 4, true, 0,
+            super::kAudioUnitRenderAction_OutputIsSilence,
+        );
+        assert_eq!(silent, [0; 16]);
+        let (_, _, failed) = decode_rendered_buffer_list(
+            &mem, format, list.cast_void(), 4, true, -50, 0,
+        );
+        assert!(failed.is_empty());
+        // This consuming helper is shared by the AUGraph bus and direct paths.
+        let mut interleaved = format;
+        interleaved.format_flags &= !kAudioFormatFlagIsNonInterleaved;
+        interleaved.bytes_per_frame = 4;
+        interleaved.bytes_per_packet = 4;
+        let mono_list = mem.alloc_and_write(AudioBufferList::<1> {
+            number_buffers: 1,
+            buffers: [AudioBuffer { number_channels: 2, data_byte_size: 4, data: left }],
+        });
+        let (_, _, decoded) = decode_rendered_buffer_list(
+            &mem, interleaved, mono_list.cast_void(), 2, false, 0, 0,
+        );
+        assert_eq!(decoded, [0x34, 0x12, 0xfe, 0xff, 0, 0, 0, 0]);
+        mem.write(list, AudioBufferList::<2> {
+            number_buffers: 2,
+            buffers: [left, right].map(|_| AudioBuffer {
+                number_channels: 1, data_byte_size: 0, data: crate::mem::Ptr::null(),
+            }),
+        });
+        let no_input_frames = super::rendered_input_frames(
+            &mem, &format, list.cast_void(), 1024, true, 0,
+        );
+        assert_eq!(no_input_frames, 0);
+        let (_, _, no_input) = decode_rendered_buffer_list(
+            &mem, format, list.cast_void(), no_input_frames, true, 0, 0,
+        );
+        assert!(no_input.is_empty());
+        assert_eq!(super::rendered_input_frames(
+            &mem, &format, list.cast_void(), 1024, true,
+            super::kAudioUnitRenderAction_OutputIsSilence,
+        ), 1024);
     }
 
     #[test]

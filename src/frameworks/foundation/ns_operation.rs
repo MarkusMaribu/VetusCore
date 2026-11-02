@@ -9,6 +9,9 @@ use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr, SEL,
 };
+use crate::Environment;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum OperationState {
@@ -52,9 +55,129 @@ struct NSOperationQueueHostObject {
     suspended: bool,
     max_concurrent_operations: i32,
     name: id,
+    main_queue: bool,
+    worker_running: bool,
+    owns_pending_reference: bool,
 }
 
 impl HostObject for NSOperationQueueHostObject {}
+
+#[derive(Default)]
+pub struct State {
+    main_queue: Option<id>,
+    current_queues: HashMap<usize, id>,
+}
+
+fn start_queue_driver(env: &mut Environment, queue: id) {
+    let host = env.objc.borrow_mut::<NSOperationQueueHostObject>(queue);
+    if host.worker_running || host.suspended || host.max_concurrent_operations == 0 {
+        return;
+    }
+    host.worker_running = true;
+    let main = host.main_queue;
+    let selector = env
+        .objc
+        .lookup_selector("_touchHLE_runOperationQueue:")
+        .unwrap();
+    if main {
+        () = msg![env; queue performSelectorOnMainThread:selector withObject:nil waitUntilDone:false];
+    } else {
+        super::ns_thread::detach_new_thread_inner(env, selector, queue, nil, false);
+    }
+}
+
+/// Operations remain queued until finished, including while suspended. A
+/// background queue runs on a guest worker; the main queue uses its run loop.
+/// https://developer.apple.com/documentation/foundation/operationqueue
+fn run_queue(env: &mut Environment, queue: id) {
+    let mut idle_since = None;
+    loop {
+        let (operations, suspended, main) = {
+            let host = env.objc.borrow::<NSOperationQueueHostObject>(queue);
+            (
+                host.operations,
+                host.suspended || host.max_concurrent_operations == 0,
+                host.main_queue,
+            )
+        };
+        let count: usize = msg![env; operations count];
+        // Reuse a background worker across sensor samples instead of creating
+        // a guest thread for every reading. Retire it after a short idle spell.
+        if !suspended && !main && count == 0 {
+            let idle = idle_since.get_or_insert_with(Instant::now);
+            if idle.elapsed() < Duration::from_millis(100) {
+                env.sleep(Duration::from_millis(5));
+                continue;
+            }
+        } else {
+            idle_since = None;
+        }
+        if suspended || count == 0 {
+            let host = env.objc.borrow_mut::<NSOperationQueueHostObject>(queue);
+            host.worker_running = false;
+            let release_pending = count == 0 && std::mem::take(&mut host.owns_pending_reference);
+            if release_pending {
+                release(env, queue);
+            }
+            return;
+        }
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let snapshot: id = msg![env; operations copy];
+        let mut selected = nil;
+        let mut priority = i32::MIN;
+        for i in 0..count {
+            let op: id = msg![env; snapshot objectAtIndex:i];
+            if msg![env; op isFinished] {
+                () = msg![env; operations removeObject:op];
+            } else if msg![env; op isReady] {
+                let p: i32 = msg![env; op queuePriority];
+                if selected == nil || p > priority {
+                    selected = op;
+                    priority = p;
+                }
+            }
+        }
+        if selected != nil {
+            let thread = env.current_thread;
+            let previous = env
+                .framework_state
+                .foundation
+                .ns_operation
+                .current_queues
+                .insert(thread, queue);
+            () = msg![env; selected start];
+            if let Some(previous) = previous {
+                env.framework_state
+                    .foundation
+                    .ns_operation
+                    .current_queues
+                    .insert(thread, previous);
+            } else {
+                env.framework_state
+                    .foundation
+                    .ns_operation
+                    .current_queues
+                    .remove(&thread);
+            }
+            if msg![env; selected isFinished] {
+                () = msg![env; operations removeObject:selected];
+            }
+        }
+        release(env, snapshot);
+        release(env, pool);
+        if selected == nil {
+            if main {
+                let selector = env
+                    .objc
+                    .lookup_selector("_touchHLE_runOperationQueue:")
+                    .unwrap();
+                () = msg![env; queue performSelector:selector withObject:nil afterDelay:0.001f64];
+                return;
+            }
+            env.sleep(Duration::from_millis(1));
+        }
+    }
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -157,7 +280,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let completion = env.objc.borrow::<NSOperationHostObject>(this).completion_block;
     if completion != nil {
         // Invoke the block
-        let _: () = msg![env; completion invoke];
+        crate::libc::dispatch::call_void_block(env, completion.cast_void());
     }
 }
 
@@ -279,13 +402,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Completion block
 
 - (())setCompletionBlock:(id)block {
-    let old_block = env.objc.borrow::<NSOperationHostObject>(this).completion_block;
-    release(env, old_block);
-
-    if block != nil {
-        retain(env, block);
-    }
-    env.objc.borrow_mut::<NSOperationHostObject>(this).completion_block = block;
+    let block: id = if block != nil { msg![env; block copy] } else { nil };
+    let old = std::mem::replace(&mut env.objc.borrow_mut::<NSOperationHostObject>(this).completion_block, block);
+    release(env, old);
 }
 
 - (id)completionBlock {
@@ -412,7 +531,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if block != nil {
         () = msg![env; op addExecutionBlock:block];
     }
-    op
+    autorelease(env, op)
 }
 
 - (())addExecutionBlock:(id)block {
@@ -445,8 +564,9 @@ pub const CLASSES: ClassExports = objc_classes! {
             .borrow::<NSOperationHostObject>(this)
             .execution_blocks
     };
-    retain(env, block);
-    () = msg![env; blocks addObject:block];
+    let copied: id = msg![env; block copy];
+    () = msg![env; blocks addObject:copied];
+    release(env, copied);
 }
 
 - (id)executionBlocks {
@@ -484,7 +604,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
         let block: id = msg![env; blocks objectAtIndex:i];
         if block != nil {
-            let _: () = msg![env; block invoke];
+            crate::libc::dispatch::call_void_block(env, block.cast_void());
         }
     }
 }
@@ -499,18 +619,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)mainQueue {
-    // Return a singleton main queue
-    // In a real implementation, this would be a true singleton
-    let queue: id = msg_class![env; NSOperationQueue alloc];
-    let queue: id = msg![env; queue init];
-    let name: id = get_static_str(env, "NSOperationQueue Main Queue");
-    () = msg![env; queue setName:name];
-    autorelease(env, queue)
+    if let Some(queue) = env.framework_state.foundation.ns_operation.main_queue {
+        return queue;
+    }
+    let queue: id = msg![env; this new];
+    env.objc.borrow_mut::<NSOperationQueueHostObject>(queue).main_queue = true;
+    env.framework_state.foundation.ns_operation.main_queue = Some(queue);
+    queue
 }
 
 + (id)currentQueue {
-    // In HLE, we don't track thread-local queues, so return nil
-    nil
+    env.framework_state.foundation.ns_operation.current_queues
+        .get(&env.current_thread).copied().unwrap_or_else(|| {
+            if env.current_thread == 0 { msg![env; this mainQueue] } else { nil }
+        })
 }
 
 - (id)init {
@@ -536,27 +658,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Adding operations
 
 - (())addOperation:(id)op {
-    if op == nil {
-        return;
-    }
-
-    retain(env, op);
-
+    if op == nil { return; }
     let operations = env.objc.borrow::<NSOperationQueueHostObject>(this).operations;
     () = msg![env; operations addObject:op];
-
-    // Execute immediately if not suspended
-    let suspended = env.objc.borrow::<NSOperationQueueHostObject>(this).suspended;
-    if !suspended {
-        let is_ready: bool = msg![env; op isReady];
-        if is_ready {
-            () = msg![env; op start];
-        }
+    let host = env.objc.borrow_mut::<NSOperationQueueHostObject>(this);
+    if !host.owns_pending_reference {
+        host.owns_pending_reference = true;
+        retain(env, this);
     }
+    start_queue_driver(env, this);
+}
 
-    // Remove from queue after execution
-    () = msg![env; operations removeObject:op];
-    release(env, op);
+- (())_touchHLE_runOperationQueue:(id)_unused {
+    run_queue(env, this);
 }
 
 - (())addOperations:(id)ops waitUntilFinished:(bool)wait {
@@ -588,25 +702,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setSuspended:(bool)suspended {
     env.objc.borrow_mut::<NSOperationQueueHostObject>(this).suspended = suspended;
-
-    // If resuming, start ready operations
-    if !suspended {
-        let operations = env.objc.borrow::<NSOperationQueueHostObject>(this).operations;
-        let count: usize = msg![env; operations count];
-
-        for i in 0..count {
-            let op: id = msg![env; operations objectAtIndex:i];
-            if op != nil {
-                let is_ready: bool = msg![env; op isReady];
-                let is_executing: bool = msg![env; op isExecuting];
-                let is_finished: bool = msg![env; op isFinished];
-
-                if is_ready && !is_executing && !is_finished {
-                    () = msg![env; op start];
-                }
-            }
-        }
-    }
+    if !suspended { start_queue_driver(env, this); }
 }
 
 - (bool)isSuspended {
@@ -615,6 +711,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setMaxConcurrentOperationCount:(i32)count {
     env.objc.borrow_mut::<NSOperationQueueHostObject>(this).max_concurrent_operations = count;
+    if count != 0 { start_queue_driver(env, this); }
 }
 
 - (i32)maxConcurrentOperationCount {
@@ -638,9 +735,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Waiting
 
 - (())waitUntilAllOperationsAreFinished {
-    // In HLE, operations are synchronous, so this is effectively a no-op
-    // All operations added to the queue have already finished by the time
-    // addOperation: returns
+    loop {
+        let count: usize = msg![env; this operationCount];
+        if count == 0 { break; }
+        env.sleep(Duration::from_millis(1));
+    }
 }
 
 // MARK: - Properties

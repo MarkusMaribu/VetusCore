@@ -14,7 +14,6 @@ use crate::dyld::{ConstantExports, HostConstant};
 use crate::environment::{ThreadBlock, ThreadId};
 use crate::frameworks::audio_toolbox::audio_queue::{handle_audio_queue, AudioQueueRef};
 use crate::frameworks::audio_toolbox::audio_services::tick_system_sound_completions;
-use crate::frameworks::audio_toolbox::audio_unit::{render_audio_unit, AudioUnit};
 use crate::frameworks::core_animation::ca_transaction;
 use crate::frameworks::core_foundation::cf_run_loop::{
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoopRef,
@@ -57,7 +56,6 @@ pub(crate) struct NSRunLoopHostObject {
     waiting: bool,
     selector_objects: VecDeque<ObjectSelectorSource>,
     next_perform_sequence: u64,
-    audio_units: Vec<AudioUnit>,
     /// Weak reference. Audio queue must remove itself when destroyed (TODO).
     /// They are in no particular order.
     audio_queues: Vec<AudioQueueRef>,
@@ -511,28 +509,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 };
 
 /// For use by Audio Toolbox.
-pub fn add_audio_unit(env: &mut Environment, run_loop: id, unit: AudioUnit) {
-    env.objc
-        .borrow_mut::<NSRunLoopHostObject>(run_loop)
-        .audio_units
-        .push(unit);
-}
-
-/// For use by Audio Toolbox.
-pub fn remove_audio_unit(env: &mut Environment, run_loop: id, unit: AudioUnit) -> Result<(), ()> {
-    let units = &mut env
-        .objc
-        .borrow_mut::<NSRunLoopHostObject>(run_loop)
-        .audio_units;
-    if let Some(unit_idx) = units.iter().position(|&item| item == unit) {
-        units.remove(unit_idx);
-        Ok(())
-    } else {
-        Err(())
-    }
-}
-
-/// For use by Audio Toolbox.
 /// TODO: Honor the requested callback mode: NewOutput treats explicit modes
 /// as common, while NewInput currently ignores the mode argument.
 /// TODO: Maybe replace this with a `CFRunLoopObserver` or some other generic
@@ -706,7 +682,6 @@ fn run_loop_body(
     // environment or to lock the object. Re-used each iteration for efficiency.
     let mut timers_tmp = Vec::new();
     let mut audio_queues_tmp = Vec::new();
-    let mut audio_units_tmp = Vec::new();
 
     fn limit_sleep_time(current: &mut Option<Instant>, new: Option<Instant>) {
         if let Some(new) = new {
@@ -794,19 +769,6 @@ fn run_loop_body(
 
         for audio_queue in audio_queues_tmp.drain(..) {
             handle_audio_queue(env, audio_queue);
-        }
-
-        // TODO: not clear if audio units should be processed in the run loop
-        assert!(audio_units_tmp.is_empty());
-        {
-            let state = env.objc.borrow::<NSRunLoopHostObject>(run_loop);
-            if is_main_run_loop {
-                audio_units_tmp.extend_from_slice(&state.audio_units);
-            }
-        }
-
-        for audio_unit in audio_units_tmp.drain(..) {
-            render_audio_unit(env, audio_unit);
         }
 
         // Main-thread requests without an explicit mode use common modes.
@@ -997,7 +959,6 @@ pub(crate) fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id:
             waiting: false,
             selector_objects: VecDeque::new(),
             next_perform_sequence: 0,
-            audio_units: Vec::new(),
             audio_queues: Vec::new(),
             independent_audio_queues: Vec::new(),
             timers: Vec::new(),

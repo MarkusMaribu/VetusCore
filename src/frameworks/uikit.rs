@@ -26,6 +26,7 @@ const FUNCTIONS: FunctionExports = &[
 ];
 
 pub mod ns_paragraph_style;
+pub(crate) mod native_ui;
 pub mod ui_accelerometer;
 pub mod ui_action_sheet;
 pub mod ui_activity;
@@ -990,6 +991,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_view::ui_web_view::CLASSES,
         ui_view::ui_window::CLASSES,
         ui_view_controller::CLASSES,
+        ui_view_controller::modal_transition::CLASSES,
         ui_page_view_controller::CLASSES,
         ui_view_controller::ui_navigation_controller::CLASSES,
     ],
@@ -1016,6 +1018,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 
 #[derive(Default)]
 pub struct State {
+    native_ui: native_ui::State,
     ui_accelerometer: ui_accelerometer::State,
     ui_application: ui_application::State,
     ui_color: ui_color::State,
@@ -1085,22 +1088,22 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
                 // treated as a real shutdown.
                 // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationwillresignactive(_:)
                 log_dbg!("Handling app-will-resign-active event.");
-                ui_application::handle_will_resign_active(env);
+                ui_application::dispatch_lifecycle(env, ui_application::handle_will_resign_active);
             }
             Event::AppDidEnterBackground => {
                 // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationdidenterbackground(_:)
                 log_dbg!("Handling app-did-enter-background event.");
-                ui_application::handle_did_enter_background(env);
+                ui_application::dispatch_lifecycle(env, ui_application::handle_did_enter_background);
             }
             Event::AppWillEnterForeground => {
                 // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationwillenterforeground(_:)
                 log_dbg!("Handling app-will-enter-foreground event.");
-                ui_application::handle_will_enter_foreground(env);
+                ui_application::dispatch_lifecycle(env, ui_application::handle_will_enter_foreground);
             }
             Event::AppDidBecomeActive => {
                 // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationdidbecomeactive(_:)
                 log_dbg!("Handling app-did-become-active event.");
-                ui_application::handle_did_become_active(env);
+                ui_application::dispatch_lifecycle(env, ui_application::handle_did_become_active);
             }
             Event::AppWillTerminate => {
                 log_dbg!("Handling app-will-terminate event.");
@@ -1117,6 +1120,7 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
                     log!("Ignoring EnterDebugger event: no debugger connected.");
                 }
             }
+            Event::UIKitAction(action) => native_ui::handle_action(env, action),
             Event::TextInput(text_event) => {
                 let responder = env.framework_state.uikit.ui_responder.first_responder;
                 if !responder.is_null() {
@@ -1136,7 +1140,7 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
                                 ui_view::ui_control::ui_text_field::handle_text(env, responder, text)
                             }
                             TextInputEvent::Backspace => {
-                                ui_view::ui_control::ui_text_field::handle_backspace(env, responder)
+                                let _: () = msg![env; responder deleteBackward];
                             }
                             TextInputEvent::Return => {
                                 ui_view::ui_control::ui_text_field::handle_return(env, responder)

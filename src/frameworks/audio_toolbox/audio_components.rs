@@ -6,7 +6,7 @@
  */
 //! `AudioComponent.h` (Audio Component Services)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::abi::GuestFunction;
@@ -96,6 +96,8 @@ impl Default for MixerBusState {
 
 #[derive(Default)]
 pub struct State {
+    pub initialized_units: HashSet<AudioComponentInstance>,
+    pub render_thread_running: bool,
     pub audio_component: AudioComponent,
     pub audio_component_instances:
         HashMap<AudioComponentInstance, AudioComponentInstanceHostObject>,
@@ -383,6 +385,7 @@ fn AudioComponentInstanceDispose(
 
     super::audio_unit::release_mic_capture(env, in_instance);
     let state = State::get(&mut env.framework_state);
+    state.initialized_units.remove(&in_instance);
     state.audio_component_instances.remove(&in_instance);
     state
         .connections

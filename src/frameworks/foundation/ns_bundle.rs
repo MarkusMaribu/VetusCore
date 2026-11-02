@@ -9,7 +9,8 @@
 use super::{ns_string, NSNotFound, NSRange, NSUInteger};
 use crate::bundle::Bundle;
 use crate::frameworks::core_foundation::cf_bundle::{
-    CFBundleCopyBundleLocalizations, CFBundleCopyPreferredLocalizationsFromArray,
+    CFBundleCopyBundleLocalizations, CFBundleCopyLocalizationsForPreferences,
+    CFBundleCopyPreferredLocalizationsFromArray,
 };
 use crate::frameworks::foundation::ns_string::{
     from_rust_string, NSUTF16StringEncoding, NSUTF8StringEncoding,
@@ -20,28 +21,9 @@ use crate::objc::{
     NSZonePtr,
 };
 use crate::Environment;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-// Should be ISO 639-1 (or ISO 639-2) compliant
-// Legacy projects use language names while newer ones use language code lprojs
-const LANG_ID_TO_LANG_PROJ: &[(&str, &[&str])] = &[
-    ("da", &["Danish.lproj", "da.lproj"]),
-    ("nl", &["Dutch.lproj", "nl.lproj"]),
-    ("en", &["English.lproj", "en.lproj"]),
-    ("fi", &["Finnish.lproj", "fi.lproj"]),
-    ("fr", &["French.lproj", "fr.lproj"]),
-    ("de", &["German.lproj", "de.lproj"]),
-    ("it", &["Italian.lproj", "it.lproj"]),
-    ("ja", &["Japanese.lproj", "ja.lproj"]),
-    ("ko", &["Korean.lproj", "ko.lproj"]),
-    ("no", &["Norwegian.lproj", "no.lproj"]),
-    ("pt", &["Portuguese.lproj", "pt.lproj"]),
-    ("ru", &["Russian.lproj", "ru.lproj"]),
-    ("zh", &["Chinese.lproj", "zh.lproj"]),
-    ("es", &["Spanish.lproj", "es.lproj"]),
-    ("sv", &["Swedish.lproj", "sv.lproj"]),
-    ("tr", &["Turkish.lproj", "tr.lproj"]),
-];
+pub(crate) mod localization;
 
 #[derive(Default)]
 pub struct State {
@@ -197,57 +179,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)pathForResource:(id)name          // NSString*
                ofType:(id)extension     // NSString*
           inDirectory:(id)directory {   // NSString*
-    let path = path_for_resource_helper(env, this, name, nil, directory, extension);
-    if path != nil {
-        return path;
-    }
-    // Try preferred languages in order.
-    let langs: id = msg_class![env; NSLocale preferredLanguages];
-    let lang_count: NSUInteger = msg![env; langs count];
-    let mut unknown_codes = HashSet::new();
-    for i in 0..lang_count {
-        let lang_code: id = msg![env; langs objectAtIndex:i];
-        let lang_code_str = ns_string::to_rust_string(env, lang_code);
-        if let Some(&(_, lprojs)) = LANG_ID_TO_LANG_PROJ
-            .iter()
-            .find(|&&(code, _)| code == lang_code_str)
-        {
-            for lproj in lprojs {
-                let lproj_ns: id = ns_string::get_static_str(env, lproj);
-                let localized_path =
-                    path_for_resource_helper(env, this, name, lproj_ns, directory, extension);
-                if localized_path != nil {
-                    return localized_path;
-                }
-            }
-        } else {
-            unknown_codes.insert(lang_code_str.into_owned());
-        }
-    }
-    if !unknown_codes.is_empty() {
-        log!(
-            "TODO: language codes {:?} aren't mapped to a language name, falling back to English",
-            unknown_codes
-        );
-    }
-    // Fallback to English.
-    for lproj in ["English.lproj", "en.lproj"] {
-        let lproj_ns: id = ns_string::get_static_str(env, lproj);
-        let path = path_for_resource_helper(env, this, name, lproj_ns, directory, extension);
-        if path != nil {
-            return path;
-        }
-    }
-    // Base.lproj is Apple's Base internationalization fallback used by
-    // storyboards and other resources that don't have a per-language copy.
-    {
-        let lproj_ns: id = ns_string::get_static_str(env, "Base.lproj");
-        let path = path_for_resource_helper(env, this, name, lproj_ns, directory, extension);
-        if path != nil {
-            return path;
-        }
-    }
-    nil
+    let main: id = msg_class![env; NSBundle mainBundle];
+    resource_path(env, main, name, extension, directory)
 }
 
 + (id)allBundles {
@@ -274,9 +207,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)preferredLocalizationsFromArray:(id)localizations_array
-                       forPreferences:(id)_locale_identifiers_array {
-    // Ignore the explicit preferences list and fall back to the system default.
-    let preferred = CFBundleCopyPreferredLocalizationsFromArray(env, localizations_array);
+                       forPreferences:(id)locale_identifiers_array {
+    let preferred = CFBundleCopyLocalizationsForPreferences(env, localizations_array, locale_identifiers_array);
     autorelease(env, preferred)
 }
 
@@ -661,57 +593,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)pathForResource:(id)name          // NSString*
                ofType:(id)extension     // NSString*
           inDirectory:(id)directory {   // NSString*
-    let path = path_for_resource_helper(env, this, name, nil, directory, extension);
-    if path != nil {
-        return path;
-    }
-    // Try preferred languages in order.
-    let langs: id = msg_class![env; NSLocale preferredLanguages];
-    let lang_count: NSUInteger = msg![env; langs count];
-    let mut unknown_codes = HashSet::new();
-    for i in 0..lang_count {
-        let lang_code: id = msg![env; langs objectAtIndex:i];
-        let lang_code_str = ns_string::to_rust_string(env, lang_code);
-        if let Some(&(_, lprojs)) = LANG_ID_TO_LANG_PROJ
-            .iter()
-            .find(|&&(code, _)| code == lang_code_str)
-        {
-            for lproj in lprojs {
-                let lproj_ns: id = ns_string::get_static_str(env, lproj);
-                let localized_path =
-                    path_for_resource_helper(env, this, name, lproj_ns, directory, extension);
-                if localized_path != nil {
-                    return localized_path;
-                }
-            }
-        } else {
-            unknown_codes.insert(lang_code_str.into_owned());
-        }
-    }
-    if !unknown_codes.is_empty() {
-        log!(
-            "TODO: language codes {:?} aren't mapped to a language name, falling back to English",
-            unknown_codes
-        );
-    }
-    // Fallback to English.
-    for lproj in ["English.lproj", "en.lproj"] {
-        let lproj_ns: id = ns_string::get_static_str(env, lproj);
-        let path = path_for_resource_helper(env, this, name, lproj_ns, directory, extension);
-        if path != nil {
-            return path;
-        }
-    }
-    // Base.lproj is Apple's Base internationalization fallback used by
-    // storyboards and other resources that don't have a per-language copy.
-    {
-        let lproj_ns: id = ns_string::get_static_str(env, "Base.lproj");
-        let path = path_for_resource_helper(env, this, name, lproj_ns, directory, extension);
-        if path != nil {
-            return path;
-        }
-    }
-    nil
+    resource_path(env, this, name, extension, directory)
 }
 
 - (id)pathForResource:(id)name        // NSString*
@@ -920,7 +802,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)preferredLocalizations {
     let loc_array = CFBundleCopyBundleLocalizations(env, this);
-    let preferred = CFBundleCopyPreferredLocalizationsFromArray(env, loc_array);
+    let languages: id = msg_class![env; NSLocale preferredLanguages];
+    let preferences: id = msg_class![env; NSMutableArray arrayWithArray:languages];
+    let development: id = msg![env; this developmentLocalization];
+    () = msg![env; preferences addObject:development];
+    let preferred = CFBundleCopyLocalizationsForPreferences(env, loc_array, preferences);
+    release(env, loc_array);
     autorelease(env, preferred)
 }
 
@@ -1074,6 +961,66 @@ fn localized_info_dictionary(env: &mut Environment, bundle: id) -> id {
 // MARK: - path_for_resource_helper
 // =========================================================================
 
+/// Global assets take precedence; translations follow user preferences,
+/// then the bundle development language. Never scan arbitrary .lproj trees.
+/// https://developer.apple.com/library/archive/documentation/CoreFoundation/Conceptual/CFBundles/AccessingaBundlesContents/AccessingaBundlesContents.html
+/// https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/foundation/ns_bundle.rs
+fn resource_path(env: &mut Environment, bundle: id, name: id, extension: id, directory: id) -> id {
+    let global = path_for_resource_helper(env, bundle, name, nil, directory, extension);
+    if global != nil {
+        return global;
+    }
+    let array = CFBundleCopyBundleLocalizations(env, bundle);
+    let count: NSUInteger = msg![env; array count];
+    let root: id = msg![env; bundle resourcePath];
+    let root = ns_string::to_rust_string(env, root).into_owned();
+    let mut available = Vec::new();
+    for i in 0..count {
+        let value: id = msg![env; array objectAtIndex:i];
+        let language = ns_string::to_rust_string(env, value).into_owned();
+        // Manually handled languages in Info.plist need not have .lproj assets.
+        if env.fs.is_dir(crate::fs::GuestPath::new(&format!(
+            "{root}/{language}.lproj"
+        ))) {
+            available.push(language);
+        }
+    }
+    release(env, array);
+    let languages: id = msg_class![env; NSLocale preferredLanguages];
+    let count: NSUInteger = msg![env; languages count];
+    let mut preferences = Vec::new();
+    for i in 0..count {
+        let value: id = msg![env; languages objectAtIndex:i];
+        preferences.push(ns_string::to_rust_string(env, value).into_owned());
+    }
+    let development: id = msg![env; bundle developmentLocalization];
+    let development = ns_string::to_rust_string(env, development).into_owned();
+    preferences.push(development.clone());
+    let mut selected = localization::preferred(&available, &preferences);
+    if selected.is_empty() && !available.is_empty() {
+        selected.push(0);
+    }
+    for index in localization::preferred(&available, &[development]) {
+        if !selected.contains(&index) {
+            selected.push(index);
+        }
+    }
+    let mut folders: Vec<String> = selected
+        .into_iter()
+        .map(|i| format!("{}.lproj", available[i]))
+        .collect();
+    folders.push("Base.lproj".to_string());
+    for folder in folders {
+        let lproj = from_rust_string(env, folder);
+        let path = path_for_resource_helper(env, bundle, name, lproj, directory, extension);
+        release(env, lproj);
+        if path != nil {
+            return path;
+        }
+    }
+    nil
+}
+
 fn path_for_resource_helper(
     env: &mut Environment,
     bundle: id,
@@ -1138,6 +1085,10 @@ fn path_for_resource_helper(
     let file_exists: bool = msg![env; file_manager fileExistsAtPath:path];
     if file_exists {
         return path;
+    }
+
+    if lproj != nil {
+        return nil;
     }
 
     // Unity iOS players keep their serialized data files in a sibling Data
@@ -1236,7 +1187,7 @@ fn path_for_resource_helper(
                 };
                 // Collect first so the env.fs borrow ends before we
                 // recurse into ns_string / msg!.
-                let entries: Vec<(String, bool)> = entries
+                let mut entries: Vec<(String, bool)> = entries
                     .map(|(name, ty)| {
                         (
                             name.to_owned(),
@@ -1244,10 +1195,15 @@ fn path_for_resource_helper(
                         )
                     })
                     .collect();
+                entries.sort();
                 for (entry, is_dir) in entries {
                     let full = format!("{}/{}", dir, entry);
                     if is_dir {
-                        stack.push(full);
+                        // Translations are selected by resource_path below.
+                        // HashMap traversal must not select a random .lproj.
+                        if !localization::is_localization_directory(&entry) {
+                            stack.push(full);
+                        }
                     } else if entry.to_lowercase() == wanted {
                         return ns_string::from_rust_string(env, full);
                     }
@@ -1318,6 +1274,12 @@ fn load_strings_as_standard_format(env: &mut Environment, dict_url: id) -> id {
         }
     };
 
+    let result = parse_strings_table(env, strings_str, res);
+    release(env, strings_str);
+    result
+}
+
+fn parse_strings_table(env: &mut Environment, strings_str: id, res: id) -> id {
     let comment_start = ns_string::get_static_str(env, "/*");
     let line_comment_start = ns_string::get_static_str(env, "//");
     let newline = ns_string::get_static_str(env, "
@@ -1329,13 +1291,20 @@ fn load_strings_as_standard_format(env: &mut Environment, dict_url: id) -> id {
     let null_ptr: MutPtr<id> = Ptr::null();
 
     let scanner: id = msg_class![env; NSScanner scannerWithString:strings_str];
-    release(env, strings_str);
     while !msg![env; scanner isAtEnd] {
         // `//` comments run to the end of the line (Apple's .strings format
         // allows both comment styles).
         loop {
             if msg![env; scanner scanString:line_comment_start intoString:null_ptr] {
+                // An empty // comment ends at this newline. The scanner's
+                // default whitespace skipping would jump over it and consume
+                // the first entry of the following line as comment text.
+                let skipped: id = msg![env; scanner charactersToBeSkipped];
+                retain(env, skipped);
+                () = msg![env; scanner setCharactersToBeSkipped:nil];
                 let _: bool = msg![env; scanner scanUpToString:newline intoString:null_ptr];
+                () = msg![env; scanner setCharactersToBeSkipped:skipped];
+                release(env, skipped);
             } else if msg![env; scanner scanString:comment_start intoString:null_ptr] {
                 // Assume no nested comments!
                 let _: bool =
@@ -1445,4 +1414,97 @@ fn scan_quoted_sanitized(env: &mut Environment, scanner: id) -> id {
         log_dbg!("scan_quoted_sanitized: unhandled backslash in token");
     }
     res
+}
+
+#[cfg(test)]
+mod strings_comment_tests {
+    use super::*;
+
+    #[test]
+    fn resource_language_follows_preferences_instead_of_recursive_scan_order() {
+        // This reproduces iGunPro's random-language lookup without its IPA.
+        // No CFBundleLocalizations key: languages must come from .lproj dirs.
+        // https://developer.apple.com/library/archive/documentation/CoreFoundation/Conceptual/CFBundles/AccessingaBundlesContents/AccessingaBundlesContents.html
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = std::env::temp_dir().join(format!(
+            "vetus_language_{}_{unique}.app",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        std::fs::write(
+            fixture.join("Info.plist"),
+            br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>CFBundleIdentifier</key><string>org.touchhle.language-test</string>
+            <key>CFBundleName</key><string>LanguageTest</string>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            </dict></plist>"#,
+        )
+        .unwrap();
+        for language in ["fr", "zh-Hans", "en", "es", "hi", "ja"] {
+            let folder = fixture.join(format!("{language}.lproj"));
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::write(folder.join("LanguageProbe.txt"), language).unwrap();
+        }
+        for (language, expected) in [
+            ("en", "en"),
+            ("es", "es"),
+            ("zh", "zh-Hans"),
+            ("hi", "hi"),
+            ("ja", "ja"),
+            ("es-MX", "es"),
+            ("ar", "en"),
+        ] {
+            let mut environment = crate::environment::touch_test_environment();
+            let env = &mut environment;
+            let (bundle, fs) = Bundle::new_bundle_and_fs_from_host_path(
+                crate::fs::BundleData::open_any(&fixture).unwrap(),
+                true,
+            )
+            .unwrap();
+            *env.bundle = bundle;
+            *env.fs = fs;
+            env.options.preferred_languages = Some(vec![language.to_string(), "en".to_string()]);
+            let pool: id = msg_class![env; NSAutoreleasePool new];
+            let bundle: id = msg_class![env; NSBundle mainBundle];
+            let name = ns_string::get_static_str(env, "LanguageProbe");
+            let extension = ns_string::get_static_str(env, "txt");
+            let path: id = msg![env; bundle pathForResource:name ofType:extension];
+            assert_ne!(path, nil);
+            assert!(
+                ns_string::to_rust_string(env, path)
+                    .ends_with(&format!("/{expected}.lproj/LanguageProbe.txt")),
+                "wrong resource for {language}: {}",
+                ns_string::to_rust_string(env, path)
+            );
+            release(env, pool);
+        }
+        std::fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    #[test]
+    fn empty_line_comments_do_not_consume_the_next_localized_entry() {
+        // Standard .strings comments end at the newline, even when empty.
+        // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/LoadingResources/Strings/Strings.html
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/foundation/ns_bundle.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        for prefix in ["//\n", "// \r\n\r\n", "// heading\n//\n", "/* heading */\n//\n"] {
+            let source = format!("{prefix}\"Network\" = \"Networking\";\n\"Display\" = \"Appearance\";");
+            let text = from_rust_string(env, source);
+            let dictionary: id = msg_class![env; NSMutableDictionary new];
+            let result = parse_strings_table(env, text, dictionary);
+            let key = ns_string::get_static_str(env, "Network");
+            let value: id = msg![env; result objectForKey:key];
+            assert_ne!(value, nil, "first localization was consumed after {prefix:?}");
+            assert_eq!(ns_string::to_rust_string(env, value), "Networking");
+            let count: NSUInteger = msg![env; result count];
+            assert_eq!(count, 2);
+            release(env, text);
+        }
+        release(env, pool);
+    }
 }

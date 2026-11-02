@@ -8,6 +8,7 @@
 // runs these automatically.
 
 #include <CoreFoundation/CFBase.h>
+#include <CoreFoundation/CFArray.h>
 #include <CoreFoundation/CFBundle.h>
 #include <CoreFoundation/CFDictionary.h>
 #include <CoreFoundation/CFNumber.h>
@@ -48,6 +49,7 @@
 + (instancetype)mainBundle;
 + (instancetype)bundleWithPath:(NSString *)path;
 + (instancetype)bundleWithIdentifier:(NSString *)identifier;
++ (NSArray *)preferredLocalizationsFromArray:(NSArray *)available forPreferences:(NSArray *)preferences;
 - (NSString *)pathForResource:(NSString *)name ofType:(NSString *)extension;
 - (NSString *)pathForResource:(NSString *)name ofType:(NSString *)extension inDirectory:(NSString *)directory;
 - (NSString *)bundleIdentifier;
@@ -74,9 +76,17 @@ extern NSString *const NSDefaultRunLoopMode;
 int test_NSHashTable_copy_is_independent(void);
 int test_NSHashTable_copy_owns_members(void);
 int test_NSHashTable_copy_empty(void);
+int test_NSAllocateObject_custom_allocator(void);
+int test_objc_super_struct_return(void);
 int test_NSRegularExpression_copy_survives_pool(void);
 int test_dictionary_subclasses_preserve_identity_and_storage(void);
 int test_NSData_base64_data(void);
+int test_NSOperationQueue_dependencies_and_completion(void);
+int test_NSOperationQueue_suspended_blocks(void);
+int test_CoreMotion_handler_background(void);
+int test_CoreMotion_handler_main_queue(void);
+int test_NSData_base64_decode(void);
+int test_NSString_long_utf8(void);
 int test_NSJSONSerialization_retained_result_survives_pool(void);
 int test_CGFont_bbox_struct_return_preserves_font(void);
 int test_CGContext_image_fill_alpha_and_blending(void);
@@ -721,6 +731,7 @@ extern int test_AVAudioPlayer_finish_waits_for_drain(void);
 extern int test_runloop_audio_queue(void);
 extern int test_runloop_audio_queue_null(void);
 extern int test_runloop_audio_unit_independent(void);
+extern int test_audio_unit_maximum_frames_per_slice(void);
 extern int test_remote_io_recording_callback(void);
 
 int test_runloop_timer_waits_until_deadline(void) {
@@ -838,6 +849,27 @@ int test_NSBundle_subbundleCacheRetainsAutoreleasedBundle(void) {
   if ([cached pathForResource:@"marker" ofType:@"txt"] == nil)
     return -5;
   return 0;
+}
+
+// A user preference must win over bundle order and legacy language names.
+// https://developer.apple.com/documentation/foundation/bundle/preferredlocalizations(from:forpreferences:)
+// https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/core_foundation/cf_bundle.rs
+int test_NSBundle_language_preferences(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  NSArray *available = [NSArray arrayWithObjects:@"French", @"English", @"Spanish", nil];
+  NSArray *preferences = [NSArray arrayWithObjects:@"es-MX", @"en", nil];
+  NSArray *chosen = [NSBundle preferredLocalizationsFromArray:available forPreferences:preferences];
+  int result = 0;
+  if ([chosen count] != 1) result = -1;
+  else if (![[chosen objectAtIndex:0] isEqualToString:@"Spanish"]) result = -2;
+  available = [NSArray arrayWithObjects:@"fr", @"zh-Hans", @"en", nil];
+  preferences = [NSArray arrayWithObjects:@"zh", @"en", nil];
+  CFArrayRef selected = CFBundleCopyLocalizationsForPreferences((CFArrayRef)available, (CFArrayRef)preferences);
+  if (CFArrayGetCount(selected) != 1) result = -3;
+  else if (![(NSString *)CFArrayGetValueAtIndex(selected, 0) isEqualToString:@"zh-Hans"]) result = -4;
+  CFRelease(selected);
+  [pool drain];
+  return result;
 }
 
 // Qualified bundle lookups must not pick the same basename elsewhere.
@@ -3047,6 +3079,48 @@ void *second_thread(void *arg) {
     second_thread_thread_size_res = 0;
   }
   return NULL;
+}
+
+static pthread_mutex_t scheduling_gate = PTHREAD_MUTEX_INITIALIZER;
+static int scheduling_order[2], scheduling_index;
+struct scheduling_check { int priority, id, error; };
+static void *scheduling_worker(void *context) {
+  struct scheduling_check *check = context;
+  struct sched_param param;
+  int policy;
+  if (pthread_getschedparam(pthread_self(), &policy, &param) ||
+      policy != 4 || param.sched_priority != check->priority) check->error = 1;
+  pthread_mutex_lock(&scheduling_gate);
+  scheduling_order[scheduling_index++] = check->id;
+  pthread_mutex_unlock(&scheduling_gate);
+  return NULL;
+}
+
+// Apple's pthread_create passes explicitly set scheduling parameters to the
+// kernel. A ready FIFO thread with greater importance runs before a lower one.
+// https://github.com/apple-oss-distributions/libpthread/blob/main/src/pthread.c
+int test_pthread_scheduling_priority() {
+  pthread_attr_t attr;
+  pthread_t low, high;
+  struct sched_param param = {0};
+  struct scheduling_check a = {10, 0, 0}, b = {30, 1, 0};
+  scheduling_index = 0;
+  pthread_mutex_lock(&scheduling_gate);
+  pthread_attr_init(&attr);
+  pthread_attr_setschedpolicy(&attr, 4); // Darwin SCHED_FIFO
+  param.sched_priority = a.priority;
+  pthread_attr_setschedparam(&attr, &param);
+  if (pthread_create(&low, &attr, scheduling_worker, &a)) return -1;
+  param.sched_priority = b.priority;
+  pthread_attr_setschedparam(&attr, &param);
+  if (pthread_create(&high, &attr, scheduling_worker, &b)) return -2;
+  pthread_mutex_unlock(&scheduling_gate);
+  pthread_join(low, NULL);
+  pthread_join(high, NULL);
+  pthread_attr_destroy(&attr);
+  if (a.error || b.error) return -3;
+  if (scheduling_index != 2 || scheduling_order[0] != 1 || scheduling_order[1] != 0) return -4;
+  return 0;
 }
 
 int test_pthread_get_stacksize_np() {
@@ -7748,6 +7822,7 @@ struct {
     FUNC_DEF(test_synchronized),
     FUNC_DEF(test_read_directory_as_fd),
     FUNC_DEF(test_pthread_get_stacksize_np),
+    FUNC_DEF(test_pthread_scheduling_priority),
     FUNC_DEF(test_cpp_virtual_inheritance),
 #endif
     FUNC_DEF(test_qsort),
@@ -7912,6 +7987,7 @@ struct {
     FUNC_DEF(test_runloop_audio_queue),
     FUNC_DEF(test_runloop_audio_queue_null),
     FUNC_DEF(test_runloop_audio_unit_independent),
+    FUNC_DEF(test_audio_unit_maximum_frames_per_slice),
     FUNC_DEF(test_remote_io_recording_callback),
     FUNC_DEF(test_runloop_timer_waits_until_deadline),
     FUNC_DEF(test_runloop_chained_timer_deadlines),
@@ -7922,11 +7998,20 @@ struct {
     FUNC_DEF(test_NSHashTable_copy_is_independent),
     FUNC_DEF(test_NSHashTable_copy_owns_members),
     FUNC_DEF(test_NSHashTable_copy_empty),
+    FUNC_DEF(test_NSAllocateObject_custom_allocator),
+    FUNC_DEF(test_objc_super_struct_return),
     FUNC_DEF(test_NSRegularExpression_copy_survives_pool),
     FUNC_DEF(test_dictionary_subclasses_preserve_identity_and_storage),
     FUNC_DEF(test_NSData_base64_data),
+    FUNC_DEF(test_NSOperationQueue_dependencies_and_completion),
+    FUNC_DEF(test_NSOperationQueue_suspended_blocks),
+    FUNC_DEF(test_CoreMotion_handler_background),
+    FUNC_DEF(test_CoreMotion_handler_main_queue),
+    FUNC_DEF(test_NSData_base64_decode),
+    FUNC_DEF(test_NSString_long_utf8),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     FUNC_DEF(test_NSBundle_qualified_resource_stays_in_requested_directory),
+    FUNC_DEF(test_NSBundle_language_preferences),
     FUNC_DEF(test_bundled_social_sdk_class_methods),
 };
 // clang-format on

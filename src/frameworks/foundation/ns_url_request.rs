@@ -165,6 +165,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 // the copy is fully independent of the original.
 
 - (id)copy {
+    msg![env; this copyWithZone:(crate::mem::MutVoidPtr::null())]
+}
+
+- (id)copyWithZone:(NSZonePtr)_zone {
     let new: id = msg_class![env; NSURLRequest alloc];
     let host = env.objc.borrow::<NSURLRequestHostObject>(this);
     let url = host.url;
@@ -224,6 +228,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)mutableCopy {
+    msg![env; this mutableCopyWithZone:(crate::mem::MutVoidPtr::null())]
+}
+
+- (id)mutableCopyWithZone:(NSZonePtr)_zone {
     let new: id = msg_class![env; NSMutableURLRequest alloc];
     let host = env.objc.borrow::<NSURLRequestHostObject>(this);
     let url = host.url;
@@ -489,3 +497,45 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    #[test]
+    fn copying_with_zone_preserves_request_and_independent_headers() {
+        // NSURLRequest adopts both copying protocols, including their zone
+        // entry points. Mutating a copy must not alter the original request.
+        // https://developer.apple.com/documentation/foundation/nsurlrequest
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/foundation/ns_url_request.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let address = ns_string::get_static_str(env, "https://example.invalid/path");
+        let url: id = msg_class![env; NSURL URLWithString:address];
+        let request: id = msg_class![env; NSMutableURLRequest requestWithURL:url];
+        let header = ns_string::get_static_str(env, "X-Probe");
+        let first = ns_string::get_static_str(env, "first");
+        let second = ns_string::get_static_str(env, "second");
+        () = msg![env; request setValue:first forHTTPHeaderField:header];
+        let zone = crate::mem::MutVoidPtr::null();
+        let frozen: id = msg![env; request copyWithZone:zone];
+        let mutable: id = msg![env; frozen mutableCopyWithZone:zone];
+        assert_ne!(frozen, nil);
+        assert_ne!(mutable, nil);
+        () = msg![env; mutable setValue:second forHTTPHeaderField:header];
+        for (copy, expected) in [(request, "first"), (frozen, "first"), (mutable, "second")] {
+            let copied_url: id = msg![env; copy URL];
+            let absolute: id = msg![env; copied_url absoluteString];
+            assert_eq!(
+                ns_string::to_rust_string(env, absolute),
+                "https://example.invalid/path"
+            );
+            let value: id = msg![env; copy valueForHTTPHeaderField:header];
+            assert_eq!(ns_string::to_rust_string(env, value), expected);
+        }
+        release(env, frozen);
+        release(env, mutable);
+        release(env, pool);
+    }
+}

@@ -42,6 +42,8 @@ pub type HostContext = Coroutine<Environment, Environment, Environment>;
 
 /// Bookkeeping for a thread.
 pub struct Thread {
+    /// Relative scheduling importance; equal priorities retain round-robin order.
+    pub scheduling_priority: i32,
     /// Once a thread finishes, this is set to false.
     pub active: bool,
     /// If this is not [ThreadBlock::NotBlocked], the thread is not executing
@@ -1022,6 +1024,7 @@ impl Environment {
         );
 
         let main_thread = Thread {
+            scheduling_priority: 0,
             active: true,
             blocked_by: ThreadBlock::NotBlocked,
             return_value: None,
@@ -1209,6 +1212,7 @@ impl Environment {
         });
 
         let main_thread = Thread {
+            scheduling_priority: 0,
             active: true,
             blocked_by: ThreadBlock::NotBlocked,
             return_value: None,
@@ -1636,6 +1640,7 @@ impl Environment {
             });
 
         self.threads.push(Thread {
+            scheduling_priority: 0,
             active: true,
             blocked_by: ThreadBlock::NotBlocked,
             return_value: None,
@@ -3841,8 +3846,11 @@ impl Environment {
             // Try to find a new thread to execute, starting with the thread
             // following the one currently executing.
             let mut next_awakening: Option<Instant> = None;
-            for i in 0..self.threads.len() {
-                let thread_id = (self.current_thread + 1 + i) % self.threads.len();
+            let mut order: Vec<_> = (0..self.threads.len())
+                .map(|i| (self.current_thread + 1 + i) % self.threads.len())
+                .collect();
+            order.sort_by_key(|&id| std::cmp::Reverse(self.threads[id].scheduling_priority));
+            for thread_id in order {
                 let candidate = &mut self.threads[thread_id];
 
                 if !candidate.active {
@@ -4167,6 +4175,7 @@ pub(crate) fn touch_test_environment() -> Environment {
     env.bundle = NullableBox::new(bundle::Bundle::new_fake_bundle());
     env.fs = NullableBox::new(fs::Fs::new_fake_fs());
     env.threads.push(Thread {
+        scheduling_priority: 0,
         active: true,
         blocked_by: ThreadBlock::NotBlocked,
         return_value: None,

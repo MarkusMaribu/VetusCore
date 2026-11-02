@@ -25,8 +25,6 @@ use crate::frameworks::audio_toolbox::audio_unit::{
     notify_audio_unit_is_running, setup_audio_unit_for_render, AudioUnit,
 };
 use crate::frameworks::carbon_core::{paramErr, OSStatus};
-use crate::frameworks::core_foundation::cf_run_loop::CFRunLoopGetMain;
-use crate::frameworks::foundation::ns_run_loop;
 use crate::mem::{guest_size_of, ConstPtr, MutPtr, SafeRead};
 
 // =========================================================================
@@ -293,9 +291,8 @@ fn AUGraphInitialize(env: &mut Environment, graph: AUGraph) -> OSStatus {
         None => return paramErr,
     };
 
-    let run_loop = CFRunLoopGetMain(env);
     for unit in units {
-        ns_run_loop::add_audio_unit(env, run_loop, unit);
+        super::audio_unit::AudioUnitInitialize(env, unit);
     }
 
     if let Some(state) = State::get(&mut env.framework_state).graphs.get_mut(&graph) {

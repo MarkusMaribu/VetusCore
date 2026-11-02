@@ -161,7 +161,6 @@ pub struct State {
 }
 
 pub fn start_text_input(env: &mut crate::Environment) {
-    #[cfg(feature = "embedded")]
     {
         let responder = env.framework_state.uikit.ui_responder.first_responder;
         let responds = |env: &mut crate::Environment, name: &str| -> bool {

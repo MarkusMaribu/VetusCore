@@ -19,16 +19,40 @@ use crate::objc::{
 };
 use crate::window::DeviceOrientation;
 use crate::Environment;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Default)]
 pub struct State {
     /// [UIApplication sharedApplication]
     shared_application: Option<id>,
+    lifecycle_callbacks: VecDeque<fn(&mut Environment)>,
+    delivering_lifecycle: bool,
     pub(super) status_bar_hidden: bool,
     /// Whether shake to edit is enabled
     pub(super) application_supports_shake_to_edit: bool,
     pub(super) ignoring_interaction_events_count: u32,
+}
+
+/// Serialize state transitions even when a delegate renders or runs a nested
+/// loop. In particular, foreground delivery must follow the completed resign
+/// callback, or that callback can pause the app after it has already resumed.
+pub(super) fn dispatch_lifecycle(env: &mut Environment, callback: fn(&mut Environment)) {
+    let state = &mut env.framework_state.uikit.ui_application;
+    state.lifecycle_callbacks.push_back(callback);
+    if state.delivering_lifecycle {
+        return;
+    }
+    state.delivering_lifecycle = true;
+    while let Some(callback) = env
+        .framework_state
+        .uikit
+        .ui_application
+        .lifecycle_callbacks
+        .pop_front()
+    {
+        callback(env);
+    }
+    env.framework_state.uikit.ui_application.delivering_lifecycle = false;
 }
 
 #[derive(Default)]
@@ -921,7 +945,8 @@ pub(super) fn UIApplicationMain(
     principal_class_name: id, // NSString*
     delegate_class_name: id,  // NSString*
 ) {
-    env.framework_state.uikit.ui_view.ui_window.defer_autorotation = true;
+    env.framework_state.uikit.ui_view.ui_window.defer_autorotation =
+        !env.options.early_initial_autorotation;
     let ui_application = {
         let pool: id = msg_class![env; NSAutoreleasePool new];
 
@@ -1561,6 +1586,64 @@ mod main_nib_window_tests {
         assert_eq!(key, selected, "Nib activation must preserve an explicit key choice");
         release(env, selected);
         release(env, top_level);
+        release(env, pool);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn mark(env: &mut Environment, delegate: id, digit: NSInteger) {
+        let value: NSInteger = msg![env; delegate tag];
+        () = msg![env; delegate setTag:(value * 10 + digit)];
+    }
+    fn resign(env: &mut Environment, delegate: id, _: SEL, _: id) {
+        mark(env, delegate, 1);
+        // A render inside the callback can poll later lifecycle events.
+        dispatch_lifecycle(env, handle_did_enter_background);
+        dispatch_lifecycle(env, handle_will_enter_foreground);
+        dispatch_lifecycle(env, handle_did_become_active);
+        mark(env, delegate, 2);
+    }
+    fn background(env: &mut Environment, delegate: id, _: SEL, _: id) {
+        mark(env, delegate, 3);
+    }
+    fn foreground(env: &mut Environment, delegate: id, _: SEL, _: id) {
+        mark(env, delegate, 4);
+    }
+    fn active(env: &mut Environment, delegate: id, _: SEL, _: id) {
+        mark(env, delegate, 5);
+    }
+
+    // UIKit delivers state transitions as main-loop work, in order. A render
+    // from willResignActive must not deliver didBecomeActive before it returns.
+    // https://developer.apple.com/documentation/uikit/managing-your-app-s-life-cycle
+    // https://developer.apple.com/documentation/xcode/understanding-hangs-in-your-app
+    // Upstream still exits on resign; Vetus supports returning to the same app.
+    // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit.rs
+    #[test]
+    fn lifecycle_callbacks_finish_before_delivering_later_transitions() {
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let app: id = msg_class![env; UIApplication new];
+        let class = env.objc.get_known_class("UIView", &mut env.mem);
+        env.objc.add_host_method_if_absent(class, "applicationWillResignActive:",
+            &(resign as fn(&mut Environment, id, SEL, id)), &mut env.mem);
+        env.objc.add_host_method_if_absent(class, "applicationDidEnterBackground:",
+            &(background as fn(&mut Environment, id, SEL, id)), &mut env.mem);
+        env.objc.add_host_method_if_absent(class, "applicationWillEnterForeground:",
+            &(foreground as fn(&mut Environment, id, SEL, id)), &mut env.mem);
+        env.objc.add_host_method_if_absent(class, "applicationDidBecomeActive:",
+            &(active as fn(&mut Environment, id, SEL, id)), &mut env.mem);
+        let delegate: id = msg_class![env; UIView new];
+        () = msg![env; app setDelegate:delegate];
+        dispatch_lifecycle(env, handle_will_resign_active);
+        let order: NSInteger = msg![env; delegate tag];
+        assert_eq!(order, 12345, "foreground arrived before resign completed");
+        () = msg![env; app setDelegate:nil];
+        release(env, delegate);
         release(env, pool);
     }
 }

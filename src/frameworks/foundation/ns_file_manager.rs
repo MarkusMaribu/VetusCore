@@ -14,7 +14,7 @@ use crate::fs::{FsError, GuestPath, GuestPathBuf};
 use crate::mem::{ConstPtr, MutPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, ClassExports, HostObject,
-    NSZonePtr,
+    NSZonePtr, TrivialHostObject,
 };
 use crate::Environment;
 
@@ -319,14 +319,25 @@ fn NSAllocateObject(
     extra_bytes: NSUInteger,
     _zone: NSZonePtr,
 ) -> id {
-    if extra_bytes > 0 {
-        log!(
-            "Warning: NSAllocateObject called with extra_bytes={}, which is currently unhandled!",
-            extra_bytes
-        );
+    if class == nil {
+        return nil;
     }
-
-    msg![env; class alloc]
+    // This primitive underlies custom +allocWithZone: implementations; sending
+    // +alloc here would re-enter them. Allocate the instance and trailing bytes
+    // directly, just as NSObject's allocator does.
+    let size = env
+        .objc
+        .class_instance_size(class)
+        .checked_add(extra_bytes)
+        .expect("NSAllocateObject size overflow");
+    let object = env.objc.alloc_object_sized(
+        class,
+        size,
+        Box::new(TrivialHostObject),
+        &mut env.mem,
+    );
+    super::ns_object::invoke_cxx_constructors(env, object);
+    object
 }
 
 fn NSDeallocateObject(env: &mut Environment, object: id) {

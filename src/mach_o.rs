@@ -837,7 +837,10 @@ impl MachO {
                         );
                     }
                 }
-                LoadCommand::LoadDyLib(DyLib { name, .. }) => {
+                LoadCommand::LoadDyLib(DyLib { name, .. })
+                | LoadCommand::LoadWeakDyLib(DyLib { name, .. }) => {
+                    // Weak linkage permits an absent library. When present,
+                    // it must still be loaded so its exports can be bound.
                     dynamic_libraries.push(String::from(&*name));
                 }
                 // Old-style entry point PC command
@@ -1212,6 +1215,36 @@ mod segment_validation_tests {
             let image = MachO::load_from_bytes(&bytes, &mut mem, "sdk-test".into(), 0).unwrap();
             assert_eq!(image.sdk_version, expected);
         }
+    }
+
+    #[test]
+    fn weak_dylibs_are_dependencies_but_install_names_are_not() {
+        // LC_LOAD_WEAK_DYLIB means load if present, not ignore the library.
+        // https://github.com/apple-oss-distributions/xnu/blob/main/EXTERNAL_HEADERS/mach-o/loader.h
+        let mut commands = Vec::new();
+        for (command, name) in [
+            (0xcu32, "/usr/lib/libSystem.B.dylib"),
+            (0x80000018, "/usr/lib/libz.1.dylib"),
+            (0xd, "/usr/lib/this-image.dylib"),
+        ] {
+            let size = (24 + name.len() + 1 + 3) & !3;
+            let start = commands.len();
+            for word in [command, size as u32, 24, 0, 0x10000, 0x10000] {
+                commands.extend_from_slice(&word.to_le_bytes());
+            }
+            commands.extend_from_slice(name.as_bytes());
+            commands.resize(start + size, 0);
+        }
+        let mut bytes = thin(9, 0x1000, 84 + commands.len() as u32);
+        bytes[16..20].copy_from_slice(&4u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&(56 + commands.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&commands);
+        let mut mem = Mem::new();
+        let image = MachO::load_from_bytes(&bytes, &mut mem, "dependencies".into(), 0).unwrap();
+        assert_eq!(
+            image.dynamic_libraries,
+            ["/usr/lib/libSystem.B.dylib", "/usr/lib/libz.1.dylib"]
+        );
     }
 
     #[test]

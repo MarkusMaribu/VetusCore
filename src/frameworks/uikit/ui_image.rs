@@ -197,18 +197,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // iOS 4.0+
-+ (id)imageWithCGImage:(CGImageRef)cg_image scale:(CGFloat)_scale orientation:(NSInteger)orientation {
-    // touchHLE's UIImage doesn't honour the scale factor (the app already
-    // assumes the image's pixel dimensions are correct), so we just call
-    // the regular initializer and store the orientation. Apps on iOS 5/6
-    // (e.g. ketchapp's "2 Cars") rely on this overload existing —
-    // returning `nil` from `[UIImage imageWithCGImage:scale:orientation:]`
-    // makes most images render as a placeholder.
++ (id)imageWithCGImage:(CGImageRef)cg_image scale:(CGFloat)scale orientation:(NSInteger)orientation {
     let new: id = msg![env; this alloc];
-    let new: id = msg![env; new initWithCGImage:cg_image];
-    if new != nil {
-        env.objc.borrow_mut::<UIImageHostObject>(new).orientation = orientation;
-    }
+    let new: id = msg![env; new initWithCGImage:cg_image scale:scale orientation:orientation];
     autorelease(env, new)
 }
 
@@ -226,6 +217,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     host.orientation = 0;
     host.left_cap_width = 0;
     host.top_cap_height = 0;
+    host.scale = 1.0;
+    this
+}
+
+- (id)initWithCGImage:(CGImageRef)cg_image scale:(CGFloat)scale orientation:(NSInteger)orientation {
+    let this: id = msg![env; this initWithCGImage:cg_image];
+    let host = env.objc.borrow_mut::<UIImageHostObject>(this);
+    host.scale = if scale > 0.0 { scale } else { 1.0 };
+    host.orientation = orientation;
     this
 }
 
@@ -326,7 +326,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // For a @2x asset loaded on this 1x-emulated device the CGImage is twice
     // the point size, so a view that sizes itself to `image.size` (and the
     // close buttons that depend on it for hit-testing) must see points.
-    let scale = env.objc.borrow::<UIImageHostObject>(this).scale.max(1.0);
+    let scale = env.objc.borrow::<UIImageHostObject>(this).scale;
     CGSize {
         width: width as CGFloat / scale,
         height: height as CGFloat / scale,
@@ -334,7 +334,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (CGFloat)scale {
-    env.objc.borrow::<UIImageHostObject>(this).scale.max(1.0)
+    env.objc.borrow::<UIImageHostObject>(this).scale
 }
 
 - (CGImageRef)CGImage {
@@ -348,12 +348,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Stretchable Images (iOS 2.0 - 4.x legacy method)
 
 - (id)stretchableImageWithLeftCapWidth:(NSInteger)leftCapWidth topCapHeight:(NSInteger)topCapHeight {
-    let cg_image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
+    let host = env.objc.borrow::<UIImageHostObject>(this);
+    let (cg_image, scale, orientation) = (host.cg_image, host.scale, host.orientation);
 
     // Создаем новый объект UIImage на основе того же CGImage.
     // ИСПОЛЬЗУЕМ msg_class! для отправки сообщения alloc классу
     let new_img: id = msg_class![env; UIImage alloc];
-    let new_img: id = msg![env; new_img initWithCGImage:cg_image];
+    let new_img: id = msg![env; new_img initWithCGImage:cg_image scale:scale orientation:orientation];
 
     // Но прописываем ему параметры растяжения
     let host = env.objc.borrow_mut::<UIImageHostObject>(new_img);
@@ -381,7 +382,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if image == nil { return; }
     // Draw at the image's point size (pixels / scale) so @2x assets are not
     // drawn at double size.
-    let scale = env.objc.borrow::<UIImageHostObject>(this).scale.max(1.0);
+    let scale = env.objc.borrow::<UIImageHostObject>(this).scale;
     let rect = CGRect {
         origin: point,
         size: CGSize {
@@ -426,7 +427,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
     // Drawing a nil image is a no-op, not a crash.
     if image == nil { return; }
-    let scale = env.objc.borrow::<UIImageHostObject>(this).scale.max(1.0);
+    let scale = env.objc.borrow::<UIImageHostObject>(this).scale;
     let rect = CGRect {
         origin: point,
         size: CGSize {
@@ -666,3 +667,75 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(UIImageJPEGRepresentation(_, _)),
     export_c_func!(UIImageWriteToSavedPhotosAlbum(_, _, _, _)),
 ];
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    #[test]
+    fn stretchable_copy_preserves_scale_and_configures_image_view_caps() {
+        // https://developer.apple.com/documentation/uikit/uiimage/leftcapwidth
+        // https://developer.apple.com/documentation/quartzcore/calayer/contentscenter
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_image.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let cg = cg_image::from_image(env, Image::from_pixel_vec(vec![255; 20 * 30 * 4], (20, 30)));
+        let image: id = msg_class![env; UIImage imageWithCGImage:cg scale:(2.0f32) orientation:(0i32)];
+        let stretch: id = msg![env; image stretchableImageWithLeftCapWidth:(3i32) topCapHeight:(4i32)];
+        let scale: f32 = msg![env; stretch scale];
+        let size: CGSize = msg![env; stretch size];
+        assert_eq!(scale, 2.0);
+        assert_eq!(size, CGSize { width: 10.0, height: 15.0 });
+        let original_cap: i32 = msg![env; image leftCapWidth];
+        assert_eq!(original_cap, 0);
+        let view: id = msg_class![env; UIImageView alloc];
+        let view: id = msg![env; view initWithImage:stretch];
+        let layer: id = msg![env; view layer];
+        let center: CGRect = msg![env; layer contentsCenter];
+        assert_eq!(center.origin, CGPoint { x: 0.3, y: 4.0 / 15.0 });
+        assert_eq!(center.size, CGSize { width: 0.1, height: 1.0 / 15.0 });
+        let layer_scale: f32 = msg![env; layer contentsScale];
+        assert_eq!(layer_scale, 2.0);
+        () = msg![env; view setImage:image];
+        let center: CGRect = msg![env; layer contentsCenter];
+        assert_eq!(center, CGRect { origin: CGPoint::default(), size: CGSize { width: 1.0, height: 1.0 } });
+        release(env, view);
+        CGImageRelease(env, cg);
+        release(env, pool);
+    }
+
+    #[test]
+    fn cgimage_scale_controls_point_size_for_initializer_and_factory() {
+        // https://developer.apple.com/documentation/uikit/uiimage/init(data:scale:)
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_image.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let cg = cg_image::from_image(env, Image::from_pixel_vec(vec![255; 20 * 30 * 4], (20, 30)));
+        for scale in [0.5f32, 1.0, 2.0, 3.0] {
+            let factory: id =
+                msg_class![env; UIImage imageWithCGImage:cg scale:scale orientation:(0i32)];
+            let allocated: id = msg_class![env; UIImage alloc];
+            let initialized: id =
+                msg![env; allocated initWithCGImage:cg scale:scale orientation:(0i32)];
+            for image in [factory, initialized] {
+                let reported_scale: CGFloat = msg![env; image scale];
+                let size: CGSize = msg![env; image size];
+                assert_eq!(reported_scale, scale);
+                assert_eq!(
+                    size,
+                    CGSize {
+                        width: 20.0 / scale,
+                        height: 30.0 / scale
+                    }
+                );
+                let backing: CGImageRef = msg![env; image CGImage];
+                assert_eq!(backing, cg);
+            }
+            release(env, initialized);
+        }
+        CGImageRelease(env, cg);
+        release(env, pool);
+    }
+}

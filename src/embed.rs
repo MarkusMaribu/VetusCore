@@ -22,6 +22,7 @@ pub struct HostFns {
     pub orientation: fn(i32),
     pub status_bar_hidden: fn(bool),
     pub keyboard: fn(bool, &str),
+    pub native_ui: Option<fn(&str) -> bool>,
     pub idle_timer: fn(bool),
     pub open_url: fn(&str) -> bool,
     pub alert: fn(&str, &str, &[&str]) -> i32,
@@ -58,6 +59,7 @@ const NOOP_HOST: HostFns = HostFns {
     orientation: noop_i32,
     status_bar_hidden: noop_bool,
     keyboard: noop_keyboard,
+    native_ui: None,
     idle_timer: noop_bool,
     open_url: noop_url,
     alert: noop_alert,
@@ -92,6 +94,21 @@ pub fn notify_status_bar(hidden: bool) {
 pub fn notify_keyboard(show: bool) {
     let snapshot = keyboard_snapshot().lock().unwrap().clone();
     (host().lock().unwrap().keyboard)(show, &snapshot);
+}
+
+pub fn present_native_ui(snapshot: &str) -> bool {
+    let Some(callback) = host().lock().unwrap().native_ui else { return false; };
+    callback(snapshot)
+}
+
+pub fn native_ui_available() -> bool { host().lock().unwrap().native_ui.is_some() }
+
+#[derive(Clone, Debug)]
+pub struct UIKitAction {
+    pub scene: u64,
+    pub target: u32,
+    pub action: String,
+    pub value: String,
 }
 
 fn keyboard_snapshot() -> &'static Mutex<String> {
@@ -303,6 +320,7 @@ pub struct InputEvent {
 
 #[derive(Clone)]
 pub enum InputKind {
+    UIKitAction(UIKitAction),
     Touch { action: i32, id: i64, x: f32, y: f32 },
     Text(String),
     EditingText(String),
@@ -788,7 +806,7 @@ fn json_bool(json: &str, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn json_escape(value: &str) -> String {
+pub(crate) fn json_escape(value: &str) -> String {
     let mut out = String::from("\"");
     for ch in value.chars() {
         match ch {

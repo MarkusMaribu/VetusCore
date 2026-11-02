@@ -28,6 +28,8 @@ struct UIImageViewHostObject {
     superclass: super::UIViewHostObject,
     /// `UIImage*`
     image: id,
+    highlighted_image: id,
+    highlighted: bool,
     /// `NSArray<UIImage *>*`
     animation_images: id,
     /// Total duration of one animation cycle. `0.0` means the default
@@ -76,10 +78,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     let &UIImageViewHostObject {
         superclass: _,
         image,
+        highlighted_image,
         animation_images,
         ..
     } = env.objc.borrow(this);
     release(env, image);
+    release(env, highlighted_image);
     release(env, animation_images);
     msg_super![env; this dealloc]
 }
@@ -93,8 +97,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     () = msg![env; this setImage:image];
 
-    // UIImageView disables user interaction by default (unlike plain UIView).
-    () = msg![env; this setUserInteractionEnabled:false];
+    // UIView decoded the archived interaction setting. Image views may be
+    // interactive containers in a nib; resetting the programmatic default here
+    // prevents every control inside them from receiving touches.
+    // https://developer.apple.com/documentation/uikit/uiimageview/isuserinteractionenabled
+    // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view/ui_image_view.rs
 
     this
 }
@@ -119,6 +126,35 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<UIImageViewHostObject>(this).image
 }
 
+- (id)initWithImage:(id)image highlightedImage:(id)highlighted_image {
+    let this: id = msg![env; this initWithImage:image];
+    () = msg![env; this setHighlightedImage:highlighted_image];
+    this
+}
+
+- (id)highlightedImage {
+    env.objc.borrow::<UIImageViewHostObject>(this).highlighted_image
+}
+
+- (())setHighlightedImage:(id)image {
+    retain(env, image);
+    let old = std::mem::replace(
+        &mut env.objc.borrow_mut::<UIImageViewHostObject>(this).highlighted_image,
+        image,
+    );
+    release(env, old);
+    update_static_image(env, this);
+}
+
+- (bool)isHighlighted {
+    env.objc.borrow::<UIImageViewHostObject>(this).highlighted
+}
+
+- (())setHighlighted:(bool)highlighted {
+    env.objc.borrow_mut::<UIImageViewHostObject>(this).highlighted = highlighted;
+    update_static_image(env, this);
+}
+
 - (())setImage:(id)new_image { // UIImage*
     let host_obj = env.objc.borrow_mut::<UIImageViewHostObject>(this);
     let old_image = std::mem::replace(&mut host_obj.image, new_image);
@@ -126,9 +162,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old_image);
 
     // While animating, the animation frames take precedence over the image.
-    if env.objc.borrow::<UIImageViewHostObject>(this).animation_start.is_none() {
-        set_layer_contents(env, this, new_image);
-    }
+    update_static_image(env, this);
 }
 
 - (id)animationImages {
@@ -197,9 +231,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let state = &mut env.framework_state.uikit.ui_view.ui_image_view;
     state.animating_views.retain(|&view| view != this);
 
-    // Restore the normal image.
-    let image = env.objc.borrow::<UIImageViewHostObject>(this).image;
-    set_layer_contents(env, this, image);
+    // Restore the appropriate static image.
+    update_static_image(env, this);
 
     release(env, this);
 }
@@ -223,6 +256,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
+fn update_static_image(env: &mut Environment, this: id) {
+    let host = env.objc.borrow::<UIImageViewHostObject>(this);
+    if host.animation_start.is_some() {
+        return;
+    }
+    let image = if host.highlighted && host.highlighted_image != nil {
+        host.highlighted_image
+    } else {
+        host.image
+    };
+    set_layer_contents(env, this, image);
+}
+
 fn set_layer_contents(env: &mut Environment, this: id, image: id) {
     let layer: id = msg![env; this layer];
     let cg_image: CGImageRef = if image == nil {
@@ -231,6 +277,23 @@ fn set_layer_contents(env: &mut Environment, this: id, image: id) {
         msg![env; image CGImage]
     };
     () = msg![env; layer setContents:cg_image];
+    let mut center = CGRect { origin: CGPoint::default(), size: CGSize { width: 1.0, height: 1.0 } };
+    let scale: f32 = if image == nil { 1.0 } else { msg![env; image scale] };
+    if image != nil {
+        let size: CGSize = msg![env; image size];
+        let left: NSInteger = msg![env; image leftCapWidth];
+        let top: NSInteger = msg![env; image topCapHeight];
+        if left > 0 && size.width > 0.0 {
+            center.origin.x = left as f32 / size.width;
+            center.size.width = 1.0 / size.width;
+        }
+        if top > 0 && size.height > 0.0 {
+            center.origin.y = top as f32 / size.height;
+            center.size.height = 1.0 / size.height;
+        }
+    }
+    () = msg![env; layer setContentsScale:scale];
+    () = msg![env; layer setContentsCenter:center];
 }
 
 /// Advance a single animating image view; stops the animation if it has
@@ -295,5 +358,57 @@ pub fn update_animations(env: &mut Environment) {
         .clone();
     for view in views {
         update_animation(env, view);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlighted_image_initialization_and_fallback_update_layer_contents() {
+        // https://developer.apple.com/documentation/uikit/uiimageview/ishighlighted
+        // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view/ui_image_view.rs
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = crate::objc::msg_class![env; NSAutoreleasePool new];
+        let normal_cg = crate::frameworks::core_graphics::cg_image::from_image(
+            env,
+            crate::image::Image::from_pixel_vec(vec![255; 8 * 12 * 4], (8, 12)),
+        );
+        let highlighted_cg = crate::frameworks::core_graphics::cg_image::from_image(
+            env,
+            crate::image::Image::from_pixel_vec(vec![128; 8 * 12 * 4], (8, 12)),
+        );
+        let normal: id = crate::objc::msg_class![env; UIImage imageWithCGImage:normal_cg];
+        let highlighted: id = crate::objc::msg_class![env; UIImage imageWithCGImage:highlighted_cg];
+        let view: id = crate::objc::msg_class![env; UIImageView alloc];
+        let view: id = msg![env; view initWithImage:normal highlightedImage:highlighted];
+        let frame: CGRect = msg![env; view frame];
+        assert_eq!(
+            frame.size,
+            CGSize {
+                width: 8.0,
+                height: 12.0
+            }
+        );
+        let layer: id = msg![env; view layer];
+        for (state, expected) in [
+            (false, normal_cg),
+            (true, highlighted_cg),
+            (false, normal_cg),
+        ] {
+            () = msg![env; view setHighlighted:state];
+            let contents: CGImageRef = msg![env; layer contents];
+            assert_eq!(contents, expected);
+        }
+        () = msg![env; view setHighlighted:true];
+        () = msg![env; view setHighlightedImage:nil];
+        let contents: CGImageRef = msg![env; layer contents];
+        assert_eq!(contents, normal_cg);
+        release(env, view);
+        crate::frameworks::core_graphics::cg_image::CGImageRelease(env, normal_cg);
+        crate::frameworks::core_graphics::cg_image::CGImageRelease(env, highlighted_cg);
+        release(env, pool);
     }
 }
