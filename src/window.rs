@@ -12,6 +12,9 @@
 //! window system interaction in general, because it is assumed only one window
 //! will be needed for the runtime of the app.
 
+// Exercise the embedded driver selection policy in desktop test runs too.
+#[cfg(test)]
+mod egl_fallback;
 mod geometry;
 mod native_aspect_ratio;
 

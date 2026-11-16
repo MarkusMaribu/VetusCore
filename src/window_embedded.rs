@@ -11,6 +11,10 @@
 #[path = "window/geometry.rs"]
 mod geometry;
 
+#[cfg(target_os = "android")]
+#[path = "window/egl_fallback.rs"]
+mod egl_fallback;
+
 include!("window_shared.rs");
 
 use crate::gles::present::present_frame;
@@ -140,7 +144,7 @@ impl Window {
         launch_image: Option<(Image, bool)>,
         options: &Options,
     ) -> Result<Window, String> {
-        let mut egl = Egl::new(!options.gles_native)?;
+        let egl = Egl::new(!options.gles_native, options.prefer_gles2_context)?;
         let scale_hack = options.scale_hack;
         // The host surface is the presentation target, not the guest display.
         // Auto selection already resolves it into options.host_screen_size in
@@ -232,6 +236,12 @@ impl Window {
 
     pub fn gl_driver_description(&self) -> &str {
         &self.gl_driver_description
+    }
+
+    // The desktop app picker is also compiled by host-side embedded tests.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn set_preserve_aspect_ratio(&mut self, enabled: bool) {
+        self.preserve_aspect_ratio = enabled;
     }
 
     pub fn poll_for_events(&mut self, _options: &Options) {
@@ -365,7 +375,9 @@ impl Window {
             self.bound_window = next;
             if next != 0 {
                 if let Err(err) = self.egl.adopt_window(next as *mut _) {
-                    log!("Could not adopt Vetus surface: {err}");
+                    // Do not keep rendering into the invisible startup pbuffer.
+                    // The JNI panic hook reports this to Alpine's crash dialog.
+                    panic!("Could not attach Vetus display: {err}");
                 }
                 self.drawable = self.egl.drawable_size().unwrap_or(self.drawable);
                 crate::embed::set_host_screen(self.drawable.0, self.drawable.1);
@@ -941,9 +953,15 @@ extern "C" {
     fn ANativeWindow_release(window: *mut std::ffi::c_void);
     fn ANativeWindow_getWidth(window: *mut std::ffi::c_void) -> i32;
     fn ANativeWindow_getHeight(window: *mut std::ffi::c_void) -> i32;
+    fn ANativeWindow_setBuffersGeometry(
+        window: *mut std::ffi::c_void,
+        width: i32,
+        height: i32,
+        format: i32,
+    ) -> i32;
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 struct Egl {
     angle: bool,
     display: *mut std::ffi::c_void,
@@ -953,14 +971,20 @@ struct Egl {
     window: *mut std::ffi::c_void,
     fns: EglFns,
     read_pixels: Option<GlReadPixels>,
+    contexts: RefCell<Vec<usize>>,
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 type GlReadPixels = unsafe extern "C" fn(i32, i32, i32, i32, u32, u32, *mut u8);
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 struct EglFns {
     get_error: unsafe extern "C" fn() -> i32,
+    get_current_context: unsafe extern "C" fn() -> *mut std::ffi::c_void,
+    get_config_attrib:
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, i32, *mut i32) -> u32,
+    destroy_context: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> u32,
+    terminate: unsafe extern "C" fn(*mut std::ffi::c_void) -> u32,
     choose_config: unsafe extern "C" fn(
         *mut std::ffi::c_void,
         *const i32,
@@ -997,18 +1021,23 @@ struct EglFns {
     get_proc: unsafe extern "C" fn(*const i8) -> *mut std::ffi::c_void,
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 impl Egl {
-    fn new(use_angle: bool) -> Result<Self, String> {
+    #[cfg(target_os = "android")]
+    fn new(use_angle: bool, prefer_gles2: bool) -> Result<Self, String> {
+        egl_fallback::try_egl_backends(use_angle, |angle| Self::initialize(angle, prefer_gles2))
+    }
+
+    #[cfg(target_os = "android")]
+    fn initialize(use_angle: bool, prefer_gles2: bool) -> Result<Self, String> {
         let (fns, angle, lib) = load_egl(use_angle)?;
         unsafe {
             let get_display: unsafe extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void =
                 std::mem::transmute(load_required(lib, b"eglGetDisplay\0")?);
-            let initialize: unsafe extern "C" fn(
-                *mut std::ffi::c_void,
-                *mut i32,
-                *mut i32,
-            ) -> u32 = std::mem::transmute(load_symbol(lib, b"eglInitialize\0").ok_or("eglInitialize missing")?);
+            let initialize: unsafe extern "C" fn(*mut std::ffi::c_void, *mut i32, *mut i32) -> u32 =
+                std::mem::transmute(
+                    load_symbol(lib, b"eglInitialize\0").ok_or("eglInitialize missing")?,
+                );
             let display = get_display(std::ptr::null_mut());
             if display.is_null() || initialize(display, std::ptr::null_mut(), std::ptr::null_mut()) == 0
             {
@@ -1024,12 +1053,18 @@ impl Egl {
             if (fns.choose_config)(display, attribs.as_ptr(), &mut config, 1, &mut count) == 0
                 || count == 0
             {
-                return Err("eglChooseConfig failed".to_string());
+                let error = (fns.get_error)();
+                (fns.terminate)(display);
+                return Err(format!("eglChooseConfig failed: EGL error {error:#x}"));
             }
             let pbuffer_attribs = [0x3057, 16, 0x3056, 16, 0x3038];
             let pbuffer = (fns.create_pbuffer)(display, config, pbuffer_attribs.as_ptr());
             if pbuffer.is_null() {
-                return Err("eglCreatePbufferSurface failed".to_string());
+                let error = (fns.get_error)();
+                (fns.terminate)(display);
+                return Err(format!(
+                    "eglCreatePbufferSurface failed: EGL error {error:#x}"
+                ));
             }
             let mut egl = Egl {
                 angle,
@@ -1040,7 +1075,31 @@ impl Egl {
                 window: std::ptr::null_mut(),
                 fns,
                 read_pixels: None,
+                contexts: RefCell::new(Vec::new()),
             };
+            // dlopen/eglInitialize do not prove that a device can run ANGLE.
+            // Probe the actual compositor API before committing the session.
+            let version = if prefer_gles2 {
+                GLVersion::GLES20
+            } else {
+                GLVersion::GLES11
+            };
+            let probe = egl.create_context(version, 0)?;
+            egl.try_make_current(probe)?;
+            let get_string = egl
+                .proc_address_raw(b"glGetString\0")
+                .ok_or("glGetString missing")?;
+            let get_string: unsafe extern "C" fn(u32) -> *const std::ffi::c_char =
+                std::mem::transmute(get_string);
+            let version_string = get_string(0x1F02); // GL_VERSION
+            if version_string.is_null() {
+                return Err("No GL_VERSION from current EGL context".to_string());
+            }
+            log!(
+                "Vetus EGL backend: {} ({})",
+                if angle { "ANGLE" } else { "native" },
+                std::ffi::CStr::from_ptr(version_string).to_string_lossy()
+            );
             if let Some(proc_addr) = egl.proc_address_raw(b"glReadPixels\0") {
                 egl.read_pixels = Some(std::mem::transmute(proc_addr));
             }
@@ -1065,21 +1124,36 @@ impl Egl {
             )
         };
         if context.is_null() {
-            Err(format!("eglCreateContext failed for GLES {client}"))
+            Err(format!(
+                "eglCreateContext failed for GLES {client}: EGL error {:#x}",
+                unsafe { (self.fns.get_error)() }
+            ))
         } else {
+            self.contexts.borrow_mut().push(context as usize);
             Ok(context as usize)
         }
     }
 
     fn make_current(&self, raw: usize) {
+        self.try_make_current(raw)
+            .unwrap_or_else(|err| panic!("{err}"));
+    }
+
+    fn try_make_current(&self, raw: usize) -> Result<(), String> {
         let surface = if self.window_surface.is_null() {
             self.pbuffer
         } else {
             self.window_surface
         };
         unsafe {
-            (self.fns.make_current)(self.display, surface, surface, raw as *mut _);
+            if (self.fns.make_current)(self.display, surface, surface, raw as *mut _) == 0 {
+                return Err(format!(
+                    "eglMakeCurrent failed: EGL error {:#x}",
+                    (self.fns.get_error)()
+                ));
+            }
         }
+        Ok(())
     }
 
     fn swap(&self) {
@@ -1087,7 +1161,12 @@ impl Egl {
             return;
         }
         unsafe {
-            (self.fns.swap_buffers)(self.display, self.window_surface);
+            if (self.fns.swap_buffers)(self.display, self.window_surface) == 0 {
+                panic!(
+                    "eglSwapBuffers failed: EGL error {:#x}",
+                    (self.fns.get_error)()
+                );
+            }
         }
     }
 
@@ -1099,6 +1178,22 @@ impl Egl {
 
     fn adopt_window(&mut self, window: *mut std::ffi::c_void) -> Result<(), String> {
         self.destroy_window_surface();
+        // Match the producer buffers to the chosen EGLConfig, retaining the
+        // TextureView's dimensions (0, 0). Some vendor drivers require this.
+        // https://developer.android.com/ndk/reference/group/a-native-window
+        let mut format = 0;
+        unsafe {
+            if (self.fns.get_config_attrib)(self.display, self.config, 0x302E, &mut format) == 0 {
+                return Err(format!(
+                    "eglGetConfigAttrib(NATIVE_VISUAL_ID) failed: EGL error {:#x}",
+                    (self.fns.get_error)()
+                ));
+            }
+            let result = ANativeWindow_setBuffersGeometry(window, 0, 0, format);
+            if result != 0 {
+                return Err(format!("ANativeWindow_setBuffersGeometry failed: {result}"));
+            }
+        }
         let surface = unsafe {
             (self.fns.create_window)(self.display, self.config, window, std::ptr::null())
         };
@@ -1111,10 +1206,14 @@ impl Egl {
         }
         self.window = window;
         self.window_surface = surface;
-        // Creating a surface does not bind it to an existing context. The
-        // internal context may still be current on our startup pbuffer, so
-        // its cached is_current() result must not skip the next eglMakeCurrent.
-        // https://registry.khronos.org/EGL/sdk/docs/man/html/eglMakeCurrent.xhtml
+        // A host update can attach this surface inside swap_window(), after
+        // the frame was drawn on the startup pbuffer. Bind it immediately:
+        // ANGLE's ValidateSwapBuffers rejects a non-current draw surface.
+        // https://github.com/google/angle/blob/main/src/libANGLE/validationEGL.cpp
+        let context = unsafe { (self.fns.get_current_context)() };
+        if !context.is_null() {
+            self.try_make_current(context as usize)?;
+        }
         CURRENT_CONTEXT.with(|current| current.set(0));
         Ok(())
     }
@@ -1122,12 +1221,15 @@ impl Egl {
     fn destroy_window_surface(&mut self) {
         if !self.window_surface.is_null() {
             unsafe {
-                (self.fns.make_current)(
-                    self.display,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
+                // Keep the current context alive and usable while Android
+                // retires/recreates the window, including a mid-frame pause.
+                // The startup pbuffer outlives every host window surface.
+                let context = (self.fns.get_current_context)();
+                if !context.is_null() && (self.fns.make_current)(
+                    self.display, self.pbuffer, self.pbuffer, context,
+                ) == 0 {
+                    panic!("Could not move EGL context to pbuffer: EGL error {:#x}", (self.fns.get_error)());
+                }
                 (self.fns.destroy_surface)(self.display, self.window_surface);
             }
             self.window_surface = std::ptr::null_mut();
@@ -1165,6 +1267,27 @@ impl Egl {
     }
 }
 
+#[cfg(any(target_os = "android", test))]
+impl Drop for Egl {
+    fn drop(&mut self) {
+        unsafe {
+            (self.fns.make_current)(
+                self.display,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            self.destroy_window_surface();
+            for context in self.contexts.get_mut().drain(..) {
+                (self.fns.destroy_context)(self.display, context as *mut _);
+            }
+            (self.fns.destroy_surface)(self.display, self.pbuffer);
+            (self.fns.terminate)(self.display);
+        }
+        CURRENT_CONTEXT.with(|current| current.set(0));
+    }
+}
+
 #[cfg(target_os = "android")]
 fn load_egl(use_angle: bool) -> Result<(EglFns, bool, *mut std::ffi::c_void), String> {
     unsafe {
@@ -1189,8 +1312,14 @@ fn load_egl(use_angle: bool) -> Result<(EglFns, bool, *mut std::ffi::c_void), St
             );
             angle = !lib.is_null();
         }
+        if use_angle && lib.is_null() {
+            return Err("Could not load bundled ANGLE EGL".to_string());
+        }
         if lib.is_null() {
-            lib = libc::dlopen(b"libEGL.so\0".as_ptr() as *const _, libc::RTLD_NOW | libc::RTLD_GLOBAL);
+            lib = libc::dlopen(
+                b"libEGL.so\0".as_ptr() as *const _,
+                libc::RTLD_NOW | libc::RTLD_GLOBAL,
+            );
             angle = false;
         }
         if lib.is_null() {
@@ -1205,6 +1334,10 @@ fn egl_fns(lib: *mut std::ffi::c_void) -> Result<EglFns, String> {
     unsafe {
         Ok(EglFns {
             get_error: std::mem::transmute(load_required(lib, b"eglGetError\0")?),
+            get_current_context: std::mem::transmute(load_required(lib, b"eglGetCurrentContext\0")?),
+            get_config_attrib: std::mem::transmute(load_required(lib, b"eglGetConfigAttrib\0")?),
+            destroy_context: std::mem::transmute(load_required(lib, b"eglDestroyContext\0")?),
+            terminate: std::mem::transmute(load_required(lib, b"eglTerminate\0")?),
             choose_config: std::mem::transmute(load_required(lib, b"eglChooseConfig\0")?),
             create_context: std::mem::transmute(load_required(lib, b"eglCreateContext\0")?),
             create_pbuffer: std::mem::transmute(load_required(lib, b"eglCreatePbufferSurface\0")?),
@@ -1267,3 +1400,10 @@ mod tests {
         assert_eq!(orientation_code(DeviceOrientation::LandscapeRight), 3);
     }
 }
+
+#[cfg(all(test, not(target_os = "android")))]
+#[path = "window/embedded_egl_tests.rs"]
+mod embedded_egl_tests;
+
+#[cfg(all(test, not(target_os = "android")))]
+use embedded_egl_tests::{ANativeWindow_getWidth, ANativeWindow_getHeight, ANativeWindow_setBuffersGeometry};
